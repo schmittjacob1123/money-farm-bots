@@ -6,7 +6,7 @@ SETUP:  pip install flask flask-cors
 RUN:    screen -S farmapi -> python3 farm_api.py -> Ctrl+A D
 """
 
-import subprocess, os, json, time, secrets, hashlib, base64
+import subprocess, os, json, time, secrets, hashlib
 from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
 
@@ -15,23 +15,9 @@ CORS(app, supports_credentials=True)
 
 # ── SESSION AUTH ──
 FARM_PASSWORD = os.environ.get("FARM_PASSWORD", "kickrocks!")
+FARM_API_TOKEN = os.environ.get("FARM_API_TOKEN", "")
 SESSION_SECRET = "d4f2861dc96539bb657aef8e80e37e590eb214de23308c69a85c5deefefe0ea6"
 SESSIONS = set()  # in-memory valid tokens
-
-# ── API TOKEN AUTH (for Claude / programmatic access) ──
-# Set FARM_API_TOKEN in .env to a long random string.
-# Pass as ?token=YOUR_TOKEN on /debug and /apply-update.
-FARM_API_TOKEN = os.environ.get("FARM_API_TOKEN", "")
-
-def valid_api_token(req):
-    """Check ?token= query param against FARM_API_TOKEN env var."""
-    if not FARM_API_TOKEN:
-        return False  # token not configured — deny all
-    return req.args.get("token", "") == FARM_API_TOKEN
-
-def authorized(req):
-    """Accept either a valid browser session OR a valid API token."""
-    return valid_session(req) or valid_api_token(req)
 
 def make_token():
     return secrets.token_hex(32)
@@ -82,24 +68,6 @@ def is_running(screen_name):
     return get_screen_pid(screen_name) is not None
 
 
-def kill_all_screens(screen_name):
-    """Kill every screen session matching this name (prevents duplicate instances)."""
-    try:
-        result = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
-        killed = 0
-        for line in result.stdout.splitlines():
-            if f".{screen_name}" in line:
-                pid = line.strip().split(".")[0].strip()
-                if pid.isdigit():
-                    subprocess.run(["screen", "-X", "-S", f"{pid}.{screen_name}", "quit"],
-                                   capture_output=True)
-                    killed += 1
-        return killed
-    except Exception as e:
-        print(f"kill_all_screens error: {e}")
-        return 0
-
-
 @app.route("/status", methods=["GET"])
 def status():
     result = {}
@@ -133,8 +101,8 @@ def stop_bot(botname):
     if get_screen_pid(cfg["screen"]) is None:
         return jsonify({"ok": True, "message": f"{botname} already stopped"})
     try:
-        killed = kill_all_screens(cfg["screen"])
-        return jsonify({"ok": True, "message": f"{botname} stopped ({killed} instance(s) killed)"})
+        subprocess.run(["screen", "-X", "-S", cfg["screen"], "quit"], capture_output=True)
+        return jsonify({"ok": True, "message": f"{botname} stopped"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -146,7 +114,7 @@ def reset_bot(botname):
     cfg = BOTS[botname]
 
     if is_running(cfg["screen"]):
-        kill_all_screens(cfg["screen"])
+        subprocess.run(["screen", "-X", "-S", cfg["screen"], "quit"], capture_output=True)
         time.sleep(1)
 
     errors = []
@@ -269,149 +237,35 @@ def auth_check():
 
 
 
-@app.route("/debug", methods=["GET"])
-def debug():
-    """
-    Returns a full snapshot of all bot data in one JSON blob.
-    Claude can web_fetch this URL directly — no more copy-pasting logs.
-    Auth: browser session cookie OR ?token=FARM_API_TOKEN
-    """
-    if not authorized(request):
-        return jsonify({"ok": False, "error": "Not authenticated"}), 401
 
-    def read_file(path):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except:
-            return None
-
-    def read_log(path, lines=80):
-        try:
-            with open(path) as f:
-                return f.readlines()[-lines:]
-        except:
-            return []
-
-    # Screen status
-    screens = {}
+def _read_json(fname, default=None):
     try:
-        result = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line or "Socket" in line or "There" in line:
-                continue
-            screens[line] = True
+        with open(os.path.join(WORK_DIR, fname)) as f:
+            return json.load(f)
     except:
-        pass
-
-    bots_debug = {}
-    for name, cfg in BOTS.items():
-        log_file   = os.path.join(WORK_DIR, f"{cfg['screen']}.log")
-        state_file = os.path.join(WORK_DIR, cfg["state"][0])
-        data_file  = os.path.join(WORK_DIR, cfg["state"][2] if len(cfg["state"]) > 2 else "")
-
-        bots_debug[name] = {
-            "running":   is_running(cfg["screen"]),
-            "log_tail":  read_log(log_file, lines=80),
-            "state":     read_file(state_file),
-            "dashboard": read_file(data_file) if data_file else None,
-        }
-
-    loachy_pending = read_file(os.path.join(WORK_DIR, "loachy_pending.json"))
-
-    return jsonify({
-        "ok":             True,
-        "timestamp":      __import__("datetime").datetime.utcnow().isoformat() + "Z",
-        "screens":        list(screens.keys()),
-        "bots":           bots_debug,
-        "loachy_pending": loachy_pending,
-    })
+        return default
 
 
-# ── ALLOWED FILES FOR apply-update (whitelist for safety) ──
-UPDATABLE_FILES = {
-    "seraphina_bot.py",
-    "jacob_bot.py",
-    "loachy_bot.py",
-    "farm_api.py",
-    "farm_alerts.py",
-    "seraphina_dashboard.html",
-    "jacob_dashboard.html",
-    "loachy_dashboard.html",
-    "index.html",
-    "login.html",
-}
-
-@app.route("/apply-update", methods=["POST"])
-def apply_update():
-    """
-    Accepts a file upload from Claude (or any authorized caller).
-    Body: { "filename": "seraphina_bot.py", "content_b64": "<base64>" }
-    Auth: ?token=FARM_API_TOKEN
-
-    After upload, optionally restarts the affected bot:
-    Body can also include: { "restart": true }
-
-    This is how Claude deploys updates without needing SCP.
-    """
-    if not valid_api_token(request):
-        return jsonify({"ok": False, "error": "Invalid or missing token"}), 401
-
+@app.route("/farm-data", methods=["GET"])
+def farm_data():
+    """Live farm status for Claude. Auth: ?token=FARM_API_TOKEN"""
+    token = request.args.get("token") or request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not FARM_API_TOKEN or token != FARM_API_TOKEN:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
     try:
-        body     = request.get_json()
-        filename = body.get("filename", "").strip()
-        b64      = body.get("content_b64", "")
-        restart  = body.get("restart", False)
-
-        if not filename:
-            return jsonify({"ok": False, "error": "filename required"}), 400
-        if filename not in UPDATABLE_FILES:
-            return jsonify({"ok": False, "error": f"{filename} not in allowed file list"}), 403
-        if not b64:
-            return jsonify({"ok": False, "error": "content_b64 required"}), 400
-
-        # Decode and write
-        content  = base64.b64decode(b64)
-        fpath    = os.path.join(WORK_DIR, filename)
-
-        # Backup old file first
-        backup = fpath + ".bak"
-        if os.path.exists(fpath):
-            os.replace(fpath, backup)
-
-        with open(fpath, "wb") as f:
-            f.write(content)
-
-        log_msg = f"[APPLY-UPDATE] {filename} written ({len(content)} bytes)"
-        print(log_msg)
-
-        # Optionally restart the affected bot
-        restarted = None
-        if restart:
-            for name, cfg in BOTS.items():
-                if cfg["script"] == filename:
-                    kill_all_screens(cfg["screen"])
-                    time.sleep(1)
-                    subprocess.Popen(
-                        ["screen", "-dmS", cfg["screen"], "python3",
-                         os.path.join(WORK_DIR, cfg["script"])],
-                        cwd=WORK_DIR
-                    )
-                    restarted = name
-                    print(f"[APPLY-UPDATE] Restarted {name}")
-                    break
-
-        return jsonify({
-            "ok":       True,
-            "filename": filename,
-            "bytes":    len(content),
-            "backup":   backup,
-            "restarted": restarted,
-        })
-
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        screens = subprocess.run(["screen", "-ls"], capture_output=True, text=True).stdout.strip()
+    except:
+        screens = "unavailable"
+    data = {
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "screens": screens,
+        "seraphina_data": _read_json("seraphina_data.json"),
+        "jacob_data":     _read_json("jacob_data.json"),
+        "loachy_data":    _read_json("loachy_data.json"),
+        "loachy_state":   _read_json("loachy_state.json"),
+        "loachy_pending": _read_json("loachy_pending.json", {"pending": [], "approved": [], "rejected": []}),
+    }
+    return jsonify(data)
 
 
 if __name__ == "__main__":
