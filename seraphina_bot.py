@@ -1,10 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SERAPHINA'S CRYPTO ENGINE v5.0 — GRID TRADER        ║
+║         SERAPHINA'S CRYPTO ENGINE v6.0 — GRID TRADER        ║
 ║  Strategy: Automated grid trading on BTC, ETH, SOL, DOGE    ║
 ║  Places buy/sell orders at fixed price intervals.            ║
 ║  Profits from volatility — no direction prediction needed.   ║
 ╚══════════════════════════════════════════════════════════════╝
+
+CHANGES v6 vs v5:
+  - Trailing momentum exit: once a position is up ≥trail_activate_pct
+    from entry, arm a trailing stop. If price then drops ≥trail_stop_pct
+    from its peak, sell immediately — don't wait for the next grid level.
+  - peak_price tracked per open buy, updated every scan
+  - Configurable via trail_activate_pct / trail_stop_pct in CONFIG
 
 CHANGES v5 vs v4:
   - max_open_per_coin: 4 → 2 (keeps more cash available to act)
@@ -22,7 +29,7 @@ HOW IT WORKS:
   Every scan she checks if price has crossed a grid line:
     - Crossed DOWN through a level → BUY (pick up cheap coins)
     - Crossed UP through a level   → SELL (take profit)
-  Profit = grid spacing % of trade size per round trip.
+  Plus: trailing stop fires if a good gain starts reversing.
   More volatility = more crossings = more profit.
 
 WALLET ACCOUNTING (simple and correct):
@@ -90,6 +97,10 @@ CONFIG = {
     "drawdown_pause_pct":   0.15,  # pause ALL new buys if portfolio drops 15% from peak
     "drawdown_resume_pct":  0.08,  # resume when recovered to within 8% of peak
     "coin_stoploss_pct":    0.20,  # close all open buys for a coin if unrealized loss > 20%
+
+    # ── Trailing momentum exit (v6) ──
+    "trail_activate_pct": 0.005,  # position must be up ≥0.5% from entry to arm the stop
+    "trail_stop_pct":     0.004,  # sell if price drops ≥0.4% from peak while armed
 
     # Timing
     "scan_interval_sec": 15,
@@ -184,7 +195,7 @@ class Grid:
         self.spacing_mult = spacing_mult
         self.created_at   = datetime.now(ET).isoformat()
         self.levels       = self._build(center, spacing_mult)
-        self.open_buys    = {}  # {level_idx: {buy_price, size_usd, bought_at}}
+        self.open_buys    = {}  # {level_idx: {buy_price, size_usd, bought_at, peak_price}}
         log.info(f"  [GRID/{coin}] New grid | center=${center:,.4f} | "
                  f"{len(self.levels)} levels | spacing={CONFIG['grid_spacing_pct']*spacing_mult*100:.2f}%")
 
@@ -209,32 +220,59 @@ class Grid:
             if not (lo <= lvl <= hi):
                 continue
             if curr < prev:
-                # price dropped through this level → potential BUY
                 results.append(("BUY", i, lvl))
             else:
-                # price rose through this level → potential SELL
                 results.append(("SELL", i, lvl))
         return results
 
+    def check_trailing_stops(self, curr_price):
+        """
+        v6: Trailing momentum exit.
+        For each open buy: update peak_price, then check if we should sell.
+        Arms when position is up >= trail_activate_pct from entry.
+        Fires when price drops >= trail_stop_pct from that peak.
+        Returns list of buy_idx to close.
+        """
+        activate = CONFIG["trail_activate_pct"]
+        trail    = CONFIG["trail_stop_pct"]
+        to_close = []
+
+        for idx, buy in self.open_buys.items():
+            buy_price = buy["buy_price"]
+
+            # Update peak
+            if curr_price > buy.get("peak_price", buy_price):
+                buy["peak_price"] = curr_price
+
+            peak            = buy.get("peak_price", buy_price)
+            gain_from_entry = (peak - buy_price) / buy_price
+            drop_from_peak  = (peak - curr_price) / peak if peak > 0 else 0
+
+            if gain_from_entry >= activate and drop_from_peak >= trail:
+                log.info(
+                    "  [TRAIL/%s] Stop armed & fired | entry=$%.4f | peak=$%.4f | "
+                    "now=$%.4f | gain=%.2f%% | drop=%.2f%%",
+                    self.coin, buy_price, peak, curr_price,
+                    gain_from_entry * 100, drop_from_peak * 100
+                )
+                to_close.append(idx)
+
+        return to_close
+
     def record_buy(self, idx, price, size_usd):
         self.open_buys[idx] = {
-            "buy_price": price,
-            "size_usd":  size_usd,
-            "bought_at": datetime.now(ET).isoformat(),
+            "buy_price":  price,
+            "size_usd":   size_usd,
+            "bought_at":  datetime.now(ET).isoformat(),
+            "peak_price": price,   # trailing stop tracker — updated every scan
         }
 
     def record_sell(self, buy_idx):
         self.open_buys.pop(buy_idx, None)
 
     def prefill(self, current_price, n_levels):
-        """
-        Place n_levels buys at levels closest to (and at/below) current price.
-        Returns list of (idx, level_price) that were filled.
-        Does NOT touch wallet — caller handles accounting.
-        """
         candidates = [(i, lvl) for i, lvl in enumerate(self.levels)
-                      if lvl <= current_price * 1.0005]  # at or just below
-        # Sort by closest to current price first
+                      if lvl <= current_price * 1.0005]
         candidates.sort(key=lambda x: abs(x[1] - current_price))
         filled = []
         for i, lvl in candidates[:n_levels]:
@@ -261,6 +299,10 @@ class Grid:
         g.created_at   = d.get("created_at", "")
         g.levels       = d["levels"]
         g.open_buys    = {int(k): v for k, v in d.get("open_buys", {}).items()}
+        # Backfill peak_price for any buys loaded from old state files
+        for buy in g.open_buys.values():
+            if "peak_price" not in buy:
+                buy["peak_price"] = buy["buy_price"]
         return g
 
 
@@ -268,24 +310,16 @@ class Grid:
 # MODULE 3: WALLET  (single source of truth for all money)
 # ══════════════════════════════════════════════════════════════════════════════
 class Wallet:
-    """
-    Simple, correct accounting:
-      buy(size)  → wallet -= size
-      sell(size, profit) → wallet += size + profit
-      daily_pnl tracks REALIZED profit/loss from sells only.
-      Prefill is treated as deployment (wallet decreases, no daily_pnl impact).
-    """
-
     def __init__(self):
         self.cash                  = CONFIG["paper_budget"]
-        self.total_pnl             = 0.0   # realized profit from sells
-        self.daily_pnl             = 0.0   # realized profit today from sells
+        self.total_pnl             = 0.0
+        self.daily_pnl             = 0.0
         self.win_streak            = 0
         self.last_date             = datetime.now(ET).date().isoformat()
-        self.trade_log             = []    # recent trades for dashboard
-        self.wallet_history        = []    # portfolio value over time
-        self.peak_portfolio        = CONFIG["paper_budget"]  # all-time high portfolio value
-        self.circuit_breaker_active = False  # True = pause all new buys
+        self.trade_log             = []
+        self.wallet_history        = []
+        self.peak_portfolio        = CONFIG["paper_budget"]
+        self.circuit_breaker_active = False
 
     def reset_daily_if_needed(self):
         today = datetime.now(ET).date().isoformat()
@@ -295,8 +329,7 @@ class Wallet:
             log.info("[WALLET] Daily P&L reset")
 
     def buy(self, coin, price, size_usd):
-        """Deduct cost from wallet. Returns actual size used."""
-        size_usd = min(size_usd, self.cash)  # can't spend more than we have
+        size_usd = min(size_usd, self.cash)
         size_usd = round(size_usd, 2)
         self.cash = round(self.cash - size_usd, 4)
         self.trade_log.append({
@@ -307,7 +340,6 @@ class Wallet:
         return size_usd
 
     def sell(self, coin, price, size_usd, profit_usd):
-        """Return cost + profit to wallet. Track realized PnL."""
         returned = round(size_usd + profit_usd, 4)
         self.cash       = round(self.cash + returned, 4)
         self.total_pnl  = round(self.total_pnl + profit_usd, 4)
@@ -324,7 +356,6 @@ class Wallet:
         return returned
 
     def prefill_buy(self, coin, price, size_usd):
-        """Prefill: deduct from cash but don't count as daily loss."""
         size_usd = min(size_usd, self.cash)
         size_usd = round(size_usd, 2)
         self.cash = round(self.cash - size_usd, 4)
@@ -336,11 +367,9 @@ class Wallet:
         return size_usd
 
     def daily_loss_cap_hit(self):
-        """Only block buying if we've LOST more than the cap today (realized)."""
         return self.daily_pnl < -CONFIG["daily_loss_cap"]
 
     def update_peak(self, portfolio_value):
-        """Track all-time high and manage circuit breaker."""
         if portfolio_value > self.peak_portfolio:
             self.peak_portfolio = portfolio_value
         drawdown = (self.peak_portfolio - portfolio_value) / self.peak_portfolio
@@ -355,7 +384,6 @@ class Wallet:
         return drawdown
 
     def size_pct(self):
-        """Streak-based trade size percentage."""
         pct = 0.08
         for threshold in sorted(CONFIG["streak_tiers"]):
             if self.win_streak >= threshold:
@@ -431,9 +459,9 @@ class SeraphinaBot:
     def __init__(self):
         self.fetcher       = PriceFetcher()
         self.wallet        = Wallet()
-        self.grids         = {}        # coin → Grid
-        self.prev_prices   = {}        # coin → float
-        self.price_hist    = {}        # coin → [float] for vol detection
+        self.grids         = {}
+        self.prev_prices   = {}
+        self.price_hist    = {}
         self.scan_count    = 0
         self._load_state()
 
@@ -470,10 +498,7 @@ class SeraphinaBot:
         return "normal", 1.0, 1.0
 
     def _new_grid(self, coin, price, spacing_mult=1.0):
-        """Create a fresh grid, run prefill, handle wallet deduction."""
         g = Grid(coin, price, spacing_mult)
-
-        # Prefill: buy N levels closest below current price
         n = CONFIG["prefill_levels"]
         to_fill = g.prefill(price, n)
         for idx, lvl in to_fill:
@@ -484,12 +509,10 @@ class SeraphinaBot:
             g.record_buy(idx, lvl, actual)
             log.info("  [GRID/%s] PREFILL buy | level=$%.4f | size=$%.2f | cash=$%.2f",
                      coin, lvl, actual, self.wallet.cash)
-
         self.grids[coin] = g
-        self.prev_prices[coin] = price * 0.9999  # nudge so first scan runs crossings
+        self.prev_prices[coin] = price * 0.9999
 
     def _portfolio_value(self, prices):
-        """Cash + current market value of all open positions."""
         pos_value = 0.0
         for coin, g in self.grids.items():
             curr = prices.get(coin)
@@ -531,6 +554,7 @@ class SeraphinaBot:
                         "liveDiff":    live_diff,
                         "liveDiffPct": live_diff_pct,
                         "coin":        coin,
+                        "peakPrice":   v.get("peak_price", v["buy_price"]),
                     })
                 grids_out.append({
                     "coin":         coin,
@@ -580,7 +604,7 @@ class SeraphinaBot:
         self.wallet.reset_daily_if_needed()
 
         log.info("=" * 60)
-        log.info("  SERAPHINA v5 #%d | %s | cash=$%.2f | total_pnl=$%+.2f | daily=$%+.2f | streak=%dW",
+        log.info("  SERAPHINA v6 #%d | %s | cash=$%.2f | total_pnl=$%+.2f | daily=$%+.2f | streak=%dW",
                  self.scan_count,
                  datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
                  self.wallet.cash, self.wallet.total_pnl,
@@ -588,10 +612,6 @@ class SeraphinaBot:
         log.info("=" * 60)
 
         # ── Step 1: Fetch prices ──
-        portfolio_value_now = round(self.wallet.cash + sum(
-            sum(b["size_usd"] for b in g.open_buys.values())
-            for g in self.grids.values()
-        ), 2)  # pre-calculated so dashboard always has it
         prices = {}
         for coin in CONFIG["coins"]:
             p = self.fetcher.fetch(coin)
@@ -625,7 +645,6 @@ class SeraphinaBot:
                 self._new_grid(coin, price, spacing_mult)
 
         # ── Step 3: Portfolio drawdown circuit breaker ──
-        # Always defined — calculated before any price-dependent logic
         open_position_value = sum(
             sum(b["size_usd"] for b in g.open_buys.values())
             for g in self.grids.values()
@@ -633,7 +652,7 @@ class SeraphinaBot:
         portfolio_value_now = round(self.wallet.cash + open_position_value, 2)
         drawdown = self.wallet.update_peak(portfolio_value_now)
 
-        # ── Step 3b: Per-coin stop loss — close all buys if unrealized loss > 20% ──
+        # ── Step 3b: Per-coin stop loss ──
         for coin, price in list(prices.items()):
             if coin not in self.grids:
                 continue
@@ -655,10 +674,28 @@ class SeraphinaBot:
                     g.record_sell(buy_idx)
                     log.warning("  [STOP LOSS/%s] Closed buy @ $%.4f | loss=$%+.4f", coin, buy["buy_price"], loss)
 
-        # ── Step 4: Check crossings ──
+        # ── Step 3c: Trailing stops (v6) ──
         trades_this_scan = 0
         total_open = sum(len(g.open_buys) for g in self.grids.values())
 
+        for coin, price in prices.items():
+            if coin not in self.grids:
+                continue
+            g = self.grids[coin]
+            to_close = g.check_trailing_stops(price)
+            for buy_idx in to_close:
+                if buy_idx not in g.open_buys:
+                    continue
+                buy    = g.open_buys[buy_idx]
+                profit = round(buy["size_usd"] * (price - buy["buy_price"]) / buy["buy_price"], 4)
+                self.wallet.sell(coin, price, buy["size_usd"], profit)
+                g.record_sell(buy_idx)
+                total_open -= 1
+                trades_this_scan += 1
+                log.info("  [TRAIL/%s] SELL | $%.4f | bought=$%.4f | profit=$%+.4f | cash=$%.2f",
+                         coin, price, buy["buy_price"], profit, self.wallet.cash)
+
+        # ── Step 4: Check grid crossings ──
         for coin, price in prices.items():
             if coin not in self.grids:
                 continue
@@ -671,7 +708,6 @@ class SeraphinaBot:
 
             regime, spacing_mult, size_mult = self._vol_regime(coin, price)
 
-            # Rebuild on regime shift — only after enough readings
             last_regime = getattr(g, "_last_regime", regime)
             if last_regime != regime:
                 log.info("  [GRID/%s] Regime shift %s->%s — noted, no rebuild", coin, last_regime, regime)
@@ -681,7 +717,6 @@ class SeraphinaBot:
 
             for action, idx, lvl in crossings:
                 if action == "BUY":
-                    # Guards
                     if self.wallet.circuit_breaker_active:
                         log.info("  [GRID/%s] Circuit breaker active — skip buy", coin)
                         continue
@@ -695,9 +730,8 @@ class SeraphinaBot:
                         log.info("  [GRID/%s] Daily loss cap hit — skip buy", coin)
                         continue
                     if idx in g.open_buys:
-                        continue  # already have a buy here
+                        continue
 
-                    # Size
                     effective_pct = min(0.14, self.wallet.size_pct() * size_mult)
                     raw = self.wallet.cash * effective_pct
                     size = round(max(CONFIG["trade_size_min"],
@@ -714,7 +748,6 @@ class SeraphinaBot:
                              coin, lvl, actual, self.wallet.cash)
 
                 elif action == "SELL":
-                    # Sweep: sell ALL open buys that are profitable at this level
                     buys_below = {k: v for k, v in g.open_buys.items()
                                   if g.levels[k] < lvl}
                     if not buys_below:
@@ -732,7 +765,7 @@ class SeraphinaBot:
             log.info("  [GRID/%s] Price=$%.4f | open=%d | regime=%s",
                      coin, price, len(g.open_buys), regime)
 
-        # ── Step 4: Save & dashboard ──
+        # ── Step 5: Save & dashboard ──
         State.save(self.wallet, self.grids)
 
         total_open_final = sum(len(g.open_buys) for g in self.grids.values())
@@ -743,7 +776,7 @@ class SeraphinaBot:
         self._write_dashboard(prices, mood, trades_this_scan, vol_regimes, portfolio_value_now)
 
     def run_loop(self):
-        log.info("Seraphina v5 starting | mode=%s | budget=$%.0f | coins=%s",
+        log.info("Seraphina v6 starting | mode=%s | budget=$%.0f | coins=%s",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], ", ".join(CONFIG["coins"]))
         log.info("Grid: %d levels | %.1f%% spacing | %.0f%% base size | 15s scans | NO API CALLS",
