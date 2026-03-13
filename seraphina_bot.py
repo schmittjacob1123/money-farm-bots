@@ -1,27 +1,34 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SERAPHINA'S CRYPTO ENGINE v6.0 — GRID TRADER        ║
+║         SERAPHINA'S CRYPTO ENGINE v7.0 — GRID TRADER        ║
 ║  Strategy: Automated grid trading on BTC, ETH, SOL, DOGE    ║
 ║  Places buy/sell orders at fixed price intervals.            ║
 ║  Profits from volatility — no direction prediction needed.   ║
 ╚══════════════════════════════════════════════════════════════╝
 
+CHANGES v7 vs v6:
+  - Momentum filter: skip buying if price dropped >1.5% over last 5 scans
+    (falling knife protection — don't catch a falling blade)
+  - Reversal detector: if price was falling but ticks up 2+ scans in a row,
+    re-enable buying with a small size boost (catch the bounce)
+  - Cash floor: never deploy new buys if cash < 25% of portfolio value
+    (Jacob's salary buffer — can withdraw without disrupting the bot)
+  - Daily history: permanent seraphina_daily.json — one snapshot per day,
+    kept for 365 days, used by dashboard for all-time chart
+
 CHANGES v6 vs v5:
   - Trailing momentum exit: once a position is up ≥trail_activate_pct
     from entry, arm a trailing stop. If price then drops ≥trail_stop_pct
-    from its peak, sell immediately — don't wait for the next grid level.
+    from its peak, sell immediately.
   - peak_price tracked per open buy, updated every scan
-  - Configurable via trail_activate_pct / trail_stop_pct in CONFIG
 
 CHANGES v5 vs v4:
-  - max_open_per_coin: 4 → 2 (keeps more cash available to act)
-  - max_open_total: 12 → 8 (leaner overall deployment)
-  - prefill_levels: 2 → 1 (less capital locked at startup)
-  - grid_drift_pct: 5% → 3% (recenters more aggressively)
+  - max_open_per_coin: 4 → 2
+  - max_open_total: 12 → 8
+  - prefill_levels: 2 → 1
+  - grid_drift_pct: 5% → 3%
   - Drift rebuild now CLOSES open positions at current price first
-    (v4 silently abandoned them — cash accounting bug fixed)
-  - Sweep sells: on upward move, sell ALL profitable positions
-    at that level, not just the single lowest buy price one
+  - Sweep sells: sell ALL profitable positions on upward move
 
 HOW IT WORKS:
   On startup, Seraphina fetches the current price of each coin.
@@ -30,19 +37,20 @@ HOW IT WORKS:
     - Crossed DOWN through a level → BUY (pick up cheap coins)
     - Crossed UP through a level   → SELL (take profit)
   Plus: trailing stop fires if a good gain starts reversing.
+  Plus: momentum filter blocks buys during falling knives.
   More volatility = more crossings = more profit.
 
-WALLET ACCOUNTING (simple and correct):
+WALLET ACCOUNTING:
   - Wallet starts at paper_budget
-  - BUY:  wallet -= trade_size  (cash leaves, position opens)
-  - SELL: wallet += trade_size + profit  (cash returns + profit)
+  - BUY:  wallet -= trade_size
+  - SELL: wallet += trade_size + profit
   - daily_pnl tracks REALIZED profit/loss from SELLs only
-  - Prefill buys deduct from wallet but NOT from daily_pnl (deployment, not loss)
 
 NO AI CALLS. No Anthropic credits used. Pure math.
 """
 
 import os, csv, json, logging, time, sys, random
+from collections import deque
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -59,19 +67,15 @@ CONFIG = {
     "dry_run":          os.getenv("DRY_RUN", "true").lower() != "false",
     "paper_budget":     1000.0,
 
-    # Coins to trade
     "coins":            ["BTC", "ETH", "SOL", "DOGE"],
 
-    # Grid settings
-    "grid_levels":      8,        # levels above AND below center (17 total)
-    "grid_spacing_pct": 0.010,    # 1.0% between levels
+    "grid_levels":      8,
+    "grid_spacing_pct": 0.010,
 
-    # Trade sizing
-    "trade_size_pct":   0.08,     # 8% of wallet per trade (base)
+    "trade_size_pct":   0.08,
     "trade_size_min":   1.0,
     "trade_size_max":   100.0,
 
-    # Streak-based sizing tiers {min_streak: size_pct}
     "streak_tiers": {
         0:  0.08,
         3:  0.10,
@@ -79,33 +83,39 @@ CONFIG = {
         10: 0.14,
     },
 
-    # Volatility regime — needs 20 readings before triggering rebuild
-    "vol_min_readings":  20,      # don't judge regime until we have this many readings
-    "vol_hot_threshold": 2.5,     # >2.5% swing = Hot  → tighten grid
-    "vol_cold_threshold": 0.8,    # <0.8% swing = Cold → widen grid
+    "vol_min_readings":  20,
+    "vol_hot_threshold": 2.5,
+    "vol_cold_threshold": 0.8,
 
-    # Hybrid prefill: buy N levels closest below current price on grid init
-    "prefill_levels":   1,        # 1 per coin = lean start, more cash reserve
+    "prefill_levels":   1,
 
-    # Position limits
-    "max_open_per_coin": 2,       # max open buys per coin (keep powder dry)
-    "max_open_total":   8,        # max open buys across all coins
+    "max_open_per_coin": 2,
+    "max_open_total":   8,
 
-    # Risk
-    "daily_loss_cap":       20.0,  # stop buying if realized losses exceed $20 today
-    "grid_drift_pct":       0.03,  # rebuild grid if price drifts 3% from center
-    "drawdown_pause_pct":   0.15,  # pause ALL new buys if portfolio drops 15% from peak
-    "drawdown_resume_pct":  0.08,  # resume when recovered to within 8% of peak
-    "coin_stoploss_pct":    0.20,  # close all open buys for a coin if unrealized loss > 20%
+    "daily_loss_cap":       20.0,
+    "grid_drift_pct":       0.03,
+    "drawdown_pause_pct":   0.15,
+    "drawdown_resume_pct":  0.08,
+    "coin_stoploss_pct":    0.20,
 
     # ── Trailing momentum exit (v6) ──
-    "trail_activate_pct": 0.005,  # position must be up ≥0.5% from entry to arm the stop
-    "trail_stop_pct":     0.004,  # sell if price drops ≥0.4% from peak while armed
+    "trail_activate_pct": 0.005,
+    "trail_stop_pct":     0.004,
 
-    # Timing
+    # ── Cash floor (v7) ──
+    "cash_floor_pct":     0.25,   # never deploy if cash < 25% of portfolio value
+
+    # ── Momentum filter (v7) ──
+    "momentum_lookback":  5,      # scans to look back
+    "momentum_drop_pct":  0.015,  # skip buy if price dropped >1.5% over lookback
+    "reversal_ticks":     2,      # consecutive up-ticks needed to re-enable buying
+    "reversal_size_mult": 1.2,    # size multiplier on confirmed reversal
+
+    # ── Daily history (v7) ──
+    "daily_history_file": "seraphina_daily.json",
+
     "scan_interval_sec": 15,
 
-    # Files
     "log_file":       "seraphina.log",
     "csv_file":       "seraphina_trades.csv",
     "state_file":     "seraphina_state.json",
@@ -183,19 +193,13 @@ class PriceFetcher:
 # MODULE 2: GRID
 # ══════════════════════════════════════════════════════════════════════════════
 class Grid:
-    """
-    Manages buy/sell levels for a single coin.
-    Wallet accounting is handled OUTSIDE this class by the bot.
-    This class only tracks grid state.
-    """
-
     def __init__(self, coin, center, spacing_mult=1.0):
         self.coin         = coin
         self.center       = center
         self.spacing_mult = spacing_mult
         self.created_at   = datetime.now(ET).isoformat()
         self.levels       = self._build(center, spacing_mult)
-        self.open_buys    = {}  # {level_idx: {buy_price, size_usd, bought_at, peak_price}}
+        self.open_buys    = {}
         log.info(f"  [GRID/{coin}] New grid | center=${center:,.4f} | "
                  f"{len(self.levels)} levels | spacing={CONFIG['grid_spacing_pct']*spacing_mult*100:.2f}%")
 
@@ -213,7 +217,6 @@ class Grid:
         return abs(price - self.center) / self.center > CONFIG["grid_drift_pct"]
 
     def find_crossings(self, prev, curr):
-        """Return list of (action, level_idx, level_price) for levels crossed."""
         lo, hi = min(prev, curr), max(prev, curr)
         results = []
         for i, lvl in enumerate(self.levels):
@@ -226,21 +229,12 @@ class Grid:
         return results
 
     def check_trailing_stops(self, curr_price):
-        """
-        v6: Trailing momentum exit.
-        For each open buy: update peak_price, then check if we should sell.
-        Arms when position is up >= trail_activate_pct from entry.
-        Fires when price drops >= trail_stop_pct from that peak.
-        Returns list of buy_idx to close.
-        """
         activate = CONFIG["trail_activate_pct"]
         trail    = CONFIG["trail_stop_pct"]
         to_close = []
 
         for idx, buy in self.open_buys.items():
             buy_price = buy["buy_price"]
-
-            # Update peak
             if curr_price > buy.get("peak_price", buy_price):
                 buy["peak_price"] = curr_price
 
@@ -264,7 +258,7 @@ class Grid:
             "buy_price":  price,
             "size_usd":   size_usd,
             "bought_at":  datetime.now(ET).isoformat(),
-            "peak_price": price,   # trailing stop tracker — updated every scan
+            "peak_price": price,
         }
 
     def record_sell(self, buy_idx):
@@ -299,7 +293,6 @@ class Grid:
         g.created_at   = d.get("created_at", "")
         g.levels       = d["levels"]
         g.open_buys    = {int(k): v for k, v in d.get("open_buys", {}).items()}
-        # Backfill peak_price for any buys loaded from old state files
         for buy in g.open_buys.values():
             if "peak_price" not in buy:
                 buy["peak_price"] = buy["buy_price"]
@@ -307,7 +300,7 @@ class Grid:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 3: WALLET  (single source of truth for all money)
+# MODULE 3: WALLET
 # ══════════════════════════════════════════════════════════════════════════════
 class Wallet:
     def __init__(self):
@@ -428,7 +421,7 @@ class Wallet:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 4: STATE (save/load)
+# MODULE 4: STATE
 # ══════════════════════════════════════════════════════════════════════════════
 class State:
     @staticmethod
@@ -457,13 +450,105 @@ class State:
 class SeraphinaBot:
 
     def __init__(self):
-        self.fetcher       = PriceFetcher()
-        self.wallet        = Wallet()
-        self.grids         = {}
-        self.prev_prices   = {}
-        self.price_hist    = {}
-        self.scan_count    = 0
+        self.fetcher         = PriceFetcher()
+        self.wallet          = Wallet()
+        self.grids           = {}
+        self.prev_prices     = {}
+        self.price_hist      = {}
+        self.scan_count      = 0
+        # v7 momentum state
+        self.momentum_hist   = {}   # coin → deque of recent prices
+        self.reversal_count  = {}   # coin → consecutive up-ticks
+        self.momentum_paused = {}   # coin → bool
+        self._daily_history  = []
         self._load_state()
+        self._load_daily_history()
+
+    # ── Daily history (v7) ──────────────────────────────────────────────────
+
+    def _load_daily_history(self):
+        try:
+            with open(CONFIG["daily_history_file"]) as f:
+                self._daily_history = json.load(f)
+            log.info("[INIT] Loaded daily history: %d days", len(self._daily_history))
+        except:
+            self._daily_history = []
+
+    def _save_daily_history(self, portfolio_value):
+        today = datetime.now(ET).date().isoformat()
+        if self._daily_history and self._daily_history[-1]["d"] == today:
+            self._daily_history[-1]["v"] = round(portfolio_value, 2)
+        else:
+            self._daily_history.append({"d": today, "v": round(portfolio_value, 2)})
+        self._daily_history = self._daily_history[-365:]
+        try:
+            with open(CONFIG["daily_history_file"], "w") as f:
+                json.dump(self._daily_history, f)
+        except Exception as e:
+            log.warning(f"Daily history save failed: {e}")
+
+    # ── Momentum filter (v7) ────────────────────────────────────────────────
+
+    def _momentum_ok_to_buy(self, coin, curr_price):
+        """
+        Returns (ok_to_buy: bool, size_multiplier: float).
+        Blocks buys during falling knives, boosts size on confirmed reversals.
+        """
+        hist = self.momentum_hist.setdefault(coin, deque(maxlen=CONFIG["momentum_lookback"] + 1))
+        hist.append(curr_price)
+
+        # Not enough data yet — allow freely
+        if len(hist) < CONFIG["momentum_lookback"]:
+            return True, 1.0
+
+        oldest = hist[0]
+        drop_pct = (oldest - curr_price) / oldest  # positive = price fell
+
+        # Count consecutive up-ticks
+        prices_list = list(hist)
+        ticks = 0
+        for i in range(len(prices_list) - 1, 0, -1):
+            if prices_list[i] > prices_list[i - 1]:
+                ticks += 1
+            else:
+                break
+        self.reversal_count[coin] = ticks
+
+        was_paused = self.momentum_paused.get(coin, False)
+
+        if drop_pct >= CONFIG["momentum_drop_pct"]:
+            # Falling knife — pause
+            if not was_paused:
+                log.info("  [MOMENTUM/%s] Falling knife (%.2f%% drop over %d scans) — pausing buys",
+                         coin, drop_pct * 100, CONFIG["momentum_lookback"])
+            self.momentum_paused[coin] = True
+            return False, 1.0
+
+        if was_paused:
+            if ticks >= CONFIG["reversal_ticks"]:
+                # Confirmed reversal — resume with size boost
+                self.momentum_paused[coin] = False
+                log.info("  [MOMENTUM/%s] Reversal confirmed (%d up-ticks) — resuming with %.1fx size",
+                         coin, ticks, CONFIG["reversal_size_mult"])
+                return True, CONFIG["reversal_size_mult"]
+            else:
+                # Still waiting for reversal confirmation
+                return False, 1.0
+
+        return True, 1.0
+
+    # ── Cash floor (v7) ─────────────────────────────────────────────────────
+
+    def _cash_floor_ok(self, portfolio_value):
+        """Block buying if cash < 25% of portfolio (Jacob's salary buffer)."""
+        floor = portfolio_value * CONFIG["cash_floor_pct"]
+        if self.wallet.cash < floor:
+            log.info("  [CASH FLOOR] Cash $%.2f < floor $%.2f (%.0f%% of $%.2f) — skip buy",
+                     self.wallet.cash, floor, CONFIG["cash_floor_pct"] * 100, portfolio_value)
+            return False
+        return True
+
+    # ────────────────────────────────────────────────────────────────────────
 
     def _load_state(self):
         data = State.load()
@@ -486,8 +571,7 @@ class SeraphinaBot:
             hist = hist[-120:]
         self.price_hist[coin] = hist
 
-        min_readings = CONFIG["vol_min_readings"]
-        if len(hist) < min_readings:
+        if len(hist) < CONFIG["vol_min_readings"]:
             return "normal", 1.0, 1.0
 
         swing = (max(hist) - min(hist)) / min(hist) * 100
@@ -565,7 +649,17 @@ class SeraphinaBot:
                     "openBuysList": buys_list,
                     "spacing":      f"{CONFIG['grid_spacing_pct']*100:.1f}%",
                     "regime":       vol_regimes.get(coin, "normal"),
+                    "momentumPaused": self.momentum_paused.get(coin, False),
                 })
+
+            # v7: momentum status for dashboard
+            momentum_status = {
+                coin: {
+                    "paused":   self.momentum_paused.get(coin, False),
+                    "upTicks":  self.reversal_count.get(coin, 0),
+                }
+                for coin in CONFIG["coins"]
+            }
 
             with open(CONFIG["dashboard_file"], "w") as f:
                 json.dump({
@@ -590,11 +684,14 @@ class SeraphinaBot:
                     "grids":           grids_out,
                     "recentTrades":    self.wallet.trade_log[-20:],
                     "walletHistory":   self.wallet.wallet_history[-500:],
+                    "dailyHistory":    self._daily_history,
                     "volRegimes":      vol_regimes,
+                    "momentumStatus":  momentum_status,
                     "circuitBreaker":  self.wallet.circuit_breaker_active,
                     "peakPortfolio":   round(self.wallet.peak_portfolio, 2),
                     "drawdownPct":     round((self.wallet.peak_portfolio - portfolio_value) / self.wallet.peak_portfolio * 100, 2) if self.wallet.peak_portfolio > 0 else 0,
                     "prices":          {c: round(p, 4) for c, p in prices.items() if p},
+                    "cashFloorPct":    CONFIG["cash_floor_pct"] * 100,
                 }, f, indent=2)
         except Exception as e:
             log.warning(f"Dashboard write failed: {e}")
@@ -604,7 +701,7 @@ class SeraphinaBot:
         self.wallet.reset_daily_if_needed()
 
         log.info("=" * 60)
-        log.info("  SERAPHINA v6 #%d | %s | cash=$%.2f | total_pnl=$%+.2f | daily=$%+.2f | streak=%dW",
+        log.info("  SERAPHINA v7 #%d | %s | cash=$%.2f | total_pnl=$%+.2f | daily=$%+.2f | streak=%dW",
                  self.scan_count,
                  datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
                  self.wallet.cash, self.wallet.total_pnl,
@@ -710,7 +807,7 @@ class SeraphinaBot:
 
             last_regime = getattr(g, "_last_regime", regime)
             if last_regime != regime:
-                log.info("  [GRID/%s] Regime shift %s->%s — noted, no rebuild", coin, last_regime, regime)
+                log.info("  [GRID/%s] Regime shift %s->%s — noted", coin, last_regime, regime)
             g._last_regime = regime
 
             crossings = g.find_crossings(prev, price)
@@ -732,7 +829,16 @@ class SeraphinaBot:
                     if idx in g.open_buys:
                         continue
 
-                    effective_pct = min(0.14, self.wallet.size_pct() * size_mult)
+                    # v7: momentum filter
+                    mom_ok, mom_mult = self._momentum_ok_to_buy(coin, price)
+                    if not mom_ok:
+                        continue
+
+                    # v7: cash floor
+                    if not self._cash_floor_ok(portfolio_value_now):
+                        continue
+
+                    effective_pct = min(0.14, self.wallet.size_pct() * size_mult * mom_mult)
                     raw = self.wallet.cash * effective_pct
                     size = round(max(CONFIG["trade_size_min"],
                                      min(CONFIG["trade_size_max"], raw)), 2)
@@ -762,11 +868,13 @@ class SeraphinaBot:
                                  coin, lvl, buy["buy_price"], profit, self.wallet.cash)
 
             self.prev_prices[coin] = price
-            log.info("  [GRID/%s] Price=$%.4f | open=%d | regime=%s",
-                     coin, price, len(g.open_buys), regime)
+            log.info("  [GRID/%s] Price=$%.4f | open=%d | regime=%s | mom_paused=%s",
+                     coin, price, len(g.open_buys), regime,
+                     self.momentum_paused.get(coin, False))
 
         # ── Step 5: Save & dashboard ──
         State.save(self.wallet, self.grids)
+        self._save_daily_history(portfolio_value_now)
 
         total_open_final = sum(len(g.open_buys) for g in self.grids.values())
         mood = "hunting" if trades_this_scan > 0 else ("watching" if total_open_final > 0 else "sleeping")
@@ -776,7 +884,7 @@ class SeraphinaBot:
         self._write_dashboard(prices, mood, trades_this_scan, vol_regimes, portfolio_value_now)
 
     def run_loop(self):
-        log.info("Seraphina v6 starting | mode=%s | budget=$%.0f | coins=%s",
+        log.info("Seraphina v7 starting | mode=%s | budget=$%.0f | coins=%s",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], ", ".join(CONFIG["coins"]))
         log.info("Grid: %d levels | %.1f%% spacing | %.0f%% base size | 15s scans | NO API CALLS",
