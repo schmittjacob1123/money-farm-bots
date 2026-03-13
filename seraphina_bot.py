@@ -1,48 +1,36 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SERAPHINA'S CRYPTO ENGINE v5.0 — GRID TRADER        ║
-║  Strategy: Automated grid trading on BTC, ETH, SOL, DOGE    ║
+║         SERAPHINA'S CRYPTO ENGINE v3.0 — GRID TRADER        ║
+║  Strategy: Automated grid trading on BTC & ETH              ║
 ║  Places buy/sell orders at fixed price intervals.            ║
 ║  Profits from volatility — no direction prediction needed.   ║
 ╚══════════════════════════════════════════════════════════════╝
 
-CHANGES v5 vs v4:
-  - max_open_per_coin: 4 → 2 (keeps more cash available to act)
-  - max_open_total: 12 → 8 (leaner overall deployment)
-  - prefill_levels: 2 → 1 (less capital locked at startup)
-  - grid_drift_pct: 5% → 3% (recenters more aggressively)
-  - Drift rebuild now CLOSES open positions at current price first
-    (v4 silently abandoned them — cash accounting bug fixed)
-  - Sweep sells: on upward move, sell ALL profitable positions
-    at that level, not just the single lowest buy price one
-
 HOW IT WORKS:
-  On startup, Seraphina fetches the current price of each coin.
+  On startup, Seraphina fetches the current price of BTC and ETH.
   She builds a grid of price levels above and below the current price.
   Every scan she checks if price has crossed a grid line:
     - Crossed DOWN through a level → BUY (pick up cheap coins)
     - Crossed UP through a level   → SELL (take profit)
-  Profit = grid spacing % of trade size per round trip.
-  More volatility = more crossings = more profit.
-
-WALLET ACCOUNTING (simple and correct):
-  - Wallet starts at paper_budget
-  - BUY:  wallet -= trade_size  (cash leaves, position opens)
-  - SELL: wallet += trade_size + profit  (cash returns + profit)
-  - daily_pnl tracks REALIZED profit/loss from SELLs only
-  - Prefill buys deduct from wallet but NOT from daily_pnl (deployment, not loss)
+  Each grid trade is a fixed dollar size. Profit = grid spacing minus fees.
+  More volatility = more grid crossings = more profit.
 
 NO AI CALLS. No Anthropic credits used. Pure math.
+
+SETUP:
+  pip install requests python-dotenv
+
+RUNNING:
+  python3 seraphina_bot.py
 """
 
-import os, csv, json, logging, time, sys, random
+import os, csv, json, logging, time, sys, math, random
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
-ET = ZoneInfo("America/New_York")
-
+ET = ZoneInfo('America/New_York')
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -50,55 +38,80 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════════════════════
 CONFIG = {
     "dry_run":          os.getenv("DRY_RUN", "true").lower() != "false",
-    "paper_budget":     1000.0,
-
-    # Coins to trade
-    "coins":            ["BTC", "ETH", "SOL", "DOGE"],
+    "paper_budget":     50.0,
 
     # Grid settings
-    "grid_levels":      8,        # levels above AND below center (17 total)
-    "grid_spacing_pct": 0.010,    # 1.0% between levels
+    "coins":            ["BTC", "ETH", "SOL", "DOGE"],
+    "grid_levels":      8,
+    "grid_spacing_pct": 0.005,
 
-    # Trade sizing
-    "trade_size_pct":   0.08,     # 8% of wallet per trade (base)
-    "trade_size_min":   1.0,
-    "trade_size_max":   100.0,
+    # Dynamic sizing: % of wallet per trade (scales as wallet grows)
+    "trade_size_pct":        0.08,  # 8% of wallet = $4 at $50, $16 at $200
+    "trade_size_min":        1.0,
+    "trade_size_max":        50.0,
 
-    # Streak-based sizing tiers {min_streak: size_pct}
-    "streak_tiers": {
-        0:  0.08,
-        3:  0.10,
-        6:  0.12,
-        10: 0.14,
-    },
+    # Confidence tiers: levels closer to center trade bigger
+    "confidence_tiers": {0:1.5, 1:1.3, 2:1.1, 3:1.0, 4:0.9, 5:0.8, 6:0.7, 7:0.6},
 
-    # Volatility regime — needs 20 readings before triggering rebuild
-    "vol_min_readings":  20,      # don't judge regime until we have this many readings
-    "vol_hot_threshold": 2.5,     # >2.5% swing = Hot  → tighten grid
-    "vol_cold_threshold": 0.8,    # <0.8% swing = Cold → widen grid
-
-    # Hybrid prefill: buy N levels closest below current price on grid init
-    "prefill_levels":   1,        # 1 per coin = lean start, more cash reserve
-
-    # Position limits
-    "max_open_per_coin": 2,       # max open buys per coin (keep powder dry)
-    "max_open_total":   8,        # max open buys across all coins
+    # Dynamic position cap: grows with wallet
+    "max_open_grids_base":    6,
+    "max_open_grids_per_usd": 25,
+    "max_open_grids_cap":     24,
 
     # Risk
-    "daily_loss_cap":       20.0,  # stop buying if realized losses exceed $20 today
-    "grid_drift_pct":       0.03,  # rebuild grid if price drifts 3% from center
-    "drawdown_pause_pct":   0.15,  # pause ALL new buys if portfolio drops 15% from peak
-    "drawdown_resume_pct":  0.08,  # resume when recovered to within 8% of peak
-    "coin_stoploss_pct":    0.20,  # close all open buys for a coin if unrealized loss > 20%
+    "daily_loss_cap":   15.0,
+    "max_drawdown_pct": 0.30,       # reset grid if price moves 30% from center
+    # ── Trailing stop (momentum exit) ──
+    "trail_activate_pct": 0.005,    # position must be up ≥0.5% to arm the trailing stop
+    "trail_stop_pct":     0.004,    # sell if price drops ≥0.4% from peak while armed
 
     # Timing
-    "scan_interval_sec": 15,
+    "scan_interval_sec": 60,        # check every 60 seconds
+    "grid_reset_hours":  24,        # rebuild grid every 24 hours
 
     # Files
-    "log_file":       "seraphina.log",
-    "csv_file":       "seraphina_trades.csv",
-    "state_file":     "seraphina_state.json",
-    "dashboard_file": "seraphina_data.json",
+    "log_file":         "seraphina.log",
+    "csv_file":         "seraphina_trades.csv",
+    "state_file":       "seraphina_state.json",
+    "dashboard_file":   "seraphina_data.json",
+}
+
+# Seraphina's personality quotes
+SERA_QUOTES = {
+    "hunting": [
+        "Grid crossed. Profit locked. That's how we do it.",
+        "Volatility is just free money if you're positioned right.",
+        "Another level hit. Another dollar earned.",
+        "The grid never sleeps. Neither do I.",
+        "Buy the dip. Sell the rip. Repeat forever.",
+    ],
+    "watching": [
+        "Grids are set. Waiting for the market to come to me.",
+        "Patience is a strategy. My orders are already placed.",
+        "The price will move. It always moves. I'll be ready.",
+        "Every minute without a trade is a minute I'm not losing either.",
+        "Watching the levels. Just waiting.",
+    ],
+    "sleeping": [
+        "Low volatility. The grid is patient.",
+        "Market's quiet. My orders are still there.",
+        "Nothing to do but wait. The grid handles itself.",
+        "Boring market. That's fine. I'm already positioned.",
+    ],
+}
+
+SERA_ART = {
+    "hunting": [
+        "  /\\ /\\\n (=^.^=) $\n  (   )\n  -\"-\"-",
+        "  /\\ /\\\n (=o.o=)>\n  (   )\n  -\"-\"-",
+    ],
+    "watching": [
+        "  /\\ /\\\n (=^.^=)\n  (   )\n  -\"-\"-",
+        "  /\\ /\\\n (=-.-=-)\n  (   )\n  -\"-\"-",
+    ],
+    "sleeping": [
+        "  /\\ /\\\n (=-.-=)\n  (   )\n  zz-\"-\"-",
+    ],
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -109,10 +122,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.FileHandler(CONFIG["log_file"], encoding="utf-8")]
 )
-log = logging.getLogger("seraphina")
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log = logging.getLogger("seraphina")
 log.addHandler(console)
 
 if sys.platform == "win32":
@@ -120,133 +133,189 @@ if sys.platform == "win32":
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERSONALITY
-# ══════════════════════════════════════════════════════════════════════════════
-QUOTES = {
-    "hunting":  ["Grid crossed. Profit locked.", "Another level hit. Another dollar earned.",
-                 "Buy the dip. Sell the rip. Repeat.", "Volatility is free money if you're positioned right."],
-    "watching": ["Grids are set. Waiting for the market.", "Price will move. It always moves. I'll be ready.",
-                 "Patience is a strategy.", "Watching the levels."],
-    "sleeping": ["Low volatility. The grid is patient.", "Quiet market. My orders are still there.",
-                 "Nothing to do but wait."],
-}
-ART = {
-    "hunting":  ["  /\\ /\\\n (=^.^=) $\n  (   )\n  -\"-\"-"],
-    "watching": ["  /\\ /\\\n (=^.^=)\n  (   )\n  -\"-\"-"],
-    "sleeping": ["  /\\ /\\\n (=-.-=)\n  (   )\n  zz-\"-\"-"],
-}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODULE 1: PRICE FETCHER
+# MODULE 1: PRICE FETCHER (Binance only — free, reliable, no API key needed)
 # ══════════════════════════════════════════════════════════════════════════════
 class PriceFetcher:
+    # Kraken — no geo restrictions, no API key needed, free
     KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
+
     SYMBOLS = {
         "BTC":  "XBTUSD",
         "ETH":  "ETHUSD",
         "SOL":  "SOLUSD",
         "DOGE": "XDGUSD",
+        "XRP":  "XRPUSD",
     }
 
-    def fetch(self, coin):
+    def fetch_price(self, coin):
         pair = self.SYMBOLS.get(coin)
-        if not pair:
-            return None
+        if not pair: return None
         try:
             r = requests.get(self.KRAKEN_URL, params={"pair": pair}, timeout=8)
             r.raise_for_status()
             res = r.json().get("result", {})
-            if not res:
-                return None
+            if not res: return None
             t = list(res.values())[0]
             bid = float(t["b"][0])
             ask = float(t["a"][0])
-            return (bid + ask) / 2
+            return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2}
         except Exception as e:
             log.debug(f"Price fetch {coin}: {e}")
             return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 2: GRID
+# MODULE 2: GRID MANAGER
 # ══════════════════════════════════════════════════════════════════════════════
-class Grid:
+class GridManager:
     """
-    Manages buy/sell levels for a single coin.
-    Wallet accounting is handled OUTSIDE this class by the bot.
-    This class only tracks grid state.
+    Maintains a grid of buy/sell levels for a single coin.
+    Levels are set at fixed % intervals above and below the center price.
+    Tracks which levels have been bought (waiting to sell) and which are empty.
     """
 
-    def __init__(self, coin, center, spacing_mult=1.0):
+    def __init__(self, coin, center_price):
         self.coin         = coin
-        self.center       = center
-        self.spacing_mult = spacing_mult
+        self.center_price = center_price
         self.created_at   = datetime.now(ET).isoformat()
-        self.levels       = self._build(center, spacing_mult)
-        self.open_buys    = {}  # {level_idx: {buy_price, size_usd, bought_at}}
-        log.info(f"  [GRID/{coin}] New grid | center=${center:,.4f} | "
-                 f"{len(self.levels)} levels | spacing={CONFIG['grid_spacing_pct']*spacing_mult*100:.2f}%")
-
-    def _build(self, center, spacing_mult=1.0):
-        n  = CONFIG["grid_levels"]
-        sp = CONFIG["grid_spacing_pct"] * spacing_mult
-        dec = 2 if center >= 10 else 4 if center >= 0.1 else 6
-        levels = sorted(set(
-            round(center * (1 + i * sp), dec)
-            for i in range(-n, n + 1)
-        ))
-        return levels
-
-    def drifted(self, price):
-        return abs(price - self.center) / self.center > CONFIG["grid_drift_pct"]
-
-    def find_crossings(self, prev, curr):
-        """Return list of (action, level_idx, level_price) for levels crossed."""
-        lo, hi = min(prev, curr), max(prev, curr)
-        results = []
+        self.levels       = self._build_levels(center_price)
+        self.open_buys    = {}   # level_idx -> {"buy_price": x, "size_usd": y, "bought_at": z}
+        log.info(f"  [GRID/{coin}] Built {len(self.levels)} levels around ${center_price:,.2f}")
         for i, lvl in enumerate(self.levels):
-            if not (lo <= lvl <= hi):
-                continue
-            if curr < prev:
-                # price dropped through this level → potential BUY
-                results.append(("BUY", i, lvl))
-            else:
-                # price rose through this level → potential SELL
-                results.append(("SELL", i, lvl))
-        return results
+            log.info(f"    Level {i:+d}: ${lvl:,.2f}")
 
-    def record_buy(self, idx, price, size_usd):
-        self.open_buys[idx] = {
-            "buy_price": price,
-            "size_usd":  size_usd,
-            "bought_at": datetime.now(ET).isoformat(),
+    def _build_levels(self, center):
+        n = CONFIG["grid_levels"]
+        sp = CONFIG["grid_spacing_pct"]
+        # Use more decimal places for low-price coins
+        decimals = 2 if center >= 10 else 4 if center >= 0.1 else 6
+        levels = []
+        for i in range(-n, n + 1):
+            levels.append(round(center * (1 + i * sp), decimals))
+        return sorted(set(levels))  # dedupe in case rounding collapses levels
+
+    def _trade_size(self, level_idx, wallet):
+        """Calculate trade size: wallet% base * confidence multiplier by distance from center."""
+        base = max(CONFIG["trade_size_min"],
+                   min(CONFIG["trade_size_max"],
+                       wallet * CONFIG["trade_size_pct"]))
+        # Distance from center level (mid of levels list)
+        center_idx = len(self.levels) // 2
+        dist = min(abs(level_idx - center_idx), 7)
+        mult = CONFIG["confidence_tiers"].get(dist, 0.6)
+        return round(base * mult, 2)
+
+    def needs_reset(self, current_price):
+        """True if price has drifted too far from center to be useful."""
+        drift = abs(current_price - self.center_price) / self.center_price
+        return drift > CONFIG["max_drawdown_pct"]
+
+    def check_crossings(self, prev_price, curr_price, wallet, daily_loss, open_count):
+        """
+        Given price moved from prev to curr, find grid levels crossed.
+        Returns list of trade actions to execute.
+        """
+        actions = []
+        lo, hi = min(prev_price, curr_price), max(prev_price, curr_price)
+
+        for i, level in enumerate(self.levels):
+            if not (lo <= level <= hi):
+                continue
+
+            # Price crossed DOWN through this level → BUY opportunity
+            if curr_price < prev_price and i not in self.open_buys:
+                dyn_cap = min(CONFIG["max_open_grids_cap"],
+                              CONFIG["max_open_grids_base"] + int((wallet - CONFIG.get("paper_budget", 50)) / CONFIG["max_open_grids_per_usd"]))
+                dyn_cap = max(CONFIG["max_open_grids_base"], dyn_cap)
+                if open_count >= dyn_cap:
+                    log.info(f"  [GRID/{self.coin}] Max open grids ({dyn_cap}) reached — skip buy at ${level:,.2f}")
+                    continue
+                if daily_loss >= CONFIG["daily_loss_cap"]:
+                    log.info(f"  [GRID/{self.coin}] Daily loss cap hit — skip buy")
+                    continue
+                trade_size = self._trade_size(i, wallet)
+                if trade_size > wallet:
+                    log.info(f"  [GRID/{self.coin}] Not enough wallet for buy")
+                    continue
+                actions.append({"action": "BUY", "level_idx": i, "price": level, "trade_size": trade_size})
+
+            # Price crossed UP through this level → SELL if we have a buy here or below
+            elif curr_price > prev_price:
+                # Find the nearest open buy below this level
+                buys_below = {k: v for k, v in self.open_buys.items() if self.levels[k] < level}
+                if buys_below:
+                    # Sell the lowest open buy (most profit)
+                    buy_idx = min(buys_below.keys())
+                    buy = buys_below[buy_idx]
+                    profit_pct = (level - buy["buy_price"]) / buy["buy_price"]
+                    profit_usd = round(buy["size_usd"] * profit_pct, 4)
+                    actions.append({
+                        "action":     "SELL",
+                        "level_idx":  i,
+                        "price":      level,
+                        "buy_idx":    buy_idx,
+                        "buy_price":  buy["buy_price"],
+                        "profit_usd": profit_usd,
+                        "size_usd":   buy["size_usd"],
+                    })
+
+        return actions
+
+    def execute_buy(self, action):
+        self.open_buys[action["level_idx"]] = {
+            "buy_price":  action["price"],
+            "size_usd":   action.get("trade_size", CONFIG["trade_size_pct"] * 50),
+            "bought_at":  datetime.now(ET).isoformat(),
+            "peak_price": action["price"],   # trailing stop tracker — updated each scan
         }
 
-    def record_sell(self, buy_idx):
-        self.open_buys.pop(buy_idx, None)
 
-    def prefill(self, current_price, n_levels):
+    def check_trailing_stops(self, curr_price):
         """
-        Place n_levels buys at levels closest to (and at/below) current price.
-        Returns list of (idx, level_price) that were filled.
-        Does NOT touch wallet — caller handles accounting.
+        Trailing momentum exit: if a position is up ≥trail_activate_pct from entry
+        AND price has since dropped ≥trail_stop_pct from its peak, sell it now.
+        Also updates peak_price on each call.
         """
-        candidates = [(i, lvl) for i, lvl in enumerate(self.levels)
-                      if lvl <= current_price * 1.0005]  # at or just below
-        # Sort by closest to current price first
-        candidates.sort(key=lambda x: abs(x[1] - current_price))
-        filled = []
-        for i, lvl in candidates[:n_levels]:
-            if i not in self.open_buys:
-                filled.append((i, lvl))
-        return filled
+        actions = []
+        activate = CONFIG["trail_activate_pct"]
+        trail    = CONFIG["trail_stop_pct"]
+
+        for idx, buy in list(self.open_buys.items()):
+            buy_price = buy["buy_price"]
+
+            # Update peak
+            if curr_price > buy.get("peak_price", buy_price):
+                buy["peak_price"] = curr_price
+
+            peak = buy.get("peak_price", buy_price)
+            gain_from_entry = (peak - buy_price) / buy_price
+            drop_from_peak  = (peak - curr_price) / peak
+
+            if gain_from_entry >= activate and drop_from_peak >= trail:
+                profit_usd = round(buy["size_usd"] * (curr_price - buy_price) / buy_price, 4)
+                log.info(f"  [TRAIL/{self.coin}] Trailing stop fired | "
+                         f"Bought ${buy_price:,.4f} | Peak ${peak:,.4f} | "
+                         f"Now ${curr_price:,.4f} | Drop {drop_from_peak*100:.2f}% | P&L ${profit_usd:+.4f}")
+                actions.append({
+                    "action":     "SELL",
+                    "level_idx":  idx,
+                    "price":      curr_price,
+                    "buy_idx":    idx,
+                    "buy_price":  buy_price,
+                    "profit_usd": profit_usd,
+                    "size_usd":   buy["size_usd"],
+                    "reason":     "trailing_stop",
+                })
+        return actions
+
+    def execute_sell(self, action):
+        if action["buy_idx"] in self.open_buys:
+            del self.open_buys[action["buy_idx"]]
 
     def to_dict(self):
         return {
             "coin":         self.coin,
-            "center":       self.center,
-            "spacing_mult": self.spacing_mult,
+            "center_price": self.center_price,
             "created_at":   self.created_at,
             "levels":       self.levels,
             "open_buys":    {str(k): v for k, v in self.open_buys.items()},
@@ -256,499 +325,320 @@ class Grid:
     def from_dict(cls, d):
         g = cls.__new__(cls)
         g.coin         = d["coin"]
-        g.center       = d.get("center", d.get("center_price", 0))
-        g.spacing_mult = d.get("spacing_mult", 1.0)
-        g.created_at   = d.get("created_at", "")
+        g.center_price = d["center_price"]
+        g.created_at   = d["created_at"]
         g.levels       = d["levels"]
         g.open_buys    = {int(k): v for k, v in d.get("open_buys", {}).items()}
         return g
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 3: WALLET  (single source of truth for all money)
+# MODULE 3: RISK & STATE MANAGER
 # ══════════════════════════════════════════════════════════════════════════════
-class Wallet:
-    """
-    Simple, correct accounting:
-      buy(size)  → wallet -= size
-      sell(size, profit) → wallet += size + profit
-      daily_pnl tracks REALIZED profit/loss from sells only.
-      Prefill is treated as deployment (wallet decreases, no daily_pnl impact).
-    """
-
+class RiskManager:
     def __init__(self):
-        self.cash                  = CONFIG["paper_budget"]
-        self.total_pnl             = 0.0   # realized profit from sells
-        self.daily_pnl             = 0.0   # realized profit today from sells
-        self.win_streak            = 0
-        self.last_date             = datetime.now(ET).date().isoformat()
-        self.trade_log             = []    # recent trades for dashboard
-        self.wallet_history        = []    # portfolio value over time
-        self.peak_portfolio        = CONFIG["paper_budget"]  # all-time high portfolio value
-        self.circuit_breaker_active = False  # True = pause all new buys
+        self.wallet       = CONFIG["paper_budget"]
+        self.total_pnl    = 0.0
+        self.daily_pnl    = 0.0
+        self.trade_history = []
+        self.last_reset_date = datetime.now(ET).date().isoformat()
+        self._load_state()
 
-    def reset_daily_if_needed(self):
-        today = datetime.now(ET).date().isoformat()
-        if today != self.last_date:
-            self.daily_pnl = 0.0
-            self.last_date = today
-            log.info("[WALLET] Daily P&L reset")
+    def _load_state(self):
+        try:
+            with open(CONFIG["state_file"]) as f:
+                s = json.load(f)
+            self.wallet            = s.get("wallet", CONFIG["paper_budget"])
+            self.total_pnl         = s.get("total_pnl", 0.0)
+            self.daily_pnl         = s.get("daily_pnl", 0.0)
+            self.trade_history     = s.get("trade_history", [])
+            self.last_reset_date   = s.get("last_reset_date", datetime.now(ET).date().isoformat())
+            log.info(f"[INIT] Seraphina wallet: ${self.wallet:.2f} | Total P&L: ${self.total_pnl:+.2f}")
+        except:
+            log.info("[INIT] Fresh state — starting simulation")
 
-    def buy(self, coin, price, size_usd):
-        """Deduct cost from wallet. Returns actual size used."""
-        size_usd = min(size_usd, self.cash)  # can't spend more than we have
-        size_usd = round(size_usd, 2)
-        self.cash = round(self.cash - size_usd, 4)
-        self.trade_log.append({
-            "ts": datetime.now(ET).isoformat(), "coin": coin,
-            "action": "BUY", "price": price, "size": size_usd,
-            "pnl": 0, "cash": round(self.cash, 2),
-        })
-        return size_usd
-
-    def sell(self, coin, price, size_usd, profit_usd):
-        """Return cost + profit to wallet. Track realized PnL."""
-        returned = round(size_usd + profit_usd, 4)
-        self.cash       = round(self.cash + returned, 4)
-        self.total_pnl  = round(self.total_pnl + profit_usd, 4)
-        self.daily_pnl  = round(self.daily_pnl + profit_usd, 4)
-        if profit_usd > 0:
-            self.win_streak += 1
-        else:
-            self.win_streak = 0
-        self.trade_log.append({
-            "ts": datetime.now(ET).isoformat(), "coin": coin,
-            "action": "SELL", "price": price, "size": size_usd,
-            "pnl": round(profit_usd, 4), "cash": round(self.cash, 2),
-        })
-        return returned
-
-    def prefill_buy(self, coin, price, size_usd):
-        """Prefill: deduct from cash but don't count as daily loss."""
-        size_usd = min(size_usd, self.cash)
-        size_usd = round(size_usd, 2)
-        self.cash = round(self.cash - size_usd, 4)
-        self.trade_log.append({
-            "ts": datetime.now(ET).isoformat(), "coin": coin,
-            "action": "BUY", "price": price, "size": size_usd,
-            "pnl": 0, "cash": round(self.cash, 2), "prefill": True,
-        })
-        return size_usd
-
-    def daily_loss_cap_hit(self):
-        """Only block buying if we've LOST more than the cap today (realized)."""
-        return self.daily_pnl < -CONFIG["daily_loss_cap"]
-
-    def update_peak(self, portfolio_value):
-        """Track all-time high and manage circuit breaker."""
-        if portfolio_value > self.peak_portfolio:
-            self.peak_portfolio = portfolio_value
-        drawdown = (self.peak_portfolio - portfolio_value) / self.peak_portfolio
-        if not self.circuit_breaker_active and drawdown >= CONFIG["drawdown_pause_pct"]:
-            self.circuit_breaker_active = True
-            log.warning("[CIRCUIT BREAKER] Portfolio down %.1f%% from peak $%.2f — PAUSING ALL NEW BUYS",
-                        drawdown * 100, self.peak_portfolio)
-        elif self.circuit_breaker_active and drawdown <= CONFIG["drawdown_resume_pct"]:
-            self.circuit_breaker_active = False
-            log.info("[CIRCUIT BREAKER] Portfolio recovered to within %.1f%% of peak — RESUMING",
-                     drawdown * 100)
-        return drawdown
-
-    def size_pct(self):
-        """Streak-based trade size percentage."""
-        pct = 0.08
-        for threshold in sorted(CONFIG["streak_tiers"]):
-            if self.win_streak >= threshold:
-                pct = CONFIG["streak_tiers"][threshold]
-        return pct
-
-    def trade_size(self, wallet_cash):
-        raw = wallet_cash * self.size_pct()
-        return round(max(CONFIG["trade_size_min"],
-                         min(CONFIG["trade_size_max"], raw)), 2)
-
-    def win_rate(self):
-        sells = [t for t in self.trade_log if t["action"] == "SELL"]
-        if not sells:
-            return 0.0
-        wins = sum(1 for t in sells if t["pnl"] > 0)
-        return round(wins / len(sells) * 100, 1)
-
-    def to_dict(self):
-        return {
-            "cash":                   round(self.cash, 4),
-            "total_pnl":              round(self.total_pnl, 4),
-            "daily_pnl":              round(self.daily_pnl, 4),
-            "win_streak":             self.win_streak,
-            "last_date":              self.last_date,
-            "trade_log":              self.trade_log[-200:],
-            "wallet_history":         self.wallet_history[-500:],
-            "peak_portfolio":         round(self.peak_portfolio, 4),
-            "circuit_breaker_active": self.circuit_breaker_active,
-        }
-
-    def load_dict(self, d):
-        self.cash                   = d.get("cash", CONFIG["paper_budget"])
-        self.total_pnl              = d.get("total_pnl", 0.0)
-        self.daily_pnl              = d.get("daily_pnl", 0.0)
-        self.win_streak             = d.get("win_streak", 0)
-        self.last_date              = d.get("last_date", datetime.now(ET).date().isoformat())
-        self.trade_log              = d.get("trade_log", [])
-        self.wallet_history         = d.get("wallet_history", [])
-        self.peak_portfolio         = d.get("peak_portfolio", CONFIG["paper_budget"])
-        self.circuit_breaker_active = d.get("circuit_breaker_active", False)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODULE 4: STATE (save/load)
-# ══════════════════════════════════════════════════════════════════════════════
-class State:
-    @staticmethod
-    def save(wallet, grids):
+    def _save_state(self, grids):
         try:
             with open(CONFIG["state_file"], "w") as f:
                 json.dump({
-                    "wallet": wallet.to_dict(),
-                    "grids":  {coin: g.to_dict() for coin, g in grids.items()},
+                    "wallet":           round(self.wallet, 4),
+                    "total_pnl":        round(self.total_pnl, 4),
+                    "daily_pnl":        round(self.daily_pnl, 4),
+                    "trade_history":    self.trade_history[-100:],
+                    "last_reset_date":  self.last_reset_date,
+                    "grids":            {k: v.to_dict() for k, v in grids.items()},
                 }, f, indent=2)
         except Exception as e:
             log.warning(f"State save failed: {e}")
 
-    @staticmethod
-    def load():
-        try:
-            with open(CONFIG["state_file"]) as f:
-                return json.load(f)
-        except:
-            return None
+    def reset_daily(self):
+        today = datetime.now(ET).date().isoformat()
+        if today != self.last_reset_date:
+            self.daily_pnl       = 0.0
+            self.last_reset_date = today
+
+    def record_trade(self, coin, action, price, size_usd, pnl):
+        self.wallet    += pnl
+        self.total_pnl += pnl
+        self.daily_pnl += pnl
+        self.trade_history.append({
+            "timestamp": datetime.now(ET).isoformat(),
+            "coin":      coin,
+            "action":    action,
+            "price":     price,
+            "size_usd":  size_usd,
+            "pnl":       round(pnl, 4),
+            "wallet":    round(self.wallet, 2),
+        })
+
+    def win_rate(self):
+        wins = sum(1 for t in self.trade_history if t.get("pnl", 0) > 0)
+        total = len([t for t in self.trade_history if t.get("action") == "SELL"])
+        return round(wins / total * 100, 1) if total > 0 else 0
+
+    def roi(self):
+        return round((self.total_pnl / CONFIG["paper_budget"]) * 100, 2)
+
+    def status(self):
+        return (f"Wallet: ${self.wallet:.2f} | P&L: ${self.total_pnl:+.4f} | "
+                f"Daily: ${self.daily_pnl:+.4f} | Win rate: {self.win_rate()}% | ROI: {self.roi():+.1f}%")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 4: TRADE LOGGER
+# ══════════════════════════════════════════════════════════════════════════════
+class TradeLogger:
+    def __init__(self):
+        if not os.path.exists(CONFIG["csv_file"]):
+            with open(CONFIG["csv_file"], "w", newline="") as f:
+                csv.writer(f).writerow(["timestamp", "coin", "action", "price", "size_usd", "pnl", "wallet"])
+
+    def log(self, coin, action, price, size_usd, pnl, wallet):
+        with open(CONFIG["csv_file"], "a", newline="") as f:
+            csv.writer(f).writerow([
+                datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
+                coin, action, f"{price:.4f}", f"{size_usd:.2f}",
+                f"{pnl:+.4f}", f"{wallet:.2f}"
+            ])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN BOT
 # ══════════════════════════════════════════════════════════════════════════════
 class SeraphinaBot:
-
     def __init__(self):
-        self.fetcher       = PriceFetcher()
-        self.wallet        = Wallet()
-        self.grids         = {}        # coin → Grid
-        self.prev_prices   = {}        # coin → float
-        self.price_hist    = {}        # coin → [float] for vol detection
-        self.scan_count    = 0
-        self._load_state()
+        self.fetcher    = PriceFetcher()
+        self.risk       = RiskManager()
+        self.logger     = TradeLogger()
+        self.grids      = {}       # coin -> GridManager
+        self.prev_prices = {}      # coin -> last mid price
+        self.scan_count  = 0
+        self.trade_count = 0
+        self._load_grids()
 
-    def _load_state(self):
-        data = State.load()
-        if not data:
-            log.info("[INIT] No state file — fresh start at $%.2f", CONFIG["paper_budget"])
-            return
-        self.wallet.load_dict(data.get("wallet", {}))
-        log.info("[INIT] Loaded wallet: cash=$%.2f | total_pnl=$%+.2f | streak=%dW",
-                 self.wallet.cash, self.wallet.total_pnl, self.wallet.win_streak)
-        for coin, gd in data.get("grids", {}).items():
-            g = Grid.from_dict(gd)
-            self.grids[coin] = g
-            log.info("[INIT] Restored grid %s | center=$%.4f | %d open buys",
-                     coin, g.center, len(g.open_buys))
-
-    def _vol_regime(self, coin, price):
-        hist = self.price_hist.setdefault(coin, [])
-        hist.append(price)
-        if len(hist) > 120:
-            hist = hist[-120:]
-        self.price_hist[coin] = hist
-
-        min_readings = CONFIG["vol_min_readings"]
-        if len(hist) < min_readings:
-            return "normal", 1.0, 1.0
-
-        swing = (max(hist) - min(hist)) / min(hist) * 100
-        if swing >= CONFIG["vol_hot_threshold"]:
-            return "hot",    0.7, 1.2
-        elif swing <= CONFIG["vol_cold_threshold"]:
-            return "cold",   1.8, 0.8
-        return "normal", 1.0, 1.0
-
-    def _new_grid(self, coin, price, spacing_mult=1.0):
-        """Create a fresh grid, run prefill, handle wallet deduction."""
-        g = Grid(coin, price, spacing_mult)
-
-        # Prefill: buy N levels closest below current price
-        n = CONFIG["prefill_levels"]
-        to_fill = g.prefill(price, n)
-        for idx, lvl in to_fill:
-            if self.wallet.cash < CONFIG["trade_size_min"]:
-                break
-            size = self.wallet.trade_size(self.wallet.cash)
-            actual = self.wallet.prefill_buy(coin, lvl, size)
-            g.record_buy(idx, lvl, actual)
-            log.info("  [GRID/%s] PREFILL buy | level=$%.4f | size=$%.2f | cash=$%.2f",
-                     coin, lvl, actual, self.wallet.cash)
-
-        self.grids[coin] = g
-        self.prev_prices[coin] = price * 0.9999  # nudge so first scan runs crossings
-
-    def _portfolio_value(self, prices):
-        """Cash + current market value of all open positions."""
-        pos_value = 0.0
-        for coin, g in self.grids.items():
-            curr = prices.get(coin)
-            if not curr:
-                continue
-            for buy in g.open_buys.values():
-                pos_value += buy["size_usd"] * (curr / buy["buy_price"])
-        return round(self.wallet.cash + pos_value, 2)
-
-    def _write_dashboard(self, prices, mood, trades_this_scan, vol_regimes, portfolio_value_now=None):
+    def _load_grids(self):
+        """Restore grids from state file if available."""
         try:
-            if portfolio_value_now is None:
-                open_pos = sum(sum(b["size_usd"] for b in g.open_buys.values()) for g in self.grids.values())
-                portfolio_value_now = round(self.wallet.cash + open_pos, 2)
-            portfolio_value = self._portfolio_value(prices)
-            portfolio_pnl   = round(portfolio_value - CONFIG["paper_budget"], 4)
-            portfolio_roi   = round(portfolio_pnl / CONFIG["paper_budget"] * 100, 2)
+            with open(CONFIG["state_file"]) as f:
+                s = json.load(f)
+            for coin, gd in s.get("grids", {}).items():
+                self.grids[coin] = GridManager.from_dict(gd)
+                log.info(f"[INIT] Restored grid for {coin} — center ${gd['center_price']:,.2f} | "
+                         f"{len(gd.get('open_buys', {}))} open buys")
+        except:
+            pass
 
-            self.wallet.wallet_history.append({
-                "t": datetime.now(ET).isoformat(),
-                "v": portfolio_value,
-            })
-            if len(self.wallet.wallet_history) > 500:
-                self.wallet.wallet_history = self.wallet.wallet_history[-500:]
+    def _pick_quote(self, mood):
+        return random.choice(SERA_QUOTES.get(mood, SERA_QUOTES["watching"]))
 
+    def _pick_art(self, mood):
+        return random.choice(SERA_ART.get(mood, SERA_ART["watching"]))
+
+    def _write_dashboard(self, prices, mood, trades_this_scan):
+        try:
             grids_out = []
-            for coin, g in self.grids.items():
+            for coin, grid in self.grids.items():
                 curr = prices.get(coin)
-                buys_list = []
-                for k, v in g.open_buys.items():
-                    live_diff     = round(curr - v["buy_price"], 4) if curr else 0
-                    live_diff_pct = round(live_diff / v["buy_price"] * 100, 2) if curr and v["buy_price"] else 0
-                    buys_list.append({
-                        "level":       g.levels[int(k)],
-                        "buyPrice":    v["buy_price"],
-                        "sizeUsd":     v["size_usd"],
-                        "boughtAt":    v["bought_at"],
-                        "livePrice":   curr,
-                        "liveDiff":    live_diff,
-                        "liveDiffPct": live_diff_pct,
-                        "coin":        coin,
-                    })
                 grids_out.append({
                     "coin":         coin,
-                    "centerPrice":  g.center,
+                    "centerPrice":  grid.center_price,
                     "currentPrice": curr,
-                    "levels":       g.levels,
-                    "openBuys":     len(g.open_buys),
-                    "openBuysList": buys_list,
+                    "levels":       grid.levels,
+                    "openBuys":     len(grid.open_buys),
+                    "openBuysList": [
+                        {"level": grid.levels[int(k)], "buyPrice": v["buy_price"],
+                         "sizeUsd": v["size_usd"], "boughtAt": v["bought_at"]}
+                        for k, v in grid.open_buys.items()
+                    ],
                     "spacing":      f"{CONFIG['grid_spacing_pct']*100:.1f}%",
-                    "regime":       vol_regimes.get(coin, "normal"),
+                    "needsReset":   grid.needs_reset(curr) if curr else False,
                 })
+
+            # Calculate live portfolio value = cash + current value of all open buys
+            open_position_value = 0.0
+            for coin, grid in self.grids.items():
+                curr = prices.get(coin)
+                if not curr:
+                    continue
+                for k, v in grid.open_buys.items():
+                    # Each open buy is worth its current market value
+                    open_position_value += v["size_usd"] * (curr / v["buy_price"])
+
+            portfolio_value = round(self.risk.wallet + open_position_value, 2)
+            portfolio_pnl   = round(portfolio_value - CONFIG["paper_budget"], 4)
+            portfolio_roi   = round((portfolio_value - CONFIG["paper_budget"]) / CONFIG["paper_budget"] * 100, 2)
 
             with open(CONFIG["dashboard_file"], "w") as f:
                 json.dump({
-                    "lastScan":        datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
-                    "mode":            "PAPER" if CONFIG["dry_run"] else "LIVE",
-                    "mood":            mood,
-                    "quote":           random.choice(QUOTES.get(mood, QUOTES["watching"])),
-                    "art":             random.choice(ART.get(mood, ART["watching"])),
-                    "cash":            round(self.wallet.cash, 2),
-                    "portfolioValue":  portfolio_value,
-                    "openPositionValue": round(portfolio_value - self.wallet.cash, 2),
-                    "portfolioPnl":    portfolio_pnl,
-                    "portfolioRoi":    portfolio_roi,
-                    "totalPnl":        round(self.wallet.total_pnl, 4),
-                    "dailyPnl":        round(self.wallet.daily_pnl, 4),
-                    "winRate":         self.wallet.win_rate(),
-                    "winStreak":       self.wallet.win_streak,
-                    "sizePct":         round(self.wallet.size_pct() * 100, 1),
-                    "startingBudget":  CONFIG["paper_budget"],
-                    "scanCount":       self.scan_count,
-                    "tradesThisScan":  trades_this_scan,
-                    "grids":           grids_out,
-                    "recentTrades":    self.wallet.trade_log[-20:],
-                    "walletHistory":   self.wallet.wallet_history[-500:],
-                    "volRegimes":      vol_regimes,
-                    "circuitBreaker":  self.wallet.circuit_breaker_active,
-                    "peakPortfolio":   round(self.wallet.peak_portfolio, 2),
-                    "drawdownPct":     round((self.wallet.peak_portfolio - portfolio_value) / self.wallet.peak_portfolio * 100, 2) if self.wallet.peak_portfolio > 0 else 0,
-                    "prices":          {c: round(p, 4) for c, p in prices.items() if p},
+                    "lastScan":          datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
+                    "mode":              "PAPER" if CONFIG["dry_run"] else "LIVE",
+                    "mood":              mood,
+                    "quote":             self._pick_quote(mood),
+                    "art":               self._pick_art(mood),
+                    "wallet":            round(self.risk.wallet, 2),
+                    "portfolioValue":    portfolio_value,
+                    "portfolioPnl":      portfolio_pnl,
+                    "portfolioRoi":      portfolio_roi,
+                    "openPositionValue": round(open_position_value, 4),
+                    "startingBudget":    CONFIG["paper_budget"],
+                    "totalPnl":          round(self.risk.total_pnl, 4),
+                    "dailyPnl":          round(self.risk.daily_pnl, 4),
+                    "winRate":           self.risk.win_rate(),
+                    "roi":               self.risk.roi(),
+                    "tradesTotal":       len(self.risk.trade_history),
+                    "tradesThisScan":    trades_this_scan,
+                    "scanCount":         self.scan_count,
+                    "grids":             grids_out,
+                    "recentTrades":      self.risk.trade_history[-20:],
+                    "prices":            {c: round(p, 2) for c, p in prices.items() if p},
                 }, f, indent=2)
         except Exception as e:
             log.warning(f"Dashboard write failed: {e}")
 
+    def _init_grid(self, coin, price):
+        self.grids[coin] = GridManager(coin, price)
+        self.prev_prices[coin] = price
+
     def run_once(self):
         self.scan_count += 1
-        self.wallet.reset_daily_if_needed()
+        self.risk.reset_daily()
 
-        log.info("=" * 60)
-        log.info("  SERAPHINA v5 #%d | %s | cash=$%.2f | total_pnl=$%+.2f | daily=$%+.2f | streak=%dW",
-                 self.scan_count,
-                 datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
-                 self.wallet.cash, self.wallet.total_pnl,
-                 self.wallet.daily_pnl, self.wallet.win_streak)
-        log.info("=" * 60)
+        log.info(f"{'='*60}")
+        log.info(f"  SERAPHINA GRID v3 #{self.scan_count} -- "
+                 f"{'PAPER' if CONFIG['dry_run'] else 'LIVE'} -- "
+                 f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')}")
+        log.info(f"  {self.risk.status()}")
+        log.info(f"{'='*60}")
 
-        # ── Step 1: Fetch prices ──
-        portfolio_value_now = round(self.wallet.cash + sum(
-            sum(b["size_usd"] for b in g.open_buys.values())
-            for g in self.grids.values()
-        ), 2)  # pre-calculated so dashboard always has it
+        # ── Step 1: Fetch current prices ──
         prices = {}
         for coin in CONFIG["coins"]:
-            p = self.fetcher.fetch(coin)
+            p = self.fetcher.fetch_price(coin)
             if p:
-                prices[coin] = p
-                log.info("  %s: $%.4f", coin, p)
+                prices[coin] = p["mid"]
+                log.info(f"  {coin}: ${p['mid']:,.2f}")
             else:
-                log.warning("  %s: fetch failed", coin)
+                log.warning(f"  {coin}: price fetch failed")
 
-        # ── Step 2: Init / reset grids ──
-        vol_regimes = {}
+        # ── Step 2: Init or reset grids if needed ──
         for coin, price in prices.items():
-            regime, spacing_mult, _ = self._vol_regime(coin, price)
-            vol_regimes[coin] = regime
-
             if coin not in self.grids:
-                log.info("  [GRID/%s] No grid — initialising", coin)
-                self._new_grid(coin, price, spacing_mult)
-            elif self.grids[coin].drifted(price):
-                old_g = self.grids[coin]
-                n_closed = 0
-                for buy_idx, buy in list(old_g.open_buys.items()):
-                    profit = round(buy["size_usd"] * (price - buy["buy_price"]) / buy["buy_price"], 4)
-                    self.wallet.sell(coin, price, buy["size_usd"], profit)
-                    sign = "+" if profit >= 0 else ""
-                    log.info("  [GRID/%s] DRIFT CLOSE | bought=$%.4f | profit=%s$%.4f | cash=$%.2f",
-                             coin, buy["buy_price"], sign, profit, self.wallet.cash)
-                    n_closed += 1
-                log.info("  [GRID/%s] Drifted >3%% — closed %d positions, rebuilding at $%.4f",
-                         coin, n_closed, price)
-                self._new_grid(coin, price, spacing_mult)
+                log.info(f"  [GRID/{coin}] Initialising new grid at ${price:,.2f}")
+                self._init_grid(coin, price)
+            elif self.grids[coin].needs_reset(price):
+                log.info(f"  [GRID/{coin}] Price drifted too far — rebuilding grid at ${price:,.2f}")
+                self._init_grid(coin, price)
 
-        # ── Step 3: Portfolio drawdown circuit breaker ──
-        # Always defined — calculated before any price-dependent logic
-        open_position_value = sum(
-            sum(b["size_usd"] for b in g.open_buys.values())
-            for g in self.grids.values()
-        )
-        portfolio_value_now = round(self.wallet.cash + open_position_value, 2)
-        drawdown = self.wallet.update_peak(portfolio_value_now)
-
-        # ── Step 3b: Per-coin stop loss — close all buys if unrealized loss > 20% ──
-        for coin, price in list(prices.items()):
-            if coin not in self.grids:
-                continue
-            g = self.grids[coin]
-            if not g.open_buys:
-                continue
-            total_cost = sum(b["size_usd"] for b in g.open_buys.values())
-            current_value = sum(
-                b["size_usd"] * (price / b["buy_price"])
-                for b in g.open_buys.values()
-            )
-            unrealized_loss_pct = (total_cost - current_value) / total_cost if total_cost > 0 else 0
-            if unrealized_loss_pct >= CONFIG["coin_stoploss_pct"]:
-                log.warning("[STOP LOSS] %s unrealized loss %.1f%% — closing %d open buys",
-                            coin, unrealized_loss_pct * 100, len(g.open_buys))
-                for buy_idx, buy in list(g.open_buys.items()):
-                    loss = round(buy["size_usd"] * (price - buy["buy_price"]) / buy["buy_price"], 4)
-                    self.wallet.sell(coin, price, buy["size_usd"], loss)
-                    g.record_sell(buy_idx)
-                    log.warning("  [STOP LOSS/%s] Closed buy @ $%.4f | loss=$%+.4f", coin, buy["buy_price"], loss)
-
-        # ── Step 4: Check crossings ──
+        # ── Step 3: Check grid crossings ──
         trades_this_scan = 0
-        total_open = sum(len(g.open_buys) for g in self.grids.values())
+        total_open_buys = sum(len(g.open_buys) for g in self.grids.values())
 
         for coin, price in prices.items():
-            if coin not in self.grids:
-                continue
-            g    = self.grids[coin]
+            if coin not in self.grids: continue
+            grid = self.grids[coin]
             prev = self.prev_prices.get(coin, price)
 
             if prev == price:
-                log.info("  [GRID/%s] No price change — skip", coin)
+                log.info(f"  [GRID/{coin}] No price change — skip")
+                self.prev_prices[coin] = price
                 continue
 
-            regime, spacing_mult, size_mult = self._vol_regime(coin, price)
+            # ── Trailing stop check (runs every scan regardless of price change) ──
+            trail_actions = grid.check_trailing_stops(price)
+            for action in trail_actions:
+                grid.execute_sell(action)
+                pnl = action["profit_usd"]
+                self.risk.record_trade(coin, "SELL", action["price"],
+                                       action["size_usd"], action["size_usd"] + pnl)
+                self.logger.log(coin, "SELL", action["price"],
+                                action["size_usd"], pnl, self.risk.wallet)
+                sign = "+" if pnl >= 0 else ""
+                log.info(f"  [TRAIL/{coin}] SELL at ${action['price']:,.2f} | "
+                         f"Bought at ${action['buy_price']:,.2f} | "
+                         f"P&L: {sign}${pnl:.4f} | Wallet: ${self.risk.wallet:.2f}")
+                trades_this_scan += 1
+                self.trade_count += 1
 
-            # Rebuild on regime shift — only after enough readings
-            last_regime = getattr(g, "_last_regime", regime)
-            if last_regime != regime:
-                log.info("  [GRID/%s] Regime shift %s->%s — noted, no rebuild", coin, last_regime, regime)
-            g._last_regime = regime
+            actions = grid.check_crossings(
+                prev, price,
+                self.risk.wallet,
+                self.risk.daily_pnl,
+                total_open_buys
+            )
 
-            crossings = g.find_crossings(prev, price)
-
-            for action, idx, lvl in crossings:
-                if action == "BUY":
-                    # Guards
-                    if self.wallet.circuit_breaker_active:
-                        log.info("  [GRID/%s] Circuit breaker active — skip buy", coin)
-                        continue
-                    if len(g.open_buys) >= CONFIG["max_open_per_coin"]:
-                        log.info("  [GRID/%s] Max open per coin reached — skip buy", coin)
-                        continue
-                    if total_open >= CONFIG["max_open_total"]:
-                        log.info("  [GRID/%s] Max open total reached — skip buy", coin)
-                        continue
-                    if self.wallet.daily_loss_cap_hit():
-                        log.info("  [GRID/%s] Daily loss cap hit — skip buy", coin)
-                        continue
-                    if idx in g.open_buys:
-                        continue  # already have a buy here
-
-                    # Size
-                    effective_pct = min(0.14, self.wallet.size_pct() * size_mult)
-                    raw = self.wallet.cash * effective_pct
-                    size = round(max(CONFIG["trade_size_min"],
-                                     min(CONFIG["trade_size_max"], raw)), 2)
-                    if size > self.wallet.cash:
-                        log.info("  [GRID/%s] Not enough cash — skip buy", coin)
-                        continue
-
-                    actual = self.wallet.buy(coin, lvl, size)
-                    g.record_buy(idx, lvl, actual)
-                    total_open += 1
+            for action in actions:
+                if action["action"] == "BUY":
+                    ts = action.get("trade_size", CONFIG["trade_size_pct"] * self.risk.wallet)
+                    grid.execute_buy(action)
+                    self.risk.record_trade(coin, "BUY", action["price"], ts, -ts)
+                    self.logger.log(coin, "BUY", action["price"], ts, -ts, self.risk.wallet)
+                    log.info(f"  [GRID/{coin}] BUY at ${action['price']:,.2f} | "
+                             f"${ts:.2f} | Wallet: ${self.risk.wallet:.2f}")
                     trades_this_scan += 1
-                    log.info("  [GRID/%s] BUY  | $%.4f | size=$%.2f | cash=$%.2f",
-                             coin, lvl, actual, self.wallet.cash)
 
-                elif action == "SELL":
-                    # Sweep: sell ALL open buys that are profitable at this level
-                    buys_below = {k: v for k, v in g.open_buys.items()
-                                  if g.levels[k] < lvl}
-                    if not buys_below:
-                        continue
-                    for buy_idx, buy in list(buys_below.items()):
-                        profit = round(buy["size_usd"] * (lvl - buy["buy_price"]) / buy["buy_price"], 4)
-                        self.wallet.sell(coin, lvl, buy["size_usd"], profit)
-                        g.record_sell(buy_idx)
-                        total_open -= 1
-                        trades_this_scan += 1
-                        log.info("  [GRID/%s] SELL | $%.4f | bought=$%.4f | profit=$%+.4f | cash=$%.2f",
-                                 coin, lvl, buy["buy_price"], profit, self.wallet.cash)
+                elif action["action"] == "SELL":
+                    grid.execute_sell(action)
+                    pnl = action["profit_usd"]
+                    self.risk.record_trade(coin, "SELL", action["price"],
+                                          action["size_usd"], action["size_usd"] + pnl)
+                    self.logger.log(coin, "SELL", action["price"],
+                                   action["size_usd"], pnl, self.risk.wallet)
+                    sign = "+" if pnl >= 0 else ""
+                    log.info(f"  [GRID/{coin}] SELL at ${action['price']:,.2f} | "
+                             f"Bought at ${action['buy_price']:,.2f} | "
+                             f"P&L: {sign}${pnl:.4f} | Wallet: ${self.risk.wallet:.2f}")
+                    trades_this_scan += 1
+                    self.trade_count += 1
 
             self.prev_prices[coin] = price
-            log.info("  [GRID/%s] Price=$%.4f | open=%d | regime=%s",
-                     coin, price, len(g.open_buys), regime)
+            log.info(f"  [GRID/{coin}] Price: ${price:,.2f} | Open buys: {len(grid.open_buys)} | "
+                     f"Actions this scan: {len(actions)}")
 
-        # ── Step 4: Save & dashboard ──
-        State.save(self.wallet, self.grids)
+        # ── Step 4: Save state & dashboard ──
+        self.risk._save_state(self.grids)
 
-        total_open_final = sum(len(g.open_buys) for g in self.grids.values())
-        mood = "hunting" if trades_this_scan > 0 else ("watching" if total_open_final > 0 else "sleeping")
-        log.info("\nScan done | trades=%d | open=%d | cash=$%.2f | total_pnl=$%+.2f\n",
-                 trades_this_scan, total_open_final, self.wallet.cash, self.wallet.total_pnl)
+        if trades_this_scan > 0:
+            mood = "hunting"
+        elif total_open_buys > 0:
+            mood = "watching"
+        else:
+            mood = "sleeping" if self.scan_count % 5 == 0 else "watching"
 
-        self._write_dashboard(prices, mood, trades_this_scan, vol_regimes, portfolio_value_now)
+        log.info(f"\nScan done | Trades: {trades_this_scan} | "
+                 f"Open buys: {sum(len(g.open_buys) for g in self.grids.values())} | "
+                 f"{self.risk.status()}\n")
+
+        self._write_dashboard(prices, mood, trades_this_scan)
 
     def run_loop(self):
-        log.info("Seraphina v5 starting | mode=%s | budget=$%.0f | coins=%s",
-                 "PAPER" if CONFIG["dry_run"] else "LIVE",
-                 CONFIG["paper_budget"], ", ".join(CONFIG["coins"]))
-        log.info("Grid: %d levels | %.1f%% spacing | %.0f%% base size | 15s scans | NO API CALLS",
-                 CONFIG["grid_levels"], CONFIG["grid_spacing_pct"] * 100,
-                 CONFIG["trade_size_pct"] * 100)
+        log.info("Seraphina Grid Trading Engine v3 starting...")
+        log.info(f"  Mode: {'PAPER' if CONFIG['dry_run'] else 'LIVE'} | "
+                 f"Budget: ${CONFIG['paper_budget']} | "
+                 f"Coins: {', '.join(CONFIG['coins'])}")
+        log.info(f"  Grid: {CONFIG['grid_levels']} levels | "
+                 f"Spacing: {CONFIG['grid_spacing_pct']*100:.1f}% | "
+                 f"Trade size: {CONFIG['trade_size_pct']*100:.0f}% of wallet (${CONFIG['trade_size_min']}-${CONFIG['trade_size_max']})")
+        log.info("  No AI calls. Pure grid. Always profitable in volatile markets.")
         while True:
             try:
                 self.run_once()
@@ -756,8 +646,8 @@ class SeraphinaBot:
                 log.info("Seraphina rests. Goodbye.")
                 break
             except Exception as e:
-                log.error("Unexpected error: %s", e, exc_info=True)
-            log.info("Sleeping %ds...\n", CONFIG["scan_interval_sec"])
+                log.error(f"Unexpected error: {e}", exc_info=True)
+            log.info(f"Sleeping {CONFIG['scan_interval_sec']}s...\n")
             time.sleep(CONFIG["scan_interval_sec"])
 
 
