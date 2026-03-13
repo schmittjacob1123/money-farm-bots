@@ -15,7 +15,6 @@ CORS(app, supports_credentials=True)
 
 # ── SESSION AUTH ──
 FARM_PASSWORD = os.environ.get("FARM_PASSWORD", "kickrocks!")
-FARM_API_TOKEN = os.environ.get("FARM_API_TOKEN", "")
 SESSION_SECRET = "d4f2861dc96539bb657aef8e80e37e590eb214de23308c69a85c5deefefe0ea6"
 SESSIONS = set()  # in-memory valid tokens
 
@@ -237,35 +236,69 @@ def auth_check():
 
 
 
+FARM_API_TOKEN = os.environ.get("FARM_API_TOKEN", "")
 
-def _read_json(fname, default=None):
-    try:
-        with open(os.path.join(WORK_DIR, fname)) as f:
-            return json.load(f)
-    except:
-        return default
+# Whitelist of files Claude is allowed to read remotely
+READABLE_FILES = [
+    "seraphina_bot.py", "jacob_bot.py", "loachy_bot.py",
+    "farm_api.py", "farm_deploy.py", "farm_alerts.py", "farm_gist.py",
+    "seraphina_dashboard.html", "jacob_dashboard.html", "loachy_dashboard.html",
+    "index.html", "login.html",
+    "seraphina_data.json", "seraphina_state.json", "seraphina_daily.json",
+    "loachy_data.json", "loachy_state.json", "loachy_pending.json",
+    "jacob_data.json",
+]
+
+def valid_api_token(req):
+    token = req.args.get("token") or req.headers.get("X-API-Token")
+    return FARM_API_TOKEN and token == FARM_API_TOKEN
 
 
 @app.route("/farm-data", methods=["GET"])
 def farm_data():
-    """Live farm status for Claude. Auth: ?token=FARM_API_TOKEN"""
-    token = request.args.get("token") or request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not FARM_API_TOKEN or token != FARM_API_TOKEN:
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    """Live farm status for Claude — token protected."""
+    if not valid_api_token(request):
+        return jsonify({"error": "unauthorized"}), 401
     try:
         screens = subprocess.run(["screen", "-ls"], capture_output=True, text=True).stdout.strip()
-    except:
-        screens = "unavailable"
-    data = {
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "screens": screens,
-        "seraphina_data": _read_json("seraphina_data.json"),
-        "jacob_data":     _read_json("jacob_data.json"),
-        "loachy_data":    _read_json("loachy_data.json"),
-        "loachy_state":   _read_json("loachy_state.json"),
-        "loachy_pending": _read_json("loachy_pending.json", {"pending": [], "approved": [], "rejected": []}),
-    }
-    return jsonify(data)
+
+        def read_json(fname):
+            try:
+                with open(os.path.join(WORK_DIR, fname)) as f:
+                    return json.load(f)
+            except:
+                return None
+
+        return jsonify({
+            "seraphina_data": read_json("seraphina_data.json"),
+            "jacob_data":     read_json("jacob_data.json"),
+            "loachy_data":    read_json("loachy_data.json"),
+            "loachy_state":   read_json("loachy_state.json"),
+            "loachy_pending": read_json("loachy_pending.json"),
+            "screens":        screens,
+            "updated_at":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/file", methods=["GET"])
+def read_file():
+    """Return contents of a whitelisted file — token protected."""
+    if not valid_api_token(request):
+        return jsonify({"error": "unauthorized"}), 401
+    name = request.args.get("name", "")
+    if name not in READABLE_FILES:
+        return jsonify({"error": f"file not in whitelist: {name}"}), 403
+    fpath = os.path.join(WORK_DIR, name)
+    try:
+        with open(fpath) as f:
+            content = f.read()
+        return jsonify({"name": name, "content": content, "size": len(content)})
+    except FileNotFoundError:
+        return jsonify({"error": f"{name} not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
