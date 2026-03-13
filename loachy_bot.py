@@ -313,7 +313,7 @@ class OddsFetcher:
     BASE_URL = "https://api.the-odds-api.com/v4/sports"
     _cache   = {}
     CACHE_SECS = 1500   # 25 min
-    MAX_LIVE_CALLS = 1  # live API calls per scan
+    MAX_LIVE_CALLS = 3  # live API calls per scan (3 sports fresh per hour ~72 credits/day)
 
     PRIORITY = [
         "basketball_ncaab", "basketball_nba", "icehockey_nhl",
@@ -1140,6 +1140,45 @@ class LoachyBot:
         except:
             return None
 
+    def _enrich_open_bets(self):
+        """Add live countdown timer to each open bet for the dashboard."""
+        enriched = []
+        now = datetime.utcnow()
+        for bet in self.wallet.open_bets.values():
+            b = dict(bet)
+            try:
+                ct = bet.get("commence_time", "")
+                if ct:
+                    game_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                    game_dt_naive = game_dt.replace(tzinfo=None)
+                    delta = game_dt_naive - now
+                    total_mins = int(delta.total_seconds() / 60)
+                    if total_mins < 0:
+                        b["time_remaining"] = "IN PROGRESS / PAST"
+                        b["mins_until"] = total_mins
+                    elif total_mins < 60:
+                        b["time_remaining"] = f"{total_mins}m"
+                        b["mins_until"] = total_mins
+                    elif total_mins < 1440:
+                        h, m = divmod(total_mins, 60)
+                        b["time_remaining"] = f"{h}h {m}m"
+                        b["mins_until"] = total_mins
+                    else:
+                        days = total_mins // 1440
+                        h = (total_mins % 1440) // 60
+                        b["time_remaining"] = f"{days}d {h}h"
+                        b["mins_until"] = total_mins
+                else:
+                    b["time_remaining"] = "Unknown"
+                    b["mins_until"] = None
+            except Exception:
+                b["time_remaining"] = "Unknown"
+                b["mins_until"] = None
+            enriched.append(b)
+        # Sort by soonest game first
+        enriched.sort(key=lambda x: x.get("mins_until") or 99999)
+        return enriched
+
     def _write_dashboard(self, candidates, mood, pending_bets, api_remaining):
         try:
             # Portfolio value = cash + staked (open bets never look like losses)
@@ -1182,7 +1221,7 @@ class LoachyBot:
                     "clvPct":         clv_pct,
                     "candidates":     candidates[:10],
                     "pendingBets":    pending_bets,
-                    "openBetsList":   list(self.wallet.open_bets.values()),
+                    "openBetsList":   self._enrich_open_bets(),
                     "recentBets":     self.wallet.bet_history[-15:],
                     "suggestedParlays": self._cur_parlays,
                     "walletHistory":  self.wallet.wallet_history[-500:],
