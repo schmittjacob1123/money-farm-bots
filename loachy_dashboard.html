@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Loachy Boy's Sportsbook</title>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0a0a08; --surface: #111110; --surface2: #18180f;
+      --border: #222218; --border2: #2a2a1e;
+      --gold: #fbbf24; --gold-dim: rgba(251,191,36,0.1); --gold-border: rgba(251,191,36,0.25);
+      --green: #4ade80; --red: #f87171; --blue: #60a5fa; --purple: #a78bfa;
+      --text: #e8e4d0; --muted: #6b6850; --dim: #1a1a12;
+    }
+    html, body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; min-height: 100%; }
+    ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-thumb { background: var(--border2); }
+
+    @keyframes fadeUp      { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes pulse       { 0%,100%{opacity:1} 50%{opacity:0.35} }
+    @keyframes float       { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
+    @keyframes spin        { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+    @keyframes ticker      { 0%{transform:translateX(0)} 100%{transform:translateX(-50%)} }
+    @keyframes urgentPulse { 0%,100%{box-shadow:0 0 0 0 rgba(251,191,36,0.5)} 50%{box-shadow:0 0 0 12px rgba(251,191,36,0)} }
+
+    .ticker-wrap  { background: var(--gold-dim); border-bottom: 1px solid var(--gold-border); padding: 5px 0; overflow: hidden; white-space: nowrap; }
+    .ticker-inner { display: inline-block; animation: ticker 35s linear infinite; }
+    .ticker-item  { display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--gold); opacity: 0.65; padding: 0 24px; letter-spacing: 0.08em; }
+    .ticker-item.hot { color: var(--green); opacity: 1; font-weight: 700; }
+    .ticker-item.mad { color: #f97316; opacity: 1; font-weight: 700; }
+
+    .header { background: rgba(10,10,8,0.97); border-bottom: 1px solid var(--border); padding: 12px 26px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 100; backdrop-filter: blur(20px); }
+    .brand  { display: flex; align-items: center; gap: 14px; }
+    .fish-box    { background: var(--gold-dim); border: 1px solid var(--gold-border); border-radius: 10px; padding: 8px 14px; font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--gold); white-space: pre; user-select: none; animation: float 3s ease-in-out infinite; line-height: 1.4; }
+    .brand-name  { font-family: 'Bebas Neue', sans-serif; font-size: 26px; letter-spacing: 0.06em; color: var(--gold); text-shadow: 0 0 18px rgba(251,191,36,0.3); }
+    .brand-sub   { font-size: 9px; color: var(--muted); font-family: 'JetBrains Mono', monospace; letter-spacing: 0.1em; text-transform: uppercase; }
+    .header-right { display: flex; align-items: center; gap: 9px; }
+    .nav-link    { font-size: 11px; font-family: 'JetBrains Mono', monospace; font-weight: 600; padding: 6px 14px; border-radius: 7px; border: 1px solid var(--border); color: var(--muted); text-decoration: none; transition: all 0.15s; }
+    .nav-link:hover { color: var(--green); border-color: rgba(74,222,128,0.3); background: rgba(74,222,128,0.05); }
+    .refresh-btn { font-size: 11px; font-weight: 700; font-family: 'Inter', sans-serif; padding: 6px 16px; border-radius: 7px; border: none; cursor: pointer; background: linear-gradient(135deg, #fbbf24, #f59e0b); color: #0a0a08; box-shadow: 0 2px 12px rgba(251,191,36,0.25); transition: opacity 0.15s; }
+    .refresh-btn:hover { opacity: 0.85; }
+    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
+    .clock    { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--gold); background: var(--gold-dim); border: 1px solid var(--gold-border); border-radius: 6px; padding: 4px 9px; }
+
+    .main { max-width: 1160px; margin: 0 auto; padding: 22px 22px 60px; }
+
+    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; margin-bottom: 20px; }
+    .stat  { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; animation: fadeUp 0.4s ease both; }
+    .stat.gold   { border-color: var(--gold-border); background: var(--gold-dim); }
+    .stat.urgent { border-color: rgba(251,191,36,0.5); animation: fadeUp 0.4s ease both, urgentPulse 2s infinite; }
+    .stat-label  { font-size: 9px; font-family: 'JetBrains Mono', monospace; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 5px; }
+    .stat-value  { font-size: 18px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+    .stat-sub    { font-size: 9px; color: var(--muted); font-family: 'JetBrains Mono', monospace; margin-top: 2px; }
+
+    .loach-bar   { background: var(--gold-dim); border: 1px solid var(--gold-border); border-radius: 10px; padding: 12px 16px; display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
+    .loach-art   { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--gold); white-space: pre; line-height: 1.4; flex-shrink: 0; }
+    .loach-quote { font-size: 13px; color: var(--gold); font-style: italic; flex: 1; opacity: 0.9; line-height: 1.5; }
+    .loach-meta  { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--muted); flex-shrink: 0; text-align: right; }
+
+    .pending-alert { background: linear-gradient(135deg, rgba(251,191,36,0.1), rgba(249,115,22,0.06)); border: 1px solid rgba(251,191,36,0.4); border-radius: 12px; padding: 16px 20px; margin-bottom: 20px; animation: urgentPulse 2s infinite; }
+    .pending-title { font-family: 'Bebas Neue', sans-serif; font-size: 22px; color: var(--gold); letter-spacing: 0.06em; }
+    .pending-sub   { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--muted); margin-top: 2px; }
+    .pending-card  { background: rgba(0,0,0,0.3); border: 1px solid var(--gold-border); border-radius: 10px; padding: 14px 16px; margin-top: 12px; }
+    .pending-matchup   { font-size: 14px; font-weight: 600; }
+    .pending-meta      { font-size: 10px; color: var(--muted); font-family: 'JetBrains Mono', monospace; margin-top: 2px; }
+    .pending-reasoning { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--muted); margin: 8px 0; line-height: 1.6; padding: 8px 10px; background: rgba(0,0,0,0.2); border-radius: 6px; border-left: 2px solid var(--gold-border); }
+    .pending-conf-bar  { height: 3px; background: var(--dim); border-radius: 2px; margin: 6px 0 2px; }
+    .pending-conf-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg, #fbbf24, #f97316); }
+    .pending-actions { display: flex; gap: 8px; margin-top: 10px; }
+    .btn-approve { flex:1; padding:8px 0; border-radius:7px; border:none; cursor:pointer; background:linear-gradient(135deg,#4ade80,#22c55e); color:#052e16; font-weight:700; font-size:12px; font-family:'Inter',sans-serif; transition:opacity 0.15s; }
+    .btn-approve:hover { opacity:0.85; }
+    .btn-reject  { flex:1; padding:8px 0; border-radius:7px; border:1px solid rgba(248,113,113,0.3); cursor:pointer; background:rgba(248,113,113,0.08); color:#f87171; font-weight:700; font-size:12px; font-family:'Inter',sans-serif; transition:all 0.15s; }
+    .btn-reject:hover  { background:rgba(248,113,113,0.15); }
+    .pending-timer { font-family:'JetBrains Mono',monospace; font-size:10px; color:#f97316; }
+
+    .chart-card   { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 20px; }
+    .chart-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
+    .chart-title  { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+    .chart-canvas { width: 100%; height: 120px; }
+
+    .tabs { display: flex; gap: 3px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
+    .tab-btn { font-family:'JetBrains Mono',monospace; font-size:10px; font-weight:700; padding:8px 18px; border-radius:8px 8px 0 0; border:1px solid transparent; border-bottom:none; cursor:pointer; color:var(--muted); background:transparent; transition:all 0.15s; letter-spacing:0.06em; text-transform:uppercase; position:relative; bottom:-1px; }
+    .tab-btn.active { background:var(--surface); border-color:var(--border); border-bottom-color:var(--surface); }
+    .tab-btn.active.board   { color:var(--gold); }
+    .tab-btn.active.opentab { color:var(--green); }
+    .tab-btn.active.history { color:var(--blue); }
+    .tab-btn.active.parlays { color:#a78bfa; }
+    .tab-panel { display:none; } .tab-panel.active { display:block; }
+
+    .sec-hdr   { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+    .sec-title { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; font-family:'JetBrains Mono',monospace; }
+    .sec-line  { flex:1; height:1px; background:var(--border); }
+    .sec-badge { font-family:'JetBrains Mono',monospace; font-size:9px; padding:2px 7px; border-radius:4px; border:1px solid; }
+
+    .board-grid { display:flex; flex-direction:column; gap:8px; }
+    .bet-card   { background:var(--surface); border:1px solid var(--border); border-radius:11px; padding:13px 15px; animation:fadeUp 0.4s ease both; }
+    .bet-card.hot    { border-color:rgba(251,191,36,0.35); background:rgba(251,191,36,0.03); }
+    .bet-card.placed { border-color:rgba(74,222,128,0.3); background:rgba(74,222,128,0.03); }
+    .bet-top     { display:flex; justify-content:space-between; gap:10px; margin-bottom:9px; }
+    .bet-matchup { font-size:13px; font-weight:600; line-height:1.3; }
+    .bet-meta    { font-size:10px; color:var(--muted); font-family:'JetBrains Mono',monospace; margin-top:2px; }
+    .odds-badge  { font-family:'JetBrains Mono',monospace; font-size:12px; font-weight:700; padding:3px 9px; border-radius:5px; }
+    .odds-fav  { background:rgba(248,113,113,0.12); color:#f87171; }
+    .odds-dog  { background:rgba(74,222,128,0.12); color:#4ade80; }
+    .odds-even { background:rgba(251,191,36,0.12); color:#fbbf24; }
+    .edge-badge { font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--gold); background:var(--gold-dim); border:1px solid var(--gold-border); border-radius:4px; padding:1px 6px; margin-top:3px; }
+    .bet-pills  { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .pill       { font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:700; padding:2px 6px; border-radius:4px; text-transform:uppercase; }
+    .pill-h2h     { background:rgba(129,140,248,0.12); color:#818cf8; }
+    .pill-spreads { background:rgba(251,191,36,0.12); color:#fbbf24; }
+    .pill-totals  { background:rgba(96,165,250,0.12); color:#60a5fa; }
+    .pill-sport   { color:var(--muted); }
+    .ai-conf-row   { flex:1; min-width:80px; }
+    .ai-conf-track { height:3px; background:var(--dim); border-radius:2px; }
+    .ai-conf-fill  { height:100%; border-radius:2px; background:linear-gradient(90deg,#fbbf24,#f59e0b); transition:width 0.6s; }
+    .ai-lbl { font-family:'JetBrains Mono',monospace; font-size:9px; color:var(--muted); margin-bottom:3px; }
+    .ai-ok  { font-family:'JetBrains Mono',monospace; font-size:9px; color:#4ade80; font-weight:700; }
+    .reasoning { font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--muted); margin-top:8px; padding-top:8px; border-top:1px solid var(--border); line-height:1.6; }
+
+    .open-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(270px,1fr)); gap:10px; }
+    .open-card { background:var(--surface); border:1px solid rgba(74,222,128,0.25); border-radius:11px; padding:14px; }
+
+    .hist-wrap { background:var(--surface); border:1px solid var(--border); border-radius:11px; overflow:hidden; }
+    .hist-row  { display:grid; grid-template-columns:80px 1fr 80px 64px 68px 54px 52px; gap:10px; padding:9px 13px; border-bottom:1px solid rgba(255,255,255,0.03); font-family:'JetBrains Mono',monospace; font-size:10px; align-items:center; }
+    .hist-row.hdr  { color:var(--muted); font-size:9px; text-transform:uppercase; letter-spacing:0.08em; border-bottom:1px solid var(--border); }
+    .hist-row.won  { background:rgba(74,222,128,0.025); }
+    .hist-row.lost { background:rgba(248,113,113,0.025); }
+
+    .empty { background:var(--surface); border:1px solid var(--border); border-radius:11px; padding:28px; text-align:center; color:var(--muted); font-family:'JetBrains Mono',monospace; font-size:12px; }
+
+    .sports-panel { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:20px; margin-bottom:22px; animation:fadeUp 0.4s ease both; }
+    .sports-grid  { display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; }
+    .sport-toggle { display:flex; align-items:center; justify-content:space-between; padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:rgba(255,255,255,0.02); cursor:pointer; transition:all 0.18s; user-select:none; }
+    .sport-toggle:hover { border-color:rgba(251,191,36,0.25); background:rgba(251,191,36,0.04); }
+    .sport-toggle.on  { border-color:rgba(251,191,36,0.4); background:rgba(251,191,36,0.08); }
+    .sport-name   { font-family:'JetBrains Mono',monospace; font-size:10px; font-weight:600; color:var(--muted); letter-spacing:0.04em; }
+    .sport-toggle.on .sport-name { color:var(--gold); }
+    .sport-pip    { width:8px; height:8px; border-radius:50%; background:var(--border2); flex-shrink:0; transition:all 0.18s; }
+    .sport-toggle.on .sport-pip { background:var(--gold); box-shadow:0 0 7px rgba(251,191,36,0.6); }
+
+    .parlay-card { background:var(--surface); border:1px solid rgba(167,139,250,0.3); border-radius:12px; padding:16px; margin-bottom:10px; animation:fadeUp 0.4s ease both; }
+    .parlay-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px; }
+    .parlay-odds   { font-family:'JetBrains Mono',monospace; font-size:24px; font-weight:700; color:#a78bfa; }
+    .parlay-payout { font-family:'JetBrains Mono',monospace; font-size:16px; font-weight:700; color:#4ade80; }
+    .parlay-leg    { display:flex; justify-content:space-between; align-items:center; padding:9px 12px; background:rgba(255,255,255,0.025); border-radius:8px; margin-bottom:6px; border:1px solid var(--border); }
+    .parlay-leg-left { flex:1; }
+    .parlay-leg-matchup  { font-size:11px; font-weight:600; }
+    .parlay-leg-outcome  { font-size:10px; color:var(--gold); margin-top:2px; font-family:'JetBrains Mono',monospace; }
+    .parlay-leg-conf     { font-size:9px; color:var(--muted); margin-top:2px; font-family:'JetBrains Mono',monospace; }
+    .parlay-leg-odds     { font-family:'JetBrains Mono',monospace; font-size:13px; font-weight:700; margin-left:12px; flex-shrink:0; }
+    .parlay-stats        { display:flex; gap:12px; flex-wrap:wrap; margin-top:10px; padding-top:10px; border-top:1px solid var(--border); }
+    .parlay-stat         { flex:1; min-width:60px; }
+    .parlay-stat-label   { font-family:'JetBrains Mono',monospace; font-size:8px; color:var(--muted); text-transform:uppercase; letter-spacing:0.08em; }
+    .parlay-stat-val     { font-family:'JetBrains Mono',monospace; font-size:13px; font-weight:700; margin-top:3px; }
+    .parlay-approve-btn  { flex:1; padding:8px 0; border-radius:7px; border:none; cursor:pointer; background:linear-gradient(135deg,#a78bfa,#7c3aed); color:#fff; font-weight:700; font-size:12px; font-family:'Inter',sans-serif; transition:opacity 0.15s; }
+    .parlay-approve-btn:hover { opacity:0.85; }
+    .parlay-reject-btn   { padding:8px 16px; border-radius:7px; border:1px solid var(--border); cursor:pointer; background:transparent; color:var(--muted); font-weight:700; font-size:12px; font-family:'Inter',sans-serif; transition:all 0.15s; }
+    .parlay-reject-btn:hover { color:var(--red); border-color:rgba(248,113,113,0.3); }
+
+    .footer     { border-top:1px solid var(--border); padding:28px; text-align:center; }
+    .footer-art { font-family:'JetBrains Mono',monospace; font-size:9px; color:#1a1a10; white-space:pre; display:inline-block; text-align:left; user-select:none; }
+  </style>
+</head>
+<body>
+
+<div class="ticker-wrap">
+  <div class="ticker-inner">
+    <span class="ticker-item">LOACHY BOY SPORTS ENGINE v3</span>
+    <span class="ticker-item">PAPER MODE · $50 WALLET</span>
+    <span class="ticker-item mad">🏀 MARCH MADNESS</span>
+    <span class="ticker-item">STATS FIRST · AI CONFIRMS · YOU APPROVE</span>
+    <span class="ticker-item hot">🐟 VEGAS LEFT MONEY ON THE TABLE. LOACHY FOUND IT.</span>
+    <span class="ticker-item">KELLY CRITERION · INJURY FEED · LINE MOVEMENT</span>
+    <span class="ticker-item">LOACHY BOY SPORTS ENGINE v3</span>
+    <span class="ticker-item">PAPER MODE · $50 WALLET</span>
+    <span class="ticker-item mad">🏀 MARCH MADNESS</span>
+    <span class="ticker-item hot">🐟 VEGAS LEFT MONEY ON THE TABLE. LOACHY FOUND IT.</span>
+  </div>
+</div>
+
+<div class="header">
+  <div class="brand">
+    <div class="fish-box" id="fish-art">  ><(((º>
+  ~ ~ ~ ~</div>
+    <div>
+      <div class="brand-name">Loachy Boy</div>
+      <div class="brand-sub">Sports Betting Engine v3 · Jacob's Money Farm</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="live-dot"></div>
+    <span class="clock" id="clock">--:--:--</span>
+    <a href="index.html"               class="nav-link">🌾 Farm</a>
+    <a href="jacob_dashboard.html"     class="nav-link">🦎 Jacob</a>
+    <a href="seraphina_dashboard.html" class="nav-link">🐱 Seraphina</a>
+    <button class="refresh-btn" onclick="loadData()">Refresh</button>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- SPORTS TOGGLES -->
+  <div class="sports-panel">
+    <div class="sec-hdr">
+      <div class="sec-title">Active Sports</div>
+      <div class="sec-line"></div>
+      <span id="overnight-badge" style="display:none;font-family:'JetBrains Mono',monospace;font-size:10px;padding:3px 10px;border-radius:4px;background:rgba(96,165,250,0.1);border:1px solid rgba(96,165,250,0.25);color:#60a5fa">😴 OVERNIGHT — NO SCAN</span>
+      <div class="sec-badge" id="sports-count-badge" style="color:var(--gold);border-color:rgba(251,191,36,0.3);background:rgba(251,191,36,0.05)">loading...</div>
+    </div>
+    <div class="sports-grid" id="sports-grid"></div>
+  </div>
+
+  <!-- STATS -->
+  <div class="stats">
+    <div class="stat gold" style="animation-delay:0s">
+      <div class="stat-label">Portfolio</div>
+      <div class="stat-value" id="l-portfolio" style="color:#fbbf24">$50.00</div>
+      <div class="stat-sub"  id="l-mode">paper</div>
+    </div>
+    <div class="stat" style="animation-delay:0.04s">
+      <div class="stat-label">Cash</div>
+      <div class="stat-value" id="l-wallet" style="color:#e8e4d0">$50.00</div>
+      <div class="stat-sub" id="l-staked" style="font-size:9px;color:var(--muted)">$0 staked</div>
+    </div>
+    <div class="stat" style="animation-delay:0.08s">
+      <div class="stat-label">Daily P&L</div>
+      <div class="stat-value" id="l-daily" style="color:#4ade80">$0.00</div>
+    </div>
+    <div class="stat" style="animation-delay:0.12s">
+      <div class="stat-label">Total P&L</div>
+      <div class="stat-value" id="l-total" style="color:#4ade80">$0.00</div>
+    </div>
+    <div class="stat" style="animation-delay:0.16s">
+      <div class="stat-label">ROI</div>
+      <div class="stat-value" id="l-roi" style="color:#94a3b8">—</div>
+    </div>
+    <div class="stat" style="animation-delay:0.20s">
+      <div class="stat-label">Win Rate</div>
+      <div class="stat-value" id="l-wr" style="color:#94a3b8">—</div>
+    </div>
+    <div class="stat" style="animation-delay:0.24s">
+      <div class="stat-label">Open Bets</div>
+      <div class="stat-value" id="l-open" style="color:#4ade80">0</div>
+    </div>
+    <div class="stat" id="pending-stat" style="animation-delay:0.28s">
+      <div class="stat-label">Needs You</div>
+      <div class="stat-value" id="l-pending" style="color:#fbbf24">0</div>
+    </div>
+    <div class="stat" style="animation-delay:0.32s">
+      <div class="stat-label">Games Scanned</div>
+      <div class="stat-value" id="l-scanned" style="color:#94a3b8">0</div>
+    </div>
+    <div class="stat" style="animation-delay:0.36s">
+      <div class="stat-label">CLV Rate</div>
+      <div class="stat-value" id="l-clv" style="color:#94a3b8">—</div>
+      <div class="stat-sub">beat closing line</div>
+    </div>
+    <div class="stat" style="animation-delay:0.40s">
+      <div class="stat-label">Loss Streak</div>
+      <div class="stat-value" id="l-streak" style="color:#4ade80">0</div>
+      <div class="stat-sub" id="l-streak-sub">kelly normal</div>
+    </div>
+    <div class="stat" style="animation-delay:0.44s">
+      <div class="stat-label">Next Scan</div>
+      <div class="stat-value" id="l-countdown" style="color:#c084fc;font-size:16px">—</div>
+      <div class="stat-sub" id="l-last-scan"></div>
+    </div>
+  </div>
+
+  <!-- LOACH BAR -->
+  <div class="loach-bar">
+    <div class="loach-art" id="loach-art-bar">  ><(((º>
+  ~ ~ ~ ~</div>
+    <div class="loach-quote" id="loach-quote">"Loachy Boy is watching the boards."</div>
+    <div class="loach-meta">
+      <div id="clock2" style="color:var(--gold)">--:--:-- ET</div>
+      <div id="l-api-credits" style="margin-top:4px">— credits</div>
+    </div>
+  </div>
+
+  <!-- WALLET CHART -->
+  <div class="chart-card">
+    <div class="chart-header">
+      <div>
+        <div class="chart-title">Portfolio Value</div>
+        <div style="font-size:9px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-top:2px">cash + staked · updates each scan</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:#fbbf24" id="chart-val">$50.00</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted);margin-top:2px" id="chart-change">—</div>
+      </div>
+    </div>
+    <canvas class="chart-canvas" id="wallet-chart"></canvas>
+  </div>
+
+  <!-- PENDING ALERT -->
+  <div id="pending-section" style="display:none">
+    <div class="pending-alert">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div>
+          <div class="pending-title">🐟 LOACHY NEEDS YOU</div>
+          <div class="pending-sub">Longshots &amp; borderline bets flagged for your call · expires in 30 min</div>
+        </div>
+        <div id="pending-count-badge" style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:#fbbf24"></div>
+      </div>
+      <div id="pending-cards"></div>
+    </div>
+  </div>
+
+  <!-- TABS -->
+  <div class="tabs">
+    <button class="tab-btn board   active" onclick="switchTab('board')"  >📋 The Board</button>
+    <button class="tab-btn opentab"        onclick="switchTab('opentab')">🎯 Open Bets</button>
+    <button class="tab-btn history"        onclick="switchTab('history')">📜 History</button>
+    <button class="tab-btn parlays"        onclick="switchTab('parlays')">🎰 Parlays <span id="parlay-tab-count" style="display:none;background:rgba(167,139,250,0.2);color:#a78bfa;border-radius:10px;padding:1px 6px;font-size:9px;margin-left:4px"></span></button>
+  </div>
+
+  <!-- TAB: BOARD -->
+  <div class="tab-panel active" id="tab-board">
+    <div class="sec-hdr">
+      <div class="sec-title" style="color:var(--gold)">Value Candidates</div>
+      <div class="sec-line"></div>
+      <div class="sec-badge" id="board-badge" style="color:var(--gold);border-color:var(--gold-border);background:var(--gold-dim)">scanning...</div>
+    </div>
+    <div class="board-grid" id="board-grid">
+      <div class="empty">
+        <div style="width:26px;height:26px;border:2px solid var(--border);border-top-color:var(--gold);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 10px"></div>
+        Loachy Boy is fetching the board...
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB: OPEN -->
+  <div class="tab-panel" id="tab-opentab">
+    <div class="sec-hdr">
+      <div class="sec-title" style="color:var(--green)">Active Positions</div>
+      <div class="sec-line"></div>
+      <div class="sec-badge" id="open-badge" style="color:var(--green);border-color:rgba(74,222,128,0.3);background:rgba(74,222,128,0.08)">0 open</div>
+    </div>
+    <div class="open-grid" id="open-grid">
+      <div class="empty">No open bets · Loachy is watching the lines</div>
+    </div>
+  </div>
+
+  <!-- TAB: HISTORY -->
+  <div class="tab-panel" id="tab-history">
+    <div class="sec-hdr">
+      <div class="sec-title" style="color:var(--blue)">Settled Bets</div>
+      <div class="sec-line"></div>
+      <div class="sec-badge" id="hist-badge" style="color:var(--blue);border-color:rgba(96,165,250,0.3);background:rgba(96,165,250,0.08)">0 settled</div>
+    </div>
+    <div class="hist-wrap">
+      <div class="hist-row hdr"><span>Time</span><span>Matchup</span><span>Bet</span><span>Odds</span><span>P&L</span><span>Source</span><span>Result</span></div>
+      <div id="hist-rows"><div class="hist-row"><span style="color:var(--muted);grid-column:1/-1;text-align:center">No settled bets yet</span></div></div>
+    </div>
+  </div>
+
+  <!-- TAB: PARLAYS -->
+  <div class="tab-panel" id="tab-parlays">
+    <div class="sec-hdr">
+      <div class="sec-title" style="color:#a78bfa">Parlay Suggestions</div>
+      <div class="sec-line"></div>
+      <div class="sec-badge" id="parlay-badge" style="color:#a78bfa;border-color:rgba(167,139,250,0.3);background:rgba(167,139,250,0.05)">0 parlays</div>
+    </div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:12px;padding:0 2px">
+      2-leg parlays from high-confidence (≥70%) confirmed bets · always requires your approval
+    </div>
+    <div id="parlay-grid">
+      <div class="empty">No parlay suggestions this scan — need 2+ high-confidence bets from different games.</div>
+    </div>
+  </div>
+
+</div>
+
+<div class="footer">
+  <pre class="footer-art">
+   _______________________________________________________________
+  |                                                               |
+  |    ><(((º>          LOACHY BOY v3          ><(((º>           |
+  |   ~ ~ ~ ~ ~    THE SPORTSBOOK FISH        ~ ~ ~ ~ ~          |
+  |                                                               |
+  |   >==(*(')`   [ MONEYLINE ] [ SPREAD ] [ TOTALS ]            |
+  |    ~ ~ ~ ~                                                    |
+  |   "Vegas left money on the table. Loachy found it."          |
+  |_______________________________________________________________| </pre>
+  <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:#1a1a10;margin-top:12px">loachy boy v3 · jacob's money farm · paper trading</div>
+</div>
+
+<script>
+(async function() {
+  try {
+    const res  = await fetch('/api/auth/check', {credentials: 'include'});
+    const data = await res.json();
+    if (!data.ok) window.location.href = '/login.html';
+  } catch(e) { window.location.href = '/login.html'; }
+})();
+</script>
+<script>
+// ── TIME HELPERS ──
+function toET(d) {
+  if (!d) return '—';
+  try {
+    return new Date(d).toLocaleString('en-US', {
+      timeZone:'America/New_York', month:'numeric', day:'numeric',
+      hour:'numeric', minute:'2-digit', second:'2-digit', hour12:true
+    }).replace(',','');
+  } catch { return String(d); }
+}
+function toETTime(d) {
+  if (!d) return '—';
+  try {
+    return new Date(d).toLocaleTimeString('en-US', {
+      timeZone:'America/New_York', hour:'numeric', minute:'2-digit', second:'2-digit', hour12:true
+    });
+  } catch { return '—'; }
+}
+function toETShort(ts) {
+  if (!ts) return '';
+  try {
+    return new Date(ts).toLocaleTimeString('en-US', {
+      timeZone:'America/New_York', hour:'numeric', minute:'2-digit', hour12:true
+    });
+  } catch { return ''; }
+}
+
+let walletHistory    = [];
+let pendingDecisions = {};
+let parlayDecisions  = {};
+let _nextScanAt      = null;
+
+// ── CLOCK ──
+setInterval(() => {
+  const t = toETTime(new Date()) + ' ET';
+  document.getElementById('clock').textContent  = t;
+  document.getElementById('clock2').textContent = t;
+}, 1000);
+
+// ── COUNTDOWN ──
+function updateCountdown() {
+  const el = document.getElementById('l-countdown');
+  if (!el || !_nextScanAt) { if(el) el.textContent='—'; return; }
+  const diff = Math.max(0, Math.floor((new Date(_nextScanAt) - new Date()) / 1000));
+  if (diff <= 0) { el.textContent = 'scanning...'; el.style.color = '#4ade80'; return; }
+  const m = Math.floor(diff/60), s = diff % 60;
+  el.textContent = m + ':' + s.toString().padStart(2,'0');
+  el.style.color = diff < 120 ? '#fbbf24' : '#c084fc';
+}
+setInterval(updateCountdown, 1000);
+
+// ── TABS ──
+function switchTab(name) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.querySelector('.tab-btn.' + name).classList.add('active');
+}
+
+// ── CHART ──
+const canvas = document.getElementById('wallet-chart');
+const ctx    = canvas.getContext('2d');
+function resizeCanvas() {
+  canvas.width  = canvas.offsetWidth  * window.devicePixelRatio;
+  canvas.height = canvas.offsetHeight * window.devicePixelRatio;
+  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+  drawChart();
+}
+window.addEventListener('resize', resizeCanvas);
+
+function drawChart(data) {
+  const W = canvas.offsetWidth, H = canvas.offsetHeight;
+  ctx.clearRect(0, 0, W, H);
+  if (walletHistory.length < 2) {
+    ctx.fillStyle = '#6b6850'; ctx.font = '11px JetBrains Mono, monospace';
+    ctx.textAlign = 'center'; ctx.fillText('Collecting portfolio data...', W/2, H/2); return;
+  }
+  const vals   = walletHistory.map(p => p.v);
+  const rawMin = Math.min(...vals), rawMax = Math.max(...vals);
+  const pad = {t:8, r:8, b:30, l:52};
+  const cW  = W-pad.l-pad.r, cH = H-pad.t-pad.b;
+  const rp   = Math.max((rawMax - rawMin) * 0.15, 1.0);
+  const minV = rawMin-rp, maxV = rawMax+rp, range = maxV-minV;
+  const toX  = i => pad.l + (i/(walletHistory.length-1))*cW;
+  const toY  = v => pad.t + cH - ((v-minV)/range)*cH;
+  const start  = data ? (data.startingBudget || 50) : 50;
+  const latest = vals[vals.length-1];
+  const isUp   = latest >= start;
+  const lClr   = isUp ? '#fbbf24' : '#f87171';
+
+  ctx.strokeStyle='#222218'; ctx.lineWidth=1;
+  for (let i = 0; i <= 4; i++) {
+    const f = i/4, v = minV + range*f, y = pad.t + cH*(1-f);
+    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(pad.l+cW,y); ctx.stroke();
+    ctx.fillStyle='#6b6850'; ctx.font='9px JetBrains Mono,monospace'; ctx.textAlign='right';
+    ctx.fillText('$'+v.toFixed(2), pad.l-5, y+3);
+  }
+
+  const daysSeen = new Set();
+  walletHistory.forEach((p,i) => {
+    const etDate = new Date(new Date(p.t).toLocaleString('en-US',{timeZone:'America/New_York'}));
+    const dayKey = etDate.toDateString();
+    if (!daysSeen.has(dayKey) && i > 0) {
+      daysSeen.add(dayKey);
+      const x = toX(i);
+      ctx.strokeStyle='rgba(107,104,80,0.35)'; ctx.lineWidth=1; ctx.setLineDash([3,4]);
+      ctx.beginPath(); ctx.moveTo(x,pad.t); ctx.lineTo(x,pad.t+cH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle='rgba(107,104,80,0.7)'; ctx.font='8px JetBrains Mono,monospace'; ctx.textAlign='center';
+      ctx.fillText(etDate.toLocaleDateString('en-US',{month:'short',day:'numeric'}), x, pad.t+8);
+    } else { daysSeen.add(dayKey); }
+  });
+
+  const lblCount = Math.min(4, walletHistory.length);
+  ctx.fillStyle='rgba(107,104,80,0.8)'; ctx.font='8px JetBrains Mono,monospace';
+  for (let i = 0; i < lblCount; i++) {
+    const idx = Math.round(i*(walletHistory.length-1)/Math.max(lblCount-1,1));
+    const x   = pad.l+(idx/(walletHistory.length-1))*cW;
+    ctx.textAlign = i===0?'left':i===lblCount-1?'right':'center';
+    ctx.fillText(toETShort(walletHistory[idx].t), x, pad.t+cH+14);
+  }
+
+  const grad = ctx.createLinearGradient(0,pad.t,0,pad.t+cH);
+  grad.addColorStop(0, isUp?'rgba(251,191,36,0.18)':'rgba(248,113,113,0.18)');
+  grad.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.beginPath();
+  walletHistory.forEach((p,i)=>i===0?ctx.moveTo(toX(i),toY(p.v)):ctx.lineTo(toX(i),toY(p.v)));
+  ctx.lineTo(toX(walletHistory.length-1),pad.t+cH); ctx.lineTo(toX(0),pad.t+cH);
+  ctx.closePath(); ctx.fillStyle=grad; ctx.fill();
+  ctx.beginPath();
+  walletHistory.forEach((p,i)=>i===0?ctx.moveTo(toX(i),toY(p.v)):ctx.lineTo(toX(i),toY(p.v)));
+  ctx.strokeStyle=lClr; ctx.lineWidth=2; ctx.lineJoin='round'; ctx.stroke();
+  const lx=toX(walletHistory.length-1), ly=toY(latest);
+  ctx.beginPath(); ctx.arc(lx,ly,4,0,Math.PI*2);
+  ctx.fillStyle=lClr; ctx.fill(); ctx.strokeStyle='#0a0a08'; ctx.lineWidth=2; ctx.stroke();
+
+  document.getElementById('chart-val').textContent   = '$'+latest.toFixed(2);
+  document.getElementById('chart-val').style.color   = isUp ? '#fbbf24' : '#f87171';
+  if (walletHistory.length >= 2) {
+    const diff = latest-walletHistory[0].v;
+    const pct  = (diff/walletHistory[0].v*100).toFixed(3);
+    const el   = document.getElementById('chart-change');
+    el.textContent = (diff>=0?'+':'')+'$'+diff.toFixed(4)+' ('+pct+'%)';
+    el.style.color = diff >= 0 ? '#fbbf24' : '#f87171';
+  }
+}
+
+// ── HELPERS ──
+function fmtOdds(o)  { return o > 0 ? '+'+o : ''+o; }
+function fmtPnl(v)   { return (v>=0?'+':'') + '$' + Math.abs(v).toFixed(4); }
+function mktLabel(m) { return m==='h2h'?'ML':m==='spreads'?'SPREAD':m==='totals'?'TOTAL':(m||'').toUpperCase(); }
+function mktClass(m) { return m==='h2h'?'pill-h2h':m==='spreads'?'pill-spreads':'pill-totals'; }
+function oddsClass(o){ return o<-110?'odds-fav':o>0?'odds-dog':'odds-even'; }
+function sportShort(s){
+  const m={americanfootball_nfl:'NFL',americanfootball_ncaaf:'NCAAF',basketball_nba:'NBA',
+           basketball_ncaab:'NCAAB',baseball_mlb:'MLB',icehockey_nhl:'NHL',
+           soccer_epl:'EPL',soccer_usa_mls:'MLS',mma_mixed_martial_arts:'MMA'};
+  return m[s]||(s||'').split('_').pop().toUpperCase();
+}
+function timeUntil(iso){
+  if(!iso) return '—';
+  try {
+    const diff=(new Date(iso)-new Date())/3600000;
+    if(diff<0) return 'started'; if(diff<1) return Math.round(diff*60)+'min';
+    return diff.toFixed(1)+'h';
+  } catch { return '—'; }
+}
+function minsLeft(iso){ try { return Math.max(0,Math.round((new Date(iso)-new Date())/60000)); } catch { return 0; } }
+
+// ── PENDING ──
+function renderPending(bets) {
+  const section  = document.getElementById('pending-section');
+  const countEl  = document.getElementById('l-pending');
+  const statEl   = document.getElementById('pending-stat');
+  const active   = (bets||[]).filter(p => !pendingDecisions[p.game_id]);
+  countEl.textContent = active.length;
+  if (!active.length) { section.style.display='none'; statEl.classList.remove('urgent'); return; }
+  section.style.display = 'block'; statEl.classList.add('urgent');
+  document.getElementById('pending-count-badge').textContent = active.length+' bet'+(active.length!==1?'s':'');
+  document.getElementById('pending-cards').innerHTML = active.map(p => {
+    const conf    = Math.round((p.ai_confidence||0)*100);
+    const expires = minsLeft(p.expires_at);
+    const outcome = p.point!=null ? `${p.outcome_name} (${p.point>0?'+':''}${p.point})` : p.outcome_name;
+    const dec     = pendingDecisions[p.game_id];
+    if (dec==='approved') return `<div class="pending-card"><div class="pending-matchup">${p.away} @ ${p.home}</div><div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#4ade80;margin-top:8px;font-weight:700">✓ APPROVED — places next scan</div></div>`;
+    if (dec==='rejected') return `<div class="pending-card" style="opacity:0.5"><div class="pending-matchup">${p.away} @ ${p.home}</div><div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#f87171;margin-top:8px">✗ Rejected</div></div>`;
+    return `<div class="pending-card">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <div class="pending-matchup">${p.away} @ ${p.home}</div>
+          <div class="pending-meta">${sportShort(p.sport_key||p.sport)} · ${mktLabel(p.market)} · ${outcome} · ${fmtOdds(p.best_price||0)} · $${(p.bet_size||0).toFixed(2)}${p.longshot?' · <span style="color:#f97316;font-weight:700">🎰 LONGSHOT</span>':''}</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0;margin-left:12px">
+          <div class="edge-badge">+${((p.edge||0)*100).toFixed(1)}% edge</div>
+          <div class="pending-timer" style="margin-top:4px">⏱ ${expires}min left</div>
+        </div>
+      </div>
+      <div class="pending-conf-bar"><div class="pending-conf-fill" style="width:${conf}%"></div></div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:6px">AI confidence: ${conf}%</div>
+      ${p.ai_reasoning?`<div class="pending-reasoning">"${p.ai_reasoning}"</div>`:''}
+      <div class="pending-actions">
+        <button class="btn-approve" onclick="decidePending('${p.game_id}','approved')">✓ Approve — Place It</button>
+        <button class="btn-reject"  onclick="decidePending('${p.game_id}','rejected')">✗ Reject — Skip It</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function decidePending(gameId, decision) {
+  pendingDecisions[gameId] = decision;
+  fetch('/api/pending-approve', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({game_id:gameId, action:decision==='approved'?'approve':'reject'})
+  }).then(r=>r.json()).then(res=>{
+    if (res.ok) loadData();
+    else console.error('Approval failed:', res.error);
+  }).catch(()=>{ loadData(); });
+}
+
+// ── BOARD ──
+function renderBoard(candidates) {
+  document.getElementById('board-badge').textContent = candidates.length+' candidate'+(candidates.length!==1?'s':'');
+  const grid = document.getElementById('board-grid');
+  if (!candidates.length) {
+    grid.innerHTML = `<div class="empty"><div style="font-size:18px;margin-bottom:8px">🐟</div>No value bets above threshold.<br><span style="color:var(--gold);font-size:10px">"The board is dry. Loachy doesn't chase."</span></div>`;
+    return;
+  }
+  grid.innerHTML = candidates.map((c,i)=>{
+    const isHot   = c.edge >= 0.08;
+    const placed  = c.ai_confirmed && (c.ai_confidence||0) >= 0.6;
+    const conf    = Math.round((c.ai_confidence||0)*100);
+    const outcome = c.point!=null?`${c.outcome_name} (${c.point>0?'+':''}${c.point})`:c.outcome_name;
+    return `<div class="bet-card ${placed?'placed':isHot?'hot':''}" style="animation-delay:${i*0.05}s">
+      <div class="bet-top">
+        <div>
+          <div class="bet-matchup">${c.away} @ ${c.home}</div>
+          <div class="bet-meta">${sportShort(c.sport_key||c.sport)} · ${outcome} · in ${timeUntil(c.commence_time)}</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px;flex-shrink:0">
+          <div class="odds-badge ${oddsClass(c.best_price)}">${fmtOdds(c.best_price)}</div>
+          <div class="edge-badge">+${(c.edge*100).toFixed(1)}% edge</div>
+        </div>
+      </div>
+      <div class="bet-pills">
+        <span class="pill ${mktClass(c.market)}">${mktLabel(c.market)}</span>
+        <span class="pill pill-sport">${sportShort(c.sport_key||c.sport)}</span>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted)">$${(c.bet_size||0).toFixed(2)} · ${c.book_count||0} books</span>
+        ${c.ai_confidence!==undefined?`
+          <div class="ai-conf-row">
+            <div class="ai-lbl">AI: ${conf}%</div>
+            <div class="ai-conf-track"><div class="ai-conf-fill" style="width:${conf}%"></div></div>
+          </div>
+          ${c.ai_confirmed?'<span class="ai-ok">✓ CONFIRMED</span>':'<span style="font-family:\'JetBrains Mono\',monospace;font-size:9px;color:var(--muted)">✗ rejected</span>'}
+        `:''}
+        ${placed?'<span style="font-family:\'JetBrains Mono\',monospace;font-size:9px;color:#4ade80;font-weight:700">BET PLACED</span>':''}
+      </div>
+      ${c.ai_reasoning?`<div class="reasoning">"${c.ai_reasoning}"</div>`:''}
+      ${(c.injury_context||c.weather_context||c.line_context)?`
+      <div style="margin-top:8px;display:flex;flex-direction:column;gap:3px">
+        ${c.star_out?`<div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:#f87171;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.2);border-radius:4px;padding:3px 7px">🚑 KEY PLAYER OUT</div>`:''}
+        ${c.injury_context?`<div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted);padding:2px 0">🩹 ${c.injury_context.substring(0,120)}</div>`:''}
+        ${c.weather_context?`<div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:#60a5fa;background:rgba(96,165,250,0.06);border:1px solid rgba(96,165,250,0.15);border-radius:4px;padding:3px 7px">🌧 ${c.weather_context}</div>`:''}
+        ${c.sharp_money?`<div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:#fbbf24;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);border-radius:4px;padding:3px 7px">📈 ${c.line_context}</div>`:c.line_context?`<div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted);padding:2px 0">📊 ${c.line_context}</div>`:''}
+      </div>`:''}
+    </div>`;
+  }).join('');
+}
+
+// ── OPEN BETS ──
+function renderOpen(bets) {
+  document.getElementById('open-badge').textContent = bets.length+' open';
+  const grid = document.getElementById('open-grid');
+  if (!bets.length) { grid.innerHTML='<div class="empty">No open bets · Loachy is hunting for the next one</div>'; return; }
+  grid.innerHTML = bets.map((b,i)=>{
+    const outcome = b.point!=null?`${b.outcome_name} (${b.point>0?'+':''}${b.point})`:b.outcome_name;
+    const odds    = b.best_price||0, size = b.bet_size||0;
+    const payout  = odds>0 ? (size*odds/100).toFixed(2) : (size*100/Math.abs(odds)).toFixed(2);
+    const mkt     = b.market||'';
+    let explain = '';
+    if (mkt.includes('spread')) {
+      const pts = b.point!=null?Math.abs(b.point):'?', fav = b.point<0;
+      explain = fav ? `Wins if ${b.outcome_name} wins by MORE than ${pts} pts.`
+                    : `Wins if ${b.outcome_name} wins OR loses by LESS than ${pts} pts.`;
+    } else if (mkt.includes('total')) {
+      const pts = b.point!=null?b.point:'?', over = (b.outcome_name||'').toLowerCase().includes('over');
+      explain = over ? `Wins if combined score is MORE than ${pts}.` : `Wins if combined score is LESS than ${pts}.`;
+    } else {
+      explain = `Wins if ${b.outcome_name} wins outright.`;
+    }
+    const iProb  = odds>0?(100/(odds+100)*100):(Math.abs(odds)/(Math.abs(odds)+100)*100);
+    const pColor = iProb>=65?'#4ade80':iProb>=55?'#fbbf24':'#f87171';
+    return `<div class="open-card" style="animation-delay:${i*0.07}s">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <div style="font-size:13px;font-weight:600">${b.away||''} @ ${b.home||''}</div>
+          <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted);margin-top:2px">${sportShort(b.sport_key||b.sport)} · ${mktLabel(mkt)}</div>
+        </div>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:9px;color:#4ade80;font-weight:700;background:rgba(74,222,128,0.1);border:1px solid rgba(74,222,128,0.2);border-radius:4px;padding:2px 6px">OPEN</span>
+      </div>
+      <div style="display:flex;gap:16px;align-items:center;margin:8px 0;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px;border:1px solid rgba(255,255,255,0.06)">
+        <div><div style="font-size:9px;color:var(--muted)">BET</div><div style="font-size:14px;font-weight:700">$${size.toFixed(2)}</div></div>
+        <div style="color:var(--muted)">@</div>
+        <div><div style="font-size:9px;color:var(--muted)">ODDS</div><div style="font-size:14px;font-weight:700;color:${odds>0?'#4ade80':'#f87171'}">${fmtOdds(odds)}</div></div>
+        <div style="margin-left:auto;text-align:right"><div style="font-size:9px;color:var(--muted)">TO WIN</div><div style="font-size:13px;font-weight:700;color:#4ade80">+$${payout}</div></div>
+      </div>
+      <div style="font-size:11px;font-weight:600;margin:4px 0">${outcome}</div>
+      <div style="font-size:10px;color:rgba(200,196,176,0.6);margin:4px 0;line-height:1.5">${explain}</div>
+      <div style="font-size:10px;font-weight:600;margin-top:4px;color:${pColor}">● ${iProb.toFixed(0)}% implied probability</div>
+      <div style="display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:8px">
+        <span style="color:var(--muted)">Edge</span><span style="color:#fbbf24">+${((b.edge||0)*100).toFixed(1)}%</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px">
+        <span style="color:var(--muted)">Source</span><span style="color:${b.source==='HUMAN'?'#a78bfa':'#94a3b8'}">${b.source||'AUTO'}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px">
+        <span style="color:var(--muted)">Placed</span><span style="color:var(--muted)">${b.placed_at?toET(b.placed_at):'—'}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── HISTORY ──
+function renderHistory(history) {
+  document.getElementById('hist-badge').textContent = history.length+' settled';
+  const wrap = document.getElementById('hist-rows');
+  if (!history.length) { wrap.innerHTML='<div class="hist-row"><span style="color:var(--muted);grid-column:1/-1;text-align:center">No settled bets yet</span></div>'; return; }
+  wrap.innerHTML = [...history].reverse().slice(0,50).map(b=>{
+    const time    = b.settled_at ? toET(b.settled_at) : '—';
+    const matchup = `${(b.away||'').split(' ').pop()} @ ${(b.home||'').split(' ').pop()}`;
+    const pnl     = b.pnl||0;
+    return `<div class="hist-row ${b.won?'won':'lost'}">
+      <span style="color:var(--muted)">${time}</span>
+      <span>${matchup}</span>
+      <span style="font-size:9px">${b.outcome_name||'—'}</span>
+      <span style="color:${(b.best_price||0)>0?'#4ade80':'#f87171'}">${fmtOdds(b.best_price||0)}</span>
+      <span style="color:${pnl>=0?'#4ade80':'#f87171'};font-weight:700">${fmtPnl(pnl)}</span>
+      <span style="color:${b.source==='HUMAN'?'#a78bfa':'#94a3b8'}">${b.source||'AUTO'}</span>
+      <span style="color:${b.won?'#4ade80':'#f87171'};font-weight:700">${b.won?'WON':'LOST'}</span>
+    </div>`;
+  }).join('');
+}
+
+// ── PARLAYS ──
+function renderParlays(parlays) {
+  const grid  = document.getElementById('parlay-grid');
+  const badge = document.getElementById('parlay-badge');
+  const tabCt = document.getElementById('parlay-tab-count');
+  if (!grid) return;
+  const active = (parlays||[]).filter(p => !parlayDecisions[p.parlay_id]);
+  badge.textContent = active.length+' parlays';
+  if (tabCt) { tabCt.textContent = active.length; tabCt.style.display = active.length?'inline':'none'; }
+  if (!active.length) { grid.innerHTML = '<div class="empty">No parlay suggestions this scan — need 2+ confirmed bets (≥70%) from different games.</div>'; return; }
+  grid.innerHTML = active.map(p => {
+    const legs = p.legs.map(l => `
+      <div class="parlay-leg">
+        <div class="parlay-leg-left">
+          <div class="parlay-leg-matchup">${l.sport} · ${l.matchup}</div>
+          <div class="parlay-leg-outcome">${l.outcome}</div>
+          <div class="parlay-leg-conf">AI: ${(l.confidence*100).toFixed(0)}% confident</div>
+          ${l.reasoning?`<div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted);margin-top:3px">"${l.reasoning.slice(0,90)}${l.reasoning.length>90?'...':''}"</div>`:''}
+        </div>
+        <div class="parlay-leg-odds" style="color:${l.odds>0?'#4ade80':'#f87171'}">${l.odds>0?'+':''}${l.odds}</div>
+      </div>`).join('');
+    return `<div class="parlay-card">
+      <div class="parlay-header">
+        <div>
+          <div style="font-size:10px;color:var(--muted);margin-bottom:4px;letter-spacing:0.1em">2-LEG PARLAY</div>
+          <div class="parlay-odds">${p.parlay_odds>0?'+':''}${p.parlay_odds}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="parlay-payout">+$${p.potential_payout} payout</div>
+          <div style="font-size:10px;color:var(--muted)">on $${p.bet_size} stake</div>
+        </div>
+      </div>
+      ${legs}
+      <div class="parlay-stats">
+        <div class="parlay-stat"><div class="parlay-stat-label">Combined Conf</div><div class="parlay-stat-val">${(p.combined_conf*100).toFixed(0)}%</div></div>
+        <div class="parlay-stat"><div class="parlay-stat-label">True Prob</div><div class="parlay-stat-val">${(p.true_prob*100).toFixed(1)}%</div></div>
+        <div class="parlay-stat"><div class="parlay-stat-label">Implied</div><div class="parlay-stat-val">${(p.implied_prob*100).toFixed(1)}%</div></div>
+        <div class="parlay-stat"><div class="parlay-stat-label">Edge</div><div class="parlay-stat-val" style="color:${p.edge>=0?'#4ade80':'#f87171'}">${p.edge>=0?'+':''}${(p.edge*100).toFixed(1)}%</div></div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="parlay-approve-btn" onclick="decideParlay('${p.parlay_id}','approve')">✓ PLACE PARLAY</button>
+        <button class="parlay-reject-btn"  onclick="decideParlay('${p.parlay_id}','reject')">✕ Skip</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function decideParlay(id, action) {
+  parlayDecisions[id] = action;
+  renderParlays(window._lastParlays||[]);
+  if (action==='approve') alert('Parlay noted! Live placement coming when Loachy goes live.');
+}
+
+// ── LOAD DATA ──
+function loadData() {
+  fetch('loachy_data.json?t='+Date.now())
+    .then(r=>{ if(!r.ok) throw new Error(); return r.json(); })
+    .then(data=>{
+      const portfolio = data.portfolioValue ?? data.wallet ?? 50;
+      const wallet    = data.wallet ?? 50;
+      const staked    = data.stakedValue ?? 0;
+      const daily     = data.dailyPnl  ?? 0;
+      const total     = data.totalPnl  ?? 0;
+      const wr        = data.winRate   ?? 0;
+      const roi       = data.roi       ?? 0;
+
+      // Portfolio (cash + staked) — this never drops when a bet is placed
+      const pEl = document.getElementById('l-portfolio');
+      pEl.textContent = '$'+portfolio.toFixed(2);
+      pEl.style.color = portfolio >= (data.startingBudget||50) ? '#fbbf24' : '#f87171';
+      document.getElementById('l-mode').textContent = data.mode==='LIVE'?'live':'paper';
+
+      // Cash
+      const wEl = document.getElementById('l-wallet');
+      wEl.textContent = '$'+wallet.toFixed(2);
+      wEl.style.color = '#e8e4d0';
+      document.getElementById('l-staked').textContent = staked>0?'$'+staked.toFixed(2)+' staked':'';
+
+      const dEl=document.getElementById('l-daily');
+      dEl.textContent=fmtPnl(daily); dEl.style.color=daily>=0?'#4ade80':'#f87171';
+      const tEl=document.getElementById('l-total');
+      tEl.textContent=fmtPnl(total); tEl.style.color=total>=0?'#4ade80':'#f87171';
+      const roiEl=document.getElementById('l-roi');
+      roiEl.textContent=(roi>=0?'+':'')+roi.toFixed(1)+'%'; roiEl.style.color=roi>=0?'#4ade80':'#f87171';
+      const wrEl=document.getElementById('l-wr');
+      wrEl.textContent=wr.toFixed(0)+'%'; wrEl.style.color=wr>=50?'#4ade80':wr>=40?'#fbbf24':'#f87171';
+
+      document.getElementById('l-open').textContent    = data.openBets??0;
+      document.getElementById('l-scanned').textContent = data.gamesScanned??0;
+
+      // CLV — now correctly populated from local scope in bot
+      const clvEl = document.getElementById('l-clv');
+      if (data.clvPct!=null) {
+        clvEl.textContent = data.clvPct.toFixed(0)+'%';
+        clvEl.style.color = data.clvPct>=55?'#4ade80':data.clvPct>=45?'#fbbf24':'#f87171';
+      } else { clvEl.textContent = '—'; }
+
+      // Loss streak — now correctly from wallet.current_loss_streak()
+      const streak    = data.lossStreak ?? 0;
+      const streakEl  = document.getElementById('l-streak');
+      const streakSub = document.getElementById('l-streak-sub');
+      streakEl.textContent = streak;
+      if (streak >= 3) {
+        streakEl.style.color = '#f87171'; streakSub.textContent = '⚠ kelly reduced'; streakSub.style.color = '#f87171';
+      } else if (streak >= 2) {
+        streakEl.style.color = '#fbbf24'; streakSub.textContent = 'watch closely'; streakSub.style.color = '#fbbf24';
+      } else {
+        streakEl.style.color = '#4ade80'; streakSub.textContent = 'kelly normal'; streakSub.style.color = 'var(--muted)';
+      }
+
+      // API credits
+      const apiEl = document.getElementById('l-api-credits');
+      const api   = data.apiRemaining;
+      if (apiEl) { apiEl.textContent = api!=null?api+' credits left':'— credits'; apiEl.style.color = api<50?'#f87171':api<150?'#fbbf24':'var(--muted)'; }
+
+      // Countdown + last scan
+      if (data.nextScanAt) { _nextScanAt = data.nextScanAt; updateCountdown(); }
+      const lsEl = document.getElementById('l-last-scan');
+      if (lsEl) lsEl.textContent = data.lastScan ? 'last: '+data.lastScan.slice(11,16) : '';
+
+      // Mood
+      const mood  = data.mood  || 'watching';
+      const quote = data.quote || '"Loachy Boy is watching the boards."';
+      const art   = data.art   || '  ><(((º>\n  ~ ~ ~ ~';
+      const moodEl = document.getElementById('l-mood');
+      if (moodEl) { moodEl.textContent=mood; moodEl.style.color=mood==='hunting'?'#fbbf24':mood==='sleeping'?'#6b6850':mood==='pending'?'#f97316':'#94a3b8'; }
+      document.getElementById('loach-quote').textContent    = quote;
+      document.getElementById('loach-art-bar').textContent  = art;
+      document.getElementById('fish-art').textContent       = art;
+
+      // Wallet history — portfolio value (never drops on bet placement)
+      if (data.walletHistory && data.walletHistory.length > 0) {
+        walletHistory = data.walletHistory;
+      } else if (!walletHistory.length || walletHistory[walletHistory.length-1].v !== portfolio) {
+        walletHistory.push({t: new Date().toISOString(), v: portfolio});
+        if (walletHistory.length > 500) walletHistory.shift();
+      }
+      drawChart(data);
+
+      window._lastParlays = data.suggestedParlays||[];
+      renderPending(data.pendingBets||[]);
+      renderBoard(data.candidates||[]);
+      renderOpen(data.openBetsList||[]);
+      renderHistory(data.recentBets||[]);
+      renderParlays(data.suggestedParlays||[]);
+    })
+    .catch(()=>{
+      document.getElementById('board-grid').innerHTML=`<div class="empty"><div style="font-size:20px;margin-bottom:8px">🐟</div>Loachy Boy isn't running yet.<br><br><span style="color:var(--gold)">Start with:</span> <span style="color:var(--text)">python3 loachy_bot.py</span><br><br><span style="font-size:10px;color:var(--muted)">Also needs ODDS_API_KEY in .env · free at the-odds-api.com</span></div>`;
+    });
+}
+
+// ── SPORTS TOGGLES ──
+const SPORTS_LIST = [
+  {key:"basketball_ncaab",label:"🏀 NCAAB"},{key:"basketball_nba",label:"🏀 NBA"},
+  {key:"icehockey_nhl",label:"🏒 NHL"},{key:"baseball_mlb",label:"⚾ MLB"},
+  {key:"americanfootball_nfl",label:"🏈 NFL"},{key:"americanfootball_ncaaf",label:"🏈 NCAAF"},
+  {key:"mma_mixed_martial_arts",label:"🥊 MMA"},{key:"soccer_epl",label:"⚽ EPL"},
+  {key:"soccer_usa_mls",label:"⚽ MLS"},
+];
+let sportsState = {};
+
+function renderSportsToggles() {
+  const grid = document.getElementById('sports-grid');
+  const on   = Object.values(sportsState).filter(Boolean).length;
+  document.getElementById('sports-count-badge').textContent = on+' / '+SPORTS_LIST.length+' active';
+  grid.innerHTML = SPORTS_LIST.map(s => {
+    const isOn = sportsState[s.key] !== false;
+    return `<div class="sport-toggle ${isOn?'on':''}" onclick="toggleSport('${s.key}')">
+      <span class="sport-name">${s.label}</span><span class="sport-pip"></span>
+    </div>`;
+  }).join('');
+}
+function toggleSport(key) {
+  sportsState[key] = !sportsState[key];
+  fetch('/api/sports-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(sportsState)}).catch(()=>{});
+  renderSportsToggles();
+}
+function loadSportsConfig() {
+  fetch('loachy_sports_config.json?t='+Date.now())
+    .then(r=>r.json()).then(d=>{sportsState=d;renderSportsToggles();})
+    .catch(()=>{SPORTS_LIST.forEach(s=>sportsState[s.key]=true);renderSportsToggles();});
+}
+
+setTimeout(resizeCanvas, 50);
+loadData();
+loadSportsConfig();
+setInterval(loadData, 30000);
+</script>
+<script src="farm_music.js"></script>
+</body>
+</html>

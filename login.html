@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jacob's Money Farm — Access</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #000;
+      font-family: 'Courier New', Courier, monospace;
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      overflow: hidden;
+    }
+
+    canvas#stars {
+      position: fixed; inset: 0; width: 100%; height: 100%;
+      pointer-events: none;
+    }
+
+    .terminal {
+      position: relative; z-index: 2;
+      background: rgba(0,0,0,0.82);
+      border: 1px solid #1a4a1a;
+      box-shadow: 0 0 60px rgba(0,255,70,0.07), inset 0 0 80px rgba(0,0,0,0.5);
+      padding: 44px 52px 40px;
+      width: min(480px, 92vw);
+      border-radius: 2px;
+    }
+
+    .scan-line {
+      width: 100%; height: 1px;
+      background: linear-gradient(90deg, transparent, #0f0, transparent);
+      margin-bottom: 28px;
+      animation: scan 3s linear infinite;
+    }
+    @keyframes scan {
+      0%   { opacity: 0; transform: scaleX(0); }
+      50%  { opacity: 1; transform: scaleX(1); }
+      100% { opacity: 0; transform: scaleX(0); }
+    }
+
+    .ascii {
+      color: #0f0; font-size: 11px; line-height: 1.35;
+      text-align: center; opacity: 0.55;
+      margin-bottom: 18px;
+      white-space: pre;
+    }
+
+    .title {
+      color: #0f0; font-size: 17px; font-weight: bold;
+      letter-spacing: 4px; text-align: center;
+      text-shadow: 0 0 12px rgba(0,255,70,0.45);
+      margin-bottom: 5px;
+    }
+
+    .sub {
+      color: #0a0; font-size: 10px; text-align: center;
+      letter-spacing: 2px; margin-bottom: 36px;
+    }
+
+    .prompt {
+      display: flex; align-items: center;
+      border-bottom: 1px solid #0a0;
+      padding-bottom: 8px; margin-bottom: 14px;
+    }
+
+    .label { color: #0f0; font-size: 14px; white-space: nowrap; }
+
+    #pw {
+      background: transparent; border: none; outline: none;
+      color: #0f0; font-family: 'Courier New', monospace;
+      font-size: 14px; flex: 1; caret-color: #0f0;
+      letter-spacing: 3px; width: 100%;
+    }
+
+    .msg {
+      font-size: 12px; min-height: 18px; letter-spacing: 1px;
+      margin-bottom: 10px; transition: all 0.3s;
+    }
+    .msg.err { color: #f44; }
+    .msg.ok  { color: #0f0; }
+
+    .hint {
+      color: #040; font-size: 10px; letter-spacing: 2px;
+      text-align: center; transition: opacity 0.3s;
+    }
+
+    @keyframes shake {
+      0%,100% { transform: translateX(0); }
+      20%,60% { transform: translateX(-8px); }
+      40%,80% { transform: translateX(8px); }
+    }
+    .shake { animation: shake 0.4s ease; }
+
+    .spinner {
+      display: inline-block; width: 10px; height: 10px;
+      border: 2px solid #040; border-top-color: #0f0;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      vertical-align: middle; margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<canvas id="stars"></canvas>
+
+<div class="terminal" id="terminal">
+  <div class="scan-line"></div>
+  <pre class="ascii">   ___  ___  ___  ___
+  | __|/ _ \| _ \|  |
+  |__ \ (_) |   /|    |
+  |___/\___/|_|_\|_||_|</pre>
+  <div class="title">JACOB'S MONEY FARM</div>
+  <div class="sub">// secure terminal — identify yourself</div>
+  <div class="prompt">
+    <span class="label">$ password:&nbsp;</span>
+    <input id="pw" type="password" autocomplete="current-password" spellcheck="false" autofocus />
+  </div>
+  <div class="msg" id="msg"></div>
+  <div class="hint" id="hint">[ type password to authenticate ]</div>
+</div>
+
+<script>
+// ── SKIP IF ALREADY LOGGED IN ──
+(async function() {
+  try {
+    const res = await fetch('/api/auth/check', {credentials: 'include'});
+    const data = await res.json();
+    if (data.ok) window.location.href = '/';
+  } catch(e) {}
+})();
+
+// ── STARFIELD ──
+const canvas = document.getElementById('stars');
+const ctx    = canvas.getContext('2d');
+function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+resize();
+window.addEventListener('resize', resize);
+
+const stars = Array.from({length: 200}, () => ({
+  x: Math.random() * canvas.width,
+  y: Math.random() * canvas.height,
+  r: Math.random() * 1.5,
+  o: Math.random(),
+  speed: 0.002 + Math.random() * 0.003,
+}));
+
+(function drawStars() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  stars.forEach(s => {
+    s.o += s.speed;
+    const op = 0.3 + Math.abs(Math.sin(s.o)) * 0.7;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${150+Math.floor(Math.random()*50)},${200+Math.floor(Math.random()*55)},${150+Math.floor(Math.random()*50)},${op})`;
+    ctx.fill();
+  });
+  requestAnimationFrame(drawStars);
+})();
+
+// ── AUTH ──
+const pw   = document.getElementById('pw');
+const msg  = document.getElementById('msg');
+const hint = document.getElementById('hint');
+const term = document.getElementById('terminal');
+let busy = false;
+
+async function tryLogin(password) {
+  if (busy) return;
+  busy = true;
+  hint.innerHTML = '<span class="spinner"></span> authenticating...';
+
+  try {
+    const res  = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'include',
+      body: JSON.stringify({password})
+    });
+    const data = await res.json();
+
+    if (data.ok) {
+      msg.className = 'msg ok';
+      msg.textContent = '// access granted — welcome back jacob';
+      hint.textContent = '';
+      setTimeout(() => {
+        window.location.href = '/';
+      }, 600);
+    } else {
+      msg.className = 'msg err';
+      msg.textContent = '// access denied — wrong password';
+      pw.value = '';
+      hint.textContent = '[ type password to authenticate ]';
+      term.classList.remove('shake');
+      void term.offsetWidth;
+      term.classList.add('shake');
+      busy = false;
+      pw.focus();
+    }
+  } catch(e) {
+    msg.className = 'msg err';
+    msg.textContent = '// connection error — try again';
+    hint.textContent = '[ type password to authenticate ]';
+    busy = false;
+    pw.focus();
+  }
+}
+
+// Auto-submit after typing stops for 400ms OR on Enter
+let debounce;
+pw.addEventListener('input', () => {
+  clearTimeout(debounce);
+  if (!pw.value) return;
+  debounce = setTimeout(() => tryLogin(pw.value), 400);
+});
+
+pw.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    clearTimeout(debounce);
+    if (pw.value) tryLogin(pw.value);
+  }
+});
+
+pw.focus();
+</script>
+</body>
+</html>
