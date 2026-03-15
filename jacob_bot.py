@@ -53,11 +53,11 @@ CONFIG = {
     "max_open_positions":    8,
     "daily_loss_cap_pct":    0.05,   # 5% of STARTING budget = $25 fixed cap
     "max_trades_per_day":    10,
-    "stop_loss_pct":         0.25,   # cut stock positions at -25%
+    "stop_loss_pct":         0.08,   # v3: tightened from 0.25   # cut stock positions at -25%
 
     # Signals
-    "rsi_oversold":           35,
-    "rsi_overbought":         65,
+    "rsi_oversold":           30,   # v3: stricter oversold
+    "rsi_overbought":         70,   # v3: stricter overbought
     "volume_surge_threshold": 1.5,
     "score_threshold":        62,    # lowered from 68 — catches more setups
     "auto_trade_confidence":  0.70,
@@ -73,7 +73,7 @@ CONFIG = {
     "options_dte_max":      45,
 
     # Holding periods
-    "stock_hold_days":   5,
+    "stock_hold_days":   2,   # v3: faster exits
     "options_hold_days": 14,         # raised from 3 — more realistic
 
     # Timing — used by run_loop
@@ -336,6 +336,60 @@ class MarketData:
 # ══════════════════════════════════════════════════════════════════════════════
 # MODULE 2: SIGNAL SCORER
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 1b: MARKET REGIME DETECTOR                                      [v3]
+# ══════════════════════════════════════════════════════════════════════════════
+class MarketRegime:
+    """
+    Fetches SPY + QQQ once per scan to determine broad market direction.
+      BEAR   → SPY and QQQ both down >2% over 5 days — block new longs
+      BULL   → SPY and QQQ both up  >1.5% over 5 days — boost long confidence
+      NEUTRAL→ everything else — normal operation
+    """
+    def __init__(self, market):
+        self.market      = market
+        self._cache      = "neutral"
+        self._spy5       = 0.0
+        self._qqq5       = 0.0
+        self._spy_chg    = 0.0
+        self._cache_time = None
+
+    def get(self):
+        """Returns (regime, spy_5d, qqq_5d). Cached per scan (~5 min)."""
+        now = datetime.now(ET)
+        if self._cache_time and (now - self._cache_time).total_seconds() < 290:
+            return self._cache, self._spy5, self._qqq5
+        try:
+            spy = self.market.get_quote("SPY")
+            qqq = self.market.get_quote("QQQ")
+            spy5 = spy.get("momentum_5d", 0)
+            qqq5 = qqq.get("momentum_5d", 0)
+            self._spy_chg = spy.get("change_pct", 0)
+
+            if spy5 < CONFIG["bear_threshold_pct"] and qqq5 < CONFIG["bear_threshold_pct"]:
+                regime = "bear"
+            elif spy5 > CONFIG["bull_threshold_pct"] and qqq5 > CONFIG["bull_threshold_pct"]:
+                regime = "bull"
+            else:
+                regime = "neutral"
+
+            self._cache      = regime
+            self._spy5       = spy5
+            self._qqq5       = qqq5
+            self._cache_time = now
+            log.info("  [REGIME] SPY 5d=%+.1f%% | QQQ 5d=%+.1f%% | Today=%+.1f%% → %s",
+                     spy5, qqq5, self._spy_chg, regime.upper())
+        except Exception as e:
+            log.warning("  [REGIME] Fetch failed: %s — using %s", e, self._cache.upper())
+        return self._cache, self._spy5, self._qqq5
+
+    @property
+    def high_vol_day(self):
+        """True if today's SPY move >2% — reduce size on high vol days."""
+        return abs(self._spy_chg) > 2.0
+
+
 class SignalScorer:
     """Scores each ticker 0-100. High score = strong setup."""
 
@@ -764,9 +818,13 @@ class State:
 class JacobBot:
 
     def __init__(self):
-        self.market   = MarketData()
-        self.scorer   = SignalScorer()
-        self.rules    = RulesEngine()
+        self.market        = MarketData()
+        self.scorer        = SignalScorer()
+        self.rules         = RulesEngine()
+        self.regime_engine = MarketRegime(self.market)
+        self.current_regime = "neutral"
+        self.regime_spy5    = 0.0
+        self.regime_qqq5    = 0.0
         self.wallet   = Wallet()
         self.pending  = PendingManager()
         self.scan_count  = 0
@@ -855,27 +913,72 @@ class JacobBot:
         return prices
 
     def _check_stop_losses(self, live_prices):
-        """Cut stock positions that dropped/rose 25%+ from entry."""
+        """
+        v3 stop logic (per position, in priority order):
+          1. Hard stop loss      — position down >8% from entry
+          2. Quick cut           — down >4% within first 24h (fast losers out early)
+          3. Trailing stop       — armed at +3%, fires at -2% from peak
+          4. Standard close      — position expired (handled in _settle_positions)
+        Also updates peak_price on winning positions each scan.
+        """
+        now = datetime.now(ET)
         for pos_id in list(self.wallet.open_positions.keys()):
             pos = self.wallet.open_positions.get(pos_id)
             if not pos or pos.get("type") == "option":
-                continue   # skip options — stock price vs option price is meaningless
-            ticker    = pos.get("ticker","").replace("_OPT","")
-            direction = pos.get("direction","LONG")
-            entry     = pos.get("entry_price",0)
+                continue
+            ticker    = pos.get("ticker", "").replace("_OPT", "")
+            direction = pos.get("direction", "LONG")
+            entry     = pos.get("entry_price", 0)
             live      = live_prices.get(ticker)
             if not live or not entry:
                 continue
+
             move = (live - entry) / entry
-            triggered = (direction == "LONG"  and move <= -CONFIG["stop_loss_pct"]) or \
-                        (direction == "SHORT" and move >=  CONFIG["stop_loss_pct"])
-            if triggered:
-                pnl = round(pos["cost"] * (move if direction == "LONG" else -move), 4)
+            gain = move if direction == "LONG" else -move  # positive = winning
+
+            # Update peak price for trailing stop
+            peak = pos.get("peak_price", entry)
+            if direction == "LONG":
+                new_peak = max(peak, live)
+            else:
+                new_peak = min(peak, live) if peak != entry else live
+            pos["peak_price"] = new_peak
+
+            # Age of position in hours
+            try:
+                age_hrs = (now - datetime.fromisoformat(pos.get("opened_at","")).astimezone(ET)).total_seconds() / 3600
+            except:
+                age_hrs = 999
+
+            stop_reason = None
+            pnl         = round(pos["cost"] * gain, 4)
+
+            # 1. Hard stop loss
+            if gain <= -CONFIG["stop_loss_pct"]:
+                stop_reason = f"STOP LOSS {gain*100:.1f}%"
+
+            # 2. Quick cut — down >4% in first 24h
+            elif gain <= -CONFIG["quick_cut_pct"] and age_hrs < 24:
+                stop_reason = f"QUICK CUT {gain*100:.1f}% <24h"
+
+            # 3. Trailing stop — only arm if ever up >3%
+            elif gain > 0:
+                peak_gain = (new_peak - entry) / entry if direction == "LONG" else (entry - new_peak) / entry
+                if peak_gain >= CONFIG["trail_arm_pct"]:
+                    # How much has it given back from peak?
+                    if direction == "LONG":
+                        pullback = (new_peak - live) / new_peak
+                    else:
+                        pullback = (live - new_peak) / new_peak
+                    if pullback >= CONFIG["trail_fire_pct"]:
+                        stop_reason = f"TRAIL STOP peak={peak_gain*100:.1f}% pullback={pullback*100:.1f}%"
+
+            if stop_reason:
                 settled = self.wallet.close(pos_id, pnl)
                 if settled:
                     State.save(self.wallet)
-                    log.warning("  [STOP LOSS] %s %s %.1f%% | P&L: $%+.2f | Cash: $%.2f",
-                                ticker, direction, move*100, pnl, self.wallet.cash)
+                    log.warning("  [%s] %s %s | P&L: $%+.2f | Cash: $%.2f",
+                                stop_reason, ticker, direction, pnl, self.wallet.cash)
                     self._log_csv(pos, pnl=pnl)
 
     def _settle_positions(self, live_prices):
@@ -990,6 +1093,9 @@ class JacobBot:
                     "scanCount":      self.scan_count,
                     "rulesEvals":     self.rules_evals,
                     "engineMode":     "rules",
+                    "regime":         getattr(self, "current_regime", "neutral"),
+                    "regimeSpy5":     round(getattr(self, "regime_spy5", 0), 2),
+                    "regimeQqq5":     round(getattr(self, "regime_qqq5", 0), 2),
                     "aiCostEstimate": 0,
                     "pendingCount":   len(pending_bets),
                     "nextScanAt":     self.next_scan_at,
@@ -1025,10 +1131,17 @@ class JacobBot:
         live_prices = self._get_live_prices()  # refresh after settlements
         self._check_stop_losses(live_prices)
 
+        # ── Step 3b: Market regime ──
+        regime, spy5, qqq5 = self.regime_engine.get()
+        self.current_regime = regime
+        self.regime_spy5    = spy5
+        self.regime_qqq5    = qqq5
+        high_vol = self.regime_engine.high_vol_day
+
         # ── Step 4: Process approved pending ──
         for trade in self.pending.get_approved():
             log.info(f"  [HUMAN APPROVED] {trade['ticker']} {trade.get('direction','?')}")
-            self._place_trade(trade, source="HUMAN", premarket=False)  # human approvals always place
+            self._place_trade(trade, source="HUMAN", premarket=premarket)
 
         # ── Step 5: Expire stale pending ──
         current_pending = self.pending.expire_old()
@@ -1065,6 +1178,14 @@ class JacobBot:
                 scan_results.append(result)
                 continue
 
+            # v3: Regime gate
+            sig_dir = signal["direction"]
+            if regime == "bear" and sig_dir == "LONG":
+                result["action"]      = "skip"
+                result["skip_reason"] = f"BEAR market — longs blocked (SPY 5d={spy5:+.1f}%)"
+                scan_results.append(result)
+                continue
+
             ok, reason = self.wallet.can_trade(ticker, signal["direction"])
             if not ok:
                 result["action"]      = "blocked"
@@ -1077,7 +1198,15 @@ class JacobBot:
             result["ai_confidence"] = round(confidence, 2)
             result["ai_reasoning"]  = reasoning
 
-            size  = self.wallet.position_size()
+            # v3: adjust size by regime and volatility
+            size = self.wallet.position_size()
+            if regime == "bull":
+                size = min(size * 1.2, CONFIG["max_position_size_usd"])
+            elif regime == "bear":
+                size = size * 0.8
+            if high_vol:
+                size = size * 0.7   # reduce on high-vol days
+            size = round(max(CONFIG["min_position_size_usd"], size), 2)
             trade = {
                 "ticker":        ticker,
                 "type":          "stock",
@@ -1216,7 +1345,7 @@ class JacobBot:
         return max(0, int((candidate - now).total_seconds()))
 
     def run_loop(self):
-        log.info("Jacob v2 starting | %s | $%.0f budget | %d tickers | rules engine",
+        log.info("Jacob v3 starting | %s | $%.0f budget | %d tickers | rules engine",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], len(CONFIG["watchlist"]))
         log.info("Scan interval: %ds | Stop loss: %.0f%% | Daily loss cap: $%.0f",
