@@ -9,6 +9,8 @@ RUN:    screen -S farmapi -> python3 farm_api.py -> Ctrl+A D
 import subprocess, os, json, time, secrets, hashlib
 from dotenv import load_dotenv
 load_dotenv(override=True)
+from twilio.request_validator import RequestValidator as TwilioValidator
+_twilio_validator = TwilioValidator(os.getenv("TWILIO_AUTH_TOKEN", ""))
 from flask import Flask, jsonify, request, make_response, Response
 from flask_cors import CORS
 
@@ -416,6 +418,13 @@ def _handle_status():
 @app.route("/sms/webhook", methods=["POST"])
 def sms_webhook():
     """Twilio webhook — handles two-way SMS replies from Jacob."""
+    # Validate Twilio signature — reject forged requests
+    sig      = request.headers.get("X-Twilio-Signature", "")
+    url      = request.url
+    params   = request.form.to_dict()
+    if not _twilio_validator.validate(url, params, sig):
+        _sms_log.warning("[SMS] Invalid Twilio signature — rejected")
+        return Response("Forbidden", status=403)
     body = (request.form.get("Body") or "").strip().upper()
     _sms_log.info(f"[SMS] Incoming reply: {body!r}")
 
@@ -444,4 +453,4 @@ def sms_webhook():
 
 if __name__ == "__main__":
     print("Jacob's Money Farm API starting on port 5000...")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="127.0.0.1", port=5000, debug=False)  # security: localhost only
