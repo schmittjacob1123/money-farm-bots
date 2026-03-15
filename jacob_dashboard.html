@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <title>Jacob · Stocks & Options</title>
+  <title>Jacob · Stocks &amp; Options</title>
   <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet"/>
   <style>
     :root {
@@ -26,13 +26,23 @@
     *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
     html,body { height:100%; background:var(--bg); color:var(--text); font-family:'JetBrains Mono',monospace; overflow-x:hidden; }
     ::-webkit-scrollbar { width:3px; } ::-webkit-scrollbar-track { background:transparent; } ::-webkit-scrollbar-thumb { background:#1a2535; border-radius:2px; }
+    body::before {
+      content:''; position:fixed; inset:0; z-index:0; pointer-events:none;
+      background-image: linear-gradient(rgba(74,222,128,0.018) 1px,transparent 1px), linear-gradient(90deg,rgba(74,222,128,0.018) 1px,transparent 1px);
+      background-size:44px 44px;
+    }
+    body>*{position:relative;z-index:1;}
     @keyframes fadeUp   { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
     @keyframes spin     { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
-    @keyframes pulse    { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    @keyframes pulse    { 0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(74,222,128,0.4)} 50%{opacity:0.7;box-shadow:0 0 0 6px rgba(74,222,128,0)} }
     @keyframes ticker   { from{transform:translateX(0)} to{transform:translateX(-50%)} }
     @keyframes chartIn  { from{opacity:0;transform:scaleX(0.9)} to{opacity:1;transform:scaleX(1)} }
+    @keyframes lizardBob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-4px)} }
+    @keyframes glowG    { 0%,100%{box-shadow:0 0 0 1px rgba(74,222,128,0.2),0 4px 20px rgba(74,222,128,0.06)} 50%{box-shadow:0 0 0 1px rgba(74,222,128,0.45),0 4px 28px rgba(74,222,128,0.14)} }
+    @keyframes scanline { 0%{top:-4px} 100%{top:100vh} }
+    .scanline { position:fixed;top:0;left:0;right:0;height:3px;z-index:999;pointer-events:none;background:linear-gradient(transparent,rgba(74,222,128,0.07),transparent);animation:scanline 10s linear infinite; }
 
-    /* ── TICKER TAPE ── */
+    /* TICKER TAPE */
     .tape-wrap { background:#0a0f16; border-bottom:1px solid var(--border); height:26px; overflow:hidden; position:relative; }
     .tape-wrap::before,.tape-wrap::after { content:''; position:absolute; top:0; width:40px; height:100%; z-index:2; pointer-events:none; }
     .tape-wrap::before { left:0;  background:linear-gradient(to right,#0a0f16,transparent); }
@@ -42,31 +52,35 @@
     .tape-item .sym { color:var(--muted2); margin-right:5px; }
     .tape-item .up  { color:var(--green); } .tape-item .dn { color:var(--red); }
 
-    /* ── HEADER ── */
-    .header { display:flex; align-items:center; justify-content:space-between; padding:14px 20px; border-bottom:1px solid var(--border); background:var(--surface); }
+    /* HEADER */
+    .header { display:flex; align-items:center; justify-content:space-between; padding:14px 20px; border-bottom:1px solid var(--border); background:rgba(13,17,23,0.97); backdrop-filter:blur(20px); position:sticky;top:26px;z-index:99; }
     .hdr-left { display:flex; align-items:center; gap:14px; }
     .hdr-logo { font-family:'Bebas Neue',sans-serif; font-size:22px; letter-spacing:0.1em; color:var(--green); text-shadow:0 0 20px rgba(74,222,128,0.4); }
     .hdr-sub  { font-size:9px; color:var(--muted2); letter-spacing:0.15em; text-transform:uppercase; }
-    .hdr-lizard { font-size:11px; color:var(--green); white-space:pre; line-height:1.2; opacity:0.8; text-shadow:0 0 8px rgba(74,222,128,0.5); }
+    .lizard-sprite-wrap { animation:lizardBob 3s ease-in-out infinite, glowG 4s ease-in-out infinite; background:var(--green-dim); border:1px solid var(--green-border); border-radius:8px; padding:6px 9px; }
+    .lizard-sprite { font-family:'Courier New',monospace; font-size:9px; color:var(--green); white-space:pre; line-height:1.25; text-shadow:0 0 10px rgba(74,222,128,0.5); display:block; }
     .hdr-right { display:flex; gap:8px; align-items:center; }
     .hdr-btn { background:transparent; border:1px solid var(--border); color:var(--muted2); font-family:'JetBrains Mono',monospace; font-size:9px; letter-spacing:0.1em; padding:5px 10px; border-radius:4px; cursor:pointer; text-decoration:none; transition:all 0.2s; }
     .hdr-btn:hover { border-color:var(--green); color:var(--green); }
     .mode-badge { font-size:9px; letter-spacing:0.1em; padding:4px 10px; border-radius:4px; font-weight:700; }
     .mode-paper { background:rgba(251,191,36,0.1); color:var(--amber); border:1px solid rgba(251,191,36,0.3); }
 
-    /* ── MAIN LAYOUT ── */
+    /* MAIN */
     .main { padding:16px 20px; max-width:1400px; margin:0 auto; animation:fadeUp 0.5s ease; }
 
-    /* ── STATS ROW ── */
+    /* STATS ROW */
     .stats-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:8px; margin-bottom:16px; }
-    .stat-card { background:var(--surface); border:1px solid var(--border2); border-radius:8px; padding:12px 14px; }
+    .stat-card { background:var(--surface); border:1px solid var(--border2); border-radius:10px; padding:12px 14px; transition:border-color 0.2s,box-shadow 0.2s; cursor:default; }
+    .stat-card:hover { border-color:var(--green-border); box-shadow:0 0 18px rgba(74,222,128,0.08); }
     .stat-label { font-size:8px; color:var(--muted); letter-spacing:0.12em; text-transform:uppercase; margin-bottom:5px; }
     .stat-val   { font-size:18px; font-weight:700; letter-spacing:0.02em; color:var(--text); }
     .stat-sub   { font-size:9px; color:var(--muted); margin-top:3px; }
     .stat-card.accent { border-color:var(--green-border); background:var(--green-dim); }
+    .stat-card.fee-stat { border-color:rgba(251,191,36,0.18); }
+    .stat-card.fee-stat:hover { border-color:rgba(251,191,36,0.38); box-shadow:0 0 18px rgba(251,191,36,0.07); }
 
-    /* ── CHART CARD ── */
-    .chart-card { background:var(--surface); border:1px solid var(--border2); border-radius:8px; padding:14px 16px; margin-bottom:16px; }
+    /* CHART */
+    .chart-card { background:var(--surface); border:1px solid var(--border2); border-radius:10px; padding:14px 16px; margin-bottom:16px; }
     .chart-hdr  { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
     .chart-title { font-size:10px; color:var(--muted2); letter-spacing:0.12em; text-transform:uppercase; }
     .chart-vals { display:flex; gap:16px; align-items:baseline; }
@@ -74,16 +88,16 @@
     .chart-chg  { font-size:10px; }
     canvas#wallet-chart { width:100%; height:110px; display:block; animation:chartIn 0.6s ease; }
 
-    /* ── JACOB MOOD BOX ── */
-    .mood-box { background:var(--surface); border:1px solid var(--green-border); border-radius:8px; padding:14px 16px; margin-bottom:16px; display:flex; gap:16px; align-items:flex-start; }
-    .mood-art  { font-size:11px; color:var(--green); white-space:pre; line-height:1.35; text-shadow:0 0 10px rgba(74,222,128,0.5); flex-shrink:0; }
+    /* MOOD BOX */
+    .mood-box { background:linear-gradient(135deg,rgba(74,222,128,0.07),rgba(74,222,128,0.03)); border:1px solid var(--green-border); border-radius:10px; padding:14px 16px; margin-bottom:16px; display:flex; gap:16px; align-items:flex-start; box-shadow:0 4px 20px rgba(74,222,128,0.06); }
+    .mood-art  { font-family:'Courier New',monospace; font-size:10px; color:var(--green); white-space:pre; line-height:1.35; text-shadow:0 0 10px rgba(74,222,128,0.5); flex-shrink:0; }
     .mood-right { flex:1; }
     .mood-label { font-size:9px; color:var(--muted2); letter-spacing:0.15em; text-transform:uppercase; margin-bottom:4px; }
     .mood-val   { font-family:'Bebas Neue',sans-serif; font-size:20px; letter-spacing:0.08em; color:var(--green); }
     .mood-quote { font-size:10px; color:var(--muted2); font-style:italic; margin-top:6px; line-height:1.5; }
     .mood-scan  { font-size:9px; color:var(--muted); margin-top:6px; }
 
-    /* ── PENDING ALERT ── */
+    /* PENDING */
     .pending-alert { background:rgba(251,191,36,0.05); border:1px solid rgba(251,191,36,0.3); border-radius:8px; padding:14px 16px; margin-bottom:16px; }
     .pending-title { font-family:'Bebas Neue',sans-serif; font-size:18px; letter-spacing:0.08em; color:var(--amber); margin-bottom:2px; }
     .pending-sub   { font-size:9px; color:rgba(251,191,36,0.6); margin-bottom:12px; letter-spacing:0.05em; }
@@ -100,14 +114,14 @@
     .btn-reject  { background:rgba(248,113,113,0.08); border:1px solid rgba(248,113,113,0.2); color:var(--red); font-family:'JetBrains Mono',monospace; font-size:9px; letter-spacing:0.1em; padding:6px 12px; border-radius:4px; cursor:pointer; transition:all 0.2s; }
     .btn-reject:hover { background:rgba(248,113,113,0.15); }
 
-    /* ── TABS ── */
+    /* TABS */
     .tabs { display:flex; gap:4px; border-bottom:1px solid var(--border2); margin-bottom:14px; }
     .tab-btn { background:transparent; border:none; border-bottom:2px solid transparent; color:var(--muted); font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.1em; padding:8px 14px; cursor:pointer; transition:all 0.2s; text-transform:uppercase; }
     .tab-btn:hover  { color:var(--text); }
     .tab-btn.active { color:var(--green); border-bottom-color:var(--green); }
     .tab-panel { display:none; } .tab-panel.active { display:block; }
 
-    /* ── SCAN BOARD ── */
+    /* SCAN BOARD */
     .board-grid { display:flex; flex-direction:column; gap:6px; }
     .board-row  { background:var(--surface); border:1px solid var(--border2); border-radius:6px; padding:10px 14px; display:grid; grid-template-columns:70px 80px 60px 60px 60px 60px 1fr auto; gap:8px; align-items:center; transition:border-color 0.2s; }
     .board-row:hover { border-color:var(--border); }
@@ -129,37 +143,34 @@
     .action-skip    { color:var(--muted); }
     .action-blocked { color:var(--red); opacity:0.5; }
 
-    /* ── OPEN POSITIONS ── */
+    /* OPEN POSITIONS */
     .pos-grid { display:flex; flex-direction:column; gap:8px; }
-    .pos-card { background:var(--surface); border:1px solid var(--border2); border-radius:6px; padding:12px 14px; }
+    .pos-card { background:var(--surface); border:1px solid var(--border2); border-radius:6px; padding:12px 14px; transition:border-color 0.2s; }
+    .pos-card:hover { border-color:var(--green-border); }
     .pos-top  { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:8px; }
     .pos-ticker { font-size:14px; font-weight:700; color:var(--text); }
     .pos-type   { font-size:9px; color:var(--muted2); margin-top:2px; }
     .pos-pnl    { font-size:13px; font-weight:700; font-family:'Bebas Neue',sans-serif; letter-spacing:0.05em; }
     .pos-meta   { display:flex; gap:16px; font-size:9px; color:var(--muted); }
 
-    /* ── TRADE HISTORY ── */
+    /* HISTORY */
     .history-list { display:flex; flex-direction:column; gap:4px; }
-    .hist-row { background:var(--surface); border:1px solid var(--border2); border-radius:5px; padding:8px 12px; display:flex; justify-content:space-between; align-items:center; }
+    .hist-row { background:var(--surface); border:1px solid var(--border2); border-radius:5px; padding:8px 12px; display:flex; justify-content:space-between; align-items:center; transition:border-color 0.2s; }
+    .hist-row:hover { border-color:var(--border); }
     .hist-left  { flex:1; }
     .hist-ticker { font-size:11px; font-weight:700; }
     .hist-detail { font-size:9px; color:var(--muted); margin-top:2px; }
     .hist-pnl    { font-size:12px; font-weight:700; }
 
-    /* ── EMPTY ── */
+    /* MISC */
     .empty { text-align:center; padding:32px; color:var(--muted); font-size:10px; letter-spacing:0.1em; }
-
-    /* ── SECTION HEADER ── */
     .sec-hdr   { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
     .sec-title { font-size:10px; letter-spacing:0.15em; text-transform:uppercase; color:var(--muted2); white-space:nowrap; }
     .sec-line  { flex:1; height:1px; background:var(--border2); }
     .sec-badge { font-size:9px; font-weight:700; letter-spacing:0.1em; padding:2px 8px; border-radius:10px; border:1px solid var(--border2); color:var(--muted2); white-space:nowrap; }
-
-    /* ── SIGNALS INLINE ── */
     .signals-wrap { display:flex; flex-wrap:wrap; gap:4px; margin-top:4px; }
     .signal-chip  { font-size:8px; padding:2px 6px; border-radius:3px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); color:var(--muted2); }
 
-    /* ── MOBILE ── */
     @media(max-width:800px) {
       .board-row { grid-template-columns:60px 70px 50px 1fr auto; }
       .br-rsi,.br-score,.br-dir { display:none; }
@@ -168,18 +179,22 @@
   </style>
 </head>
 <body>
+<div class="scanline"></div>
 
 <!-- TICKER TAPE -->
 <div class="tape-wrap">
-  <div class="tape-inner" id="tape-inner">
-    <!-- populated by JS -->
-  </div>
+  <div class="tape-inner" id="tape-inner"></div>
 </div>
 
 <!-- HEADER -->
 <div class="header">
   <div class="hdr-left">
-    <div class="hdr-lizard">  .__.\n( o.o )\n > ^ <</div>
+    <div class="lizard-sprite-wrap">
+      <pre class="lizard-sprite" id="header-lizard">  .__. ~
+ ( o.o )
+  )   (
+  . . .</pre>
+    </div>
     <div>
       <div class="hdr-logo">JACOB</div>
       <div class="hdr-sub">Stocks &amp; Options Engine</div>
@@ -189,7 +204,7 @@
     <div class="mode-badge mode-paper" id="mode-badge">PAPER</div>
     <a href="index.html" class="hdr-btn">🌾 Farm</a>
     <a href="loachy_dashboard.html" class="hdr-btn">🐟 Loachy</a>
-    <a href="seraphina_dashboard.html" class="hdr-btn">🦎 Seraphina</a>
+    <a href="seraphina_dashboard.html" class="hdr-btn">🐱 Seraphina</a>
   </div>
 </div>
 
@@ -227,6 +242,11 @@
       <div class="stat-val" id="s-ai">—</div>
       <div class="stat-sub" id="s-cost">~$— spent</div>
     </div>
+    <div class="stat-card fee-stat">
+      <div class="stat-label">Fees Paid</div>
+      <div class="stat-val" id="s-fees" style="color:#fbbf24">$0.00</div>
+      <div class="stat-sub">brokerage fees</div>
+    </div>
   </div>
 
   <!-- WALLET CHART -->
@@ -243,7 +263,10 @@
 
   <!-- JACOB MOOD -->
   <div class="mood-box">
-    <div class="mood-art" id="jacob-art">  .__.\n( o.o )\n > ^ <</div>
+    <div class="mood-art" id="jacob-art">  .__. ~
+ ( o.o )
+  )   (
+  . . .</div>
     <div class="mood-right">
       <div class="mood-label">Status</div>
       <div class="mood-val" id="jacob-mood">INITIALIZING</div>
@@ -280,7 +303,6 @@
       <div class="sec-line"></div>
       <div class="sec-badge" id="board-badge" style="color:var(--green);border-color:rgba(74,222,128,0.3);background:rgba(74,222,128,0.06)">scanning...</div>
     </div>
-    <!-- board header labels -->
     <div style="display:grid;grid-template-columns:70px 80px 60px 60px 60px 60px 1fr auto;gap:8px;padding:4px 14px;font-size:8px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px">
       <span>Ticker</span><span>Price</span><span>Chg%</span><span>RSI</span><span>Score</span><span>Dir</span><span>Signal</span><span>Action</span>
     </div>
@@ -316,7 +338,7 @@
     </div>
   </div>
 
-</div><!-- /main -->
+</div>
 
 <script>
 // ── AUTH CHECK ──
@@ -327,9 +349,34 @@
 })();
 </script>
 <script>
-// ══════════════════════════════════════════════════════
-// UTILITIES
-// ══════════════════════════════════════════════════════
+// ── ANIMATED LIZARD SPRITE (600ms) ──
+const LIZARD_FRAMES = {
+  hunting: [
+    '   .__. ~  \n  ( *>* )  \n   ) > (   \n  ALPHA!   ',
+    '   .__.    \n  ( >.< )  \n   )   (   \n  TRADE    '
+  ],
+  watching: [
+    '  .__. ~   \n ( o.o )   \n  )   (    \n  . . .    ',
+    '  .__. ~   \n ( o.- )   \n  )   (    \n  . . .    '
+  ],
+  sleeping: [
+    '  .__. ~   \n ( -.- )   \n  )   (    \n  zzz.     ',
+    '  .__. ~   \n ( -.~ )   \n  )   (    \n  zZz.     '
+  ]
+};
+let lizardFrame = 0;
+let lizardMood  = 'watching';
+function tickLizard() {
+  const frames = LIZARD_FRAMES[lizardMood] || LIZARD_FRAMES.watching;
+  lizardFrame = (lizardFrame + 1) % frames.length;
+  const el1 = document.getElementById('header-lizard');
+  const el2 = document.getElementById('jacob-art');
+  if (el1) el1.textContent = frames[lizardFrame];
+  if (el2) el2.textContent = frames[lizardFrame];
+}
+setInterval(tickLizard, 600);
+
+// ── UTILITIES ──
 function fmtUsd(v) { return '$'+Number(v||0).toFixed(2); }
 function fmtPnl(v) { const n=Number(v||0); return (n>=0?'+':'')+fmtUsd(n); }
 function fmtPct(v) { const n=Number(v||0); return (n>=0?'+':'')+n.toFixed(1)+'%'; }
@@ -353,12 +400,10 @@ function switchTab(name) {
   event.currentTarget.classList.add('active');
 }
 
-// ══════════════════════════════════════════════════════
-// WALLET CHART
-// ══════════════════════════════════════════════════════
+// ── WALLET CHART ──
 const canvas = document.getElementById('wallet-chart');
 const ctx    = canvas.getContext('2d');
-let walletHistory = [];  // loaded from server each poll
+let walletHistory = [];
 let _lastData = null;
 
 function drawChart(data) {
@@ -383,8 +428,6 @@ function drawChart(data) {
   const budget = _lastData ? (_lastData.startingBudget||500) : 500;
   const isUp   = latest >= budget;
   const lClr   = isUp ? '#4ade80' : '#f87171';
-
-  // Grid lines
   ctx.strokeStyle='#1a2535'; ctx.lineWidth=1;
   for (let i=0;i<=4;i++) {
     const f=i/4, v=minV+range*f, y=pad.t+cH*(1-f);
@@ -392,8 +435,6 @@ function drawChart(data) {
     ctx.fillStyle='#4a5568'; ctx.font='8px JetBrains Mono,monospace'; ctx.textAlign='right';
     ctx.fillText('$'+v.toFixed(0), pad.l-5, y+3);
   }
-
-  // Day markers
   const daysSeen = new Set();
   walletHistory.forEach((p,i) => {
     const d = new Date(p.t);
@@ -403,14 +444,11 @@ function drawChart(data) {
       daysSeen.add(dk);
       const x=toX(i);
       ctx.strokeStyle='rgba(74,222,128,0.15)'; ctx.lineWidth=1; ctx.setLineDash([3,4]);
-      ctx.beginPath(); ctx.moveTo(x,pad.t); ctx.lineTo(x,pad.t+cH); ctx.stroke();
-      ctx.setLineDash([]);
+      ctx.beginPath(); ctx.moveTo(x,pad.t); ctx.lineTo(x,pad.t+cH); ctx.stroke(); ctx.setLineDash([]);
       ctx.fillStyle='rgba(74,222,128,0.5)'; ctx.font='8px JetBrains Mono,monospace'; ctx.textAlign='center';
       ctx.fillText(etDate.toLocaleDateString('en-US',{month:'short',day:'numeric'}), x, pad.t+9);
     } else { daysSeen.add(dk); }
   });
-
-  // X labels
   const lblCount = Math.min(5, walletHistory.length);
   ctx.fillStyle='rgba(74,82,104,0.9)'; ctx.font='8px JetBrains Mono,monospace';
   for (let i=0;i<lblCount;i++) {
@@ -419,8 +457,6 @@ function drawChart(data) {
     ctx.textAlign=i===0?'left':i===lblCount-1?'right':'center';
     ctx.fillText(fmtShort(walletHistory[idx].t), x, pad.t+cH+16);
   }
-
-  // Gradient fill
   const grad = ctx.createLinearGradient(0,pad.t,0,pad.t+cH);
   grad.addColorStop(0, isUp?'rgba(74,222,128,0.15)':'rgba(248,113,113,0.15)');
   grad.addColorStop(1,'rgba(0,0,0,0)');
@@ -428,19 +464,13 @@ function drawChart(data) {
   walletHistory.forEach((p,i)=>i===0?ctx.moveTo(toX(i),toY(p.v)):ctx.lineTo(toX(i),toY(p.v)));
   ctx.lineTo(toX(walletHistory.length-1),pad.t+cH); ctx.lineTo(toX(0),pad.t+cH);
   ctx.closePath(); ctx.fillStyle=grad; ctx.fill();
-
-  // Line
   ctx.beginPath();
   walletHistory.forEach((p,i)=>i===0?ctx.moveTo(toX(i),toY(p.v)):ctx.lineTo(toX(i),toY(p.v)));
   ctx.strokeStyle=lClr; ctx.lineWidth=2; ctx.lineJoin='round'; ctx.stroke();
-
-  // Dot
   const lx=toX(walletHistory.length-1), ly=toY(latest);
   ctx.beginPath(); ctx.arc(lx,ly,4,0,Math.PI*2);
   ctx.fillStyle=lClr; ctx.fill();
   ctx.strokeStyle='#07090d'; ctx.lineWidth=2; ctx.stroke();
-
-  // Values
   document.getElementById('chart-val').textContent = fmtUsd(latest);
   document.getElementById('chart-val').style.color = lClr;
   if (walletHistory.length >= 2) {
@@ -450,12 +480,9 @@ function drawChart(data) {
     el.style.color=diff>=0?'#4ade80':'#f87171';
   }
 }
-
 window.addEventListener('resize', ()=>drawChart());
 
-// ══════════════════════════════════════════════════════
-// RENDER PENDING
-// ══════════════════════════════════════════════════════
+// ── RENDER PENDING ──
 let pendingDecisions = {};
 function renderPending(pending) {
   const section = document.getElementById('pending-section');
@@ -485,7 +512,6 @@ function renderPending(pending) {
     </div>`;
   }).join('');
 }
-
 function decidePending(posId, action) {
   pendingDecisions[posId] = action;
   const all = _lastData?.pendingTrades || [];
@@ -502,26 +528,23 @@ function decidePending(posId, action) {
   renderPending(_lastData?.pendingTrades||[]);
 }
 
-// ══════════════════════════════════════════════════════
-// RENDER SCAN BOARD
-// ══════════════════════════════════════════════════════
+// ── RENDER SCAN BOARD ──
 function renderBoard(results) {
   const grid  = document.getElementById('board-grid');
   const badge = document.getElementById('board-badge');
   if (!results.length) {
     grid.innerHTML = '<div class="empty">No scan results yet.</div>';
-    badge.textContent = '0 tickers';
-    return;
+    badge.textContent = '0 tickers'; return;
   }
   badge.textContent = results.length + ' tickers';
   grid.innerHTML = results.map(r => {
-    const chgColor  = r.change_pct >= 0 ? '#4ade80' : '#f87171';
+    const chgColor   = r.change_pct >= 0 ? '#4ade80' : '#f87171';
     const scoreColor = r.score >= 70 ? '#4ade80' : r.score >= 55 ? '#fbbf24' : '#4a5568';
-    const dirClass  = r.direction==='LONG'?'dir-long':r.direction==='SHORT'?'dir-short':'dir-csp';
+    const dirClass   = r.direction==='LONG'?'dir-long':r.direction==='SHORT'?'dir-short':'dir-csp';
     const actionClass = r.action==='trade'?'action-trade':r.action==='pending'?'action-pending':r.action==='blocked'?'action-blocked':'action-skip';
     const actionLabel = r.action==='trade'?'● TRADED':r.action==='pending'?'⏸ PENDING':r.action==='blocked'?'✗ BLOCKED':'○ SKIP';
-    const rowClass  = r.action==='trade'?'traded':r.action==='pending'?'pending-row':'';
-    const mainSignal = r.ai_reasoning || (r.signals&&r.signals[0]) || r.skip_reason || '—';
+    const rowClass    = r.action==='trade'?'traded':r.action==='pending'?'pending-row':'';
+    const mainSignal  = r.ai_reasoning || (r.signals&&r.signals[0]) || r.skip_reason || '—';
     return `<div class="board-row ${rowClass}">
       <span class="br-ticker">${r.ticker}</span>
       <span class="br-price">${fmtUsd(r.price)}</span>
@@ -535,68 +558,39 @@ function renderBoard(results) {
   }).join('');
 }
 
-// ══════════════════════════════════════════════════════
-// RENDER OPEN POSITIONS
-// ══════════════════════════════════════════════════════
+// ── RENDER OPEN POSITIONS ──
 function posExplanation(p) {
-  const dir    = p.direction || 'LONG';
-  const ticker = (p.ticker||'').replace('_OPT','');
-  const entry  = Number(p.entry_price || p.price || 0);
-  const live   = Number(p.live_price || 0);
-  const diff   = p.live_diff || 0;
-  const pct    = p.live_diff_pct || 0;
-  const strategy = p.strategy || '';
-
-  // Plain English explanation
-  let explain = '';
-  if (strategy === 'CSP') {
-    const strike = p.strike || '?';
-    const buffer = live ? (live - strike).toFixed(2) : '?';
-    const bufPct = live ? ((live - strike) / live * 100).toFixed(1) : '?';
-    explain = `Wins if ${ticker} stays ABOVE $${strike} by expiry. You keep the premium. Buffer: $${buffer} (${bufPct}%)`;
-  } else if (strategy === 'CALL') {
-    const strike = p.strike || '?';
-    const needed = live ? (strike - live).toFixed(2) : '?';
-    const neededPct = live ? ((strike - live) / live * 100).toFixed(1) : '?';
-    explain = `Wins if ${ticker} breaks ABOVE $${strike} before expiry. Needs to move $${needed} more (${neededPct}%).`;
-  } else if (dir === 'LONG') {
-    if (diff >= 0) {
-      explain = `Wins if ${ticker} keeps rising above $${entry.toFixed(2)}. Currently $${Math.abs(diff).toFixed(2)} in profit.`;
-    } else {
-      explain = `Wins if ${ticker} recovers above $${entry.toFixed(2)}. Currently $${Math.abs(diff).toFixed(2)} in the hole.`;
-    }
-  } else if (dir === 'SHORT') {
-    if (diff <= 0) {
-      explain = `Wins if ${ticker} keeps falling below $${entry.toFixed(2)}. Currently $${Math.abs(diff).toFixed(2)} in profit.`;
-    } else {
-      explain = `Wins if ${ticker} drops back below $${entry.toFixed(2)}. Currently $${Math.abs(diff).toFixed(2)} against you.`;
-    }
+  const dir = p.direction||'LONG', ticker = (p.ticker||'').replace('_OPT','');
+  const entry = Number(p.entry_price||p.price||0), live = Number(p.live_price||0);
+  const diff = p.live_diff||0, pct = p.live_diff_pct||0, strategy = p.strategy||'';
+  let explain = '', progress = '', progressColor = '#4ade80';
+  if (strategy==='CSP') {
+    const strike=p.strike||'?', buffer=live?(live-strike).toFixed(2):'?', bufPct=live?((live-strike)/live*100).toFixed(1):'?';
+    explain=`Wins if ${ticker} stays ABOVE $${strike} by expiry. Buffer: $${buffer} (${bufPct}%)`;
+    const bp=live?((live-(p.strike||live))/live*100):0;
+    if(bp>3){progress=`${bp.toFixed(1)}% buffer — safe`;progressColor='#4ade80';}
+    else if(bp>1){progress=`${bp.toFixed(1)}% buffer — getting close`;progressColor='#fbbf24';}
+    else{progress=`Only ${bp.toFixed(1)}% buffer — danger zone`;progressColor='#f87171';}
+  } else if (strategy==='CALL') {
+    const strike=p.strike||'?', needed=live?(strike-live).toFixed(2):'?', nPct=live?((strike-live)/live*100).toFixed(1):'?';
+    explain=`Wins if ${ticker} breaks ABOVE $${strike} before expiry. Needs $${needed} more (${nPct}%).`;
+    const ap=live?((p.strike-live)/live*100):0;
+    if(ap<0){progress=`In the money!`;progressColor='#4ade80';}
+    else if(ap<2){progress=`${ap.toFixed(1)}% away — almost there`;progressColor='#fbbf24';}
+    else{progress=`${ap.toFixed(1)}% away from profit`;progressColor='#f87171';}
+  } else if (dir==='LONG') {
+    explain=diff>=0?`+$${Math.abs(diff).toFixed(2)} in profit`:` $${Math.abs(diff).toFixed(2)} in the hole`;
+    if(pct>=3){progress=`+${pct.toFixed(1)}% — running well`;progressColor='#4ade80';}
+    else if(pct>=0){progress=`+${pct.toFixed(1)}% — slightly in profit`;progressColor='#4ade80';}
+    else if(pct>=-5){progress=`${pct.toFixed(1)}% — down, watching`;progressColor='#fbbf24';}
+    else{progress=`${pct.toFixed(1)}% — significant loss`;progressColor='#f87171';}
+  } else if (dir==='SHORT') {
+    explain=diff<=0?`$${Math.abs(diff).toFixed(2)} in profit`:`$${Math.abs(diff).toFixed(2)} against you`;
+    if(pct<=-3){progress=`${Math.abs(pct).toFixed(1)}% in your favor`;progressColor='#4ade80';}
+    else if(pct<=0){progress=`slightly in your favor`;progressColor='#4ade80';}
+    else if(pct<=5){progress=`${pct.toFixed(1)}% against you — watching`;progressColor='#fbbf24';}
+    else{progress=`${pct.toFixed(1)}% against you`;progressColor='#f87171';}
   }
-
-  // Progress indicator
-  let progress = '', progressColor = '#4ade80';
-  if (strategy === 'CSP') {
-    const bufPct = live ? ((live - (p.strike||live)) / live * 100) : 0;
-    if (bufPct > 3)      { progress = `${bufPct.toFixed(1)}% buffer — safe`; progressColor = '#4ade80'; }
-    else if (bufPct > 1) { progress = `${bufPct.toFixed(1)}% buffer — getting close`; progressColor = '#fbbf24'; }
-    else                 { progress = `Only ${bufPct.toFixed(1)}% buffer — danger zone`; progressColor = '#f87171'; }
-  } else if (strategy === 'CALL') {
-    const awayPct = live ? ((p.strike - live) / live * 100) : 0;
-    if (awayPct < 0)     { progress = `In the money! $${(live-(p.strike||0)).toFixed(2)} above strike`; progressColor = '#4ade80'; }
-    else if (awayPct < 2){ progress = `${awayPct.toFixed(1)}% away from profit — almost there`; progressColor = '#fbbf24'; }
-    else                 { progress = `${awayPct.toFixed(1)}% away from profit zone`; progressColor = '#f87171'; }
-  } else if (dir === 'LONG') {
-    if (pct >= 3)        { progress = `+${pct.toFixed(1)}% — running well`; progressColor = '#4ade80'; }
-    else if (pct >= 0)   { progress = `+${pct.toFixed(1)}% — slightly in profit`; progressColor = '#4ade80'; }
-    else if (pct >= -5)  { progress = `${pct.toFixed(1)}% — down, watching`; progressColor = '#fbbf24'; }
-    else                 { progress = `${pct.toFixed(1)}% — significant loss`; progressColor = '#f87171'; }
-  } else if (dir === 'SHORT') {
-    if (pct <= -3)       { progress = `${Math.abs(pct).toFixed(1)}% in your favor — running well`; progressColor = '#4ade80'; }
-    else if (pct <= 0)   { progress = `${Math.abs(pct).toFixed(1)}% in your favor`; progressColor = '#4ade80'; }
-    else if (pct <= 5)   { progress = `${pct.toFixed(1)}% against you — watching`; progressColor = '#fbbf24'; }
-    else                 { progress = `${pct.toFixed(1)}% against you — significant loss`; progressColor = '#f87171'; }
-  }
-
   return { explain, progress, progressColor };
 }
 
@@ -604,44 +598,29 @@ function renderOpen(positions) {
   const grid  = document.getElementById('pos-grid');
   const badge = document.getElementById('open-badge');
   badge.textContent = positions.length + ' positions';
-  if (!positions.length) {
-    grid.innerHTML = '<div class="empty">No open positions.</div>'; return;
-  }
+  if (!positions.length) { grid.innerHTML = '<div class="empty">No open positions.</div>'; return; }
   grid.innerHTML = positions.map(p => {
-    const isOpt  = p.type === 'option';
-    const dir    = p.direction || 'LONG';
-    const cost   = Number(p.cost || 0);
-    const entry  = Number(p.entry_price || p.price || 0);
-    const live   = Number(p.live_price || 0);
-    const diff   = Number(p.live_diff || 0);
-    const pct    = Number(p.live_diff_pct || 0);
-    const isUp   = dir === 'LONG' || dir === 'CSP' ? diff >= 0 : diff <= 0;
-    const diffColor  = isUp ? '#4ade80' : '#f87171';
-    const diffSign   = diff >= 0 ? '+' : '';
+    const isOpt=p.type==='option', dir=p.direction||'LONG';
+    const cost=Number(p.cost||0), entry=Number(p.entry_price||p.price||0), live=Number(p.live_price||0);
+    const diff=Number(p.live_diff||0), pct=Number(p.live_diff_pct||0);
+    const isUp = dir==='LONG'||dir==='CSP' ? diff>=0 : diff<=0;
+    const diffColor=isUp?'#4ade80':'#f87171', diffSign=diff>=0?'+':'';
     const { explain, progress, progressColor } = posExplanation(p);
-
     const livePriceRow = live ? `
       <div style="display:flex;gap:16px;align-items:center;margin:8px 0;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px;border:1px solid rgba(255,255,255,0.06)">
-        <div>
-          <div style="font-size:9px;color:var(--muted);letter-spacing:0.08em">BOUGHT AT</div>
-          <div style="font-size:14px;font-weight:700;color:var(--text)">$${entry.toFixed(2)}</div>
-        </div>
+        <div><div style="font-size:9px;color:var(--muted);letter-spacing:0.08em">BOUGHT AT</div><div style="font-size:14px;font-weight:700;color:var(--text)">$${entry.toFixed(2)}</div></div>
         <div style="color:var(--muted);font-size:14px">→</div>
-        <div>
-          <div style="font-size:9px;color:var(--muted);letter-spacing:0.08em">NOW</div>
-          <div style="font-size:14px;font-weight:700;color:${diffColor}">$${live.toFixed(2)}</div>
-        </div>
+        <div><div style="font-size:9px;color:var(--muted);letter-spacing:0.08em">NOW</div><div style="font-size:14px;font-weight:700;color:${diffColor}">$${live.toFixed(2)}</div></div>
         <div style="margin-left:auto;text-align:right">
           <div style="font-size:13px;font-weight:700;color:${diffColor}">${diffSign}$${Math.abs(diff).toFixed(2)}</div>
           <div style="font-size:11px;color:${diffColor}">${diffSign}${pct.toFixed(2)}%</div>
         </div>
       </div>` : '';
-
     return `<div class="pos-card">
       <div class="pos-top">
         <div>
           <div class="pos-ticker">${(p.ticker||'').replace('_OPT','')} <span style="font-size:9px;color:var(--muted2)">${isOpt?'OPT':'STK'}</span></div>
-          <div class="pos-type">${dir}${isOpt ? ' · ' + (p.strategy||'OPT') + ' $' + (p.strike||'?') + ' · ' + (p.dte||'?') + ' DTE' : ''}</div>
+          <div class="pos-type">${dir}${isOpt?' · '+(p.strategy||'OPT')+' $'+(p.strike||'?')+' · '+(p.dte||'?')+' DTE':''}</div>
         </div>
         <div style="text-align:right">
           <div style="font-size:9px;color:var(--muted)">$${cost.toFixed(2)} deployed</div>
@@ -649,33 +628,25 @@ function renderOpen(positions) {
         </div>
       </div>
       ${livePriceRow}
-      ${explain ? `<div style="font-size:10px;color:rgba(200,196,176,0.6);margin:4px 0;line-height:1.5">${explain}</div>` : ''}
-      ${progress ? `<div style="font-size:10px;margin-top:4px;font-weight:600" style="color:${progressColor}">
-        <span style="color:${progressColor}">● ${progress}</span>
-      </div>` : ''}
+      ${explain?`<div style="font-size:10px;color:rgba(200,196,176,0.6);margin:4px 0;line-height:1.5">${explain}</div>`:''}
+      ${progress?`<div style="font-size:10px;margin-top:4px;font-weight:600"><span style="color:${progressColor}">● ${progress}</span></div>`:''}
       <div class="pos-meta" style="margin-top:6px">
         <span>Opened: ${fmtTime(p.opened_at)}</span>
-        <span>${p.ai_reasoning ? '"' + (p.ai_reasoning||'').slice(0,80) + '"' : ''}</span>
+        <span>${p.ai_reasoning?'"'+(p.ai_reasoning||'').slice(0,80)+'"':''}</span>
       </div>
     </div>`;
   }).join('');
 }
 
-// ══════════════════════════════════════════════════════
-// RENDER HISTORY
-// ══════════════════════════════════════════════════════
+// ── RENDER HISTORY ──
 function renderHistory(trades) {
   const list  = document.getElementById('hist-list');
   const badge = document.getElementById('hist-badge');
   const closed = (trades||[]).filter(t=>t.pnl!==undefined);
   badge.textContent = closed.length + ' trades';
-  if (!closed.length) {
-    list.innerHTML = '<div class="empty">No closed trades yet.</div>'; return;
-  }
+  if (!closed.length) { list.innerHTML = '<div class="empty">No closed trades yet.</div>'; return; }
   list.innerHTML = [...closed].reverse().map(t => {
-    const pnl  = t.pnl||0;
-    const dir  = t.direction||'LONG';
-    const cost = t.cost||0;
+    const pnl=t.pnl||0, dir=t.direction||'LONG', cost=t.cost||0;
     return `<div class="hist-row">
       <div class="hist-left">
         <div class="hist-ticker" style="color:${pnl>=0?'#4ade80':'#f87171'}">${t.ticker} <span style="font-size:9px;font-weight:400;color:var(--muted2)">${t.type==='option'?'OPT':'STK'}</span></div>
@@ -686,9 +657,7 @@ function renderHistory(trades) {
   }).join('');
 }
 
-// ══════════════════════════════════════════════════════
-// TICKER TAPE
-// ══════════════════════════════════════════════════════
+// ── TICKER TAPE ──
 function buildTape(results) {
   const tape = document.getElementById('tape-inner');
   if (!results||!results.length) return;
@@ -696,19 +665,15 @@ function buildTape(results) {
     const isUp = r.change_pct >= 0;
     return `<span class="tape-item"><span class="sym">${r.ticker}</span><span class="${isUp?'up':'dn'}">$${Number(r.price).toFixed(2)} ${fmtPct(r.change_pct)}</span></span>`;
   }).join('');
-  tape.innerHTML = items + items; // duplicate for seamless loop
+  tape.innerHTML = items + items;
 }
 
-// ══════════════════════════════════════════════════════
-// MAIN DATA LOAD
-// ══════════════════════════════════════════════════════
+// ── MAIN DATA LOAD ──
 function loadData() {
   fetch('jacob_data.json?t='+Date.now())
     .then(r=>r.json())
     .then(d => {
       _lastData = d;
-
-      // Stats
       const wallet = d.portfolioValue || d.wallet || 0;
       const budget = d.startingBudget||500;
       document.getElementById('s-wallet').textContent    = fmtUsd(wallet);
@@ -730,20 +695,22 @@ function loadData() {
       document.getElementById('s-ai').textContent        = d.aiCallsTotal||0;
       document.getElementById('s-cost').textContent      = `~$${(d.aiCostEstimate||0).toFixed(3)} spent`;
 
-      // Mode badge
+      const feesEl = document.getElementById('s-fees');
+      if (feesEl) feesEl.textContent = '$' + (d.totalFees || 0).toFixed(2);
+
       const mb = document.getElementById('mode-badge');
       mb.textContent = d.mode||'PAPER';
 
-      // Mood
       const mood = d.mood||'watching';
       const moodEl = document.getElementById('jacob-mood');
       moodEl.textContent = mood.toUpperCase();
       moodEl.style.color = mood==='hunting'?'#4ade80':mood==='sleeping'?'#4a5568':mood==='pending'?'#fbbf24':'#94a3b8';
       document.getElementById('jacob-quote').textContent = d.quote||'';
-      document.getElementById('jacob-art').textContent   = (d.art||'  .__.\n( o.o )\n > ^ <').replace(/\\n/g,'\n');
       document.getElementById('jacob-scan').textContent  = `Scan #${d.scanCount||0} · ${(d.scanResults||[]).length} tickers`;
 
-      // Chart
+      const lmood = mood.toLowerCase();
+      if (LIZARD_FRAMES[lmood]) lizardMood = lmood;
+
       if (d.walletHistory && d.walletHistory.length > 0) {
         walletHistory = d.walletHistory;
       } else if (!walletHistory.length || walletHistory[walletHistory.length-1].v !== wallet) {
@@ -751,19 +718,10 @@ function loadData() {
         if (walletHistory.length > 500) walletHistory.shift();
       }
       drawChart(d);
-
-      // Tape
       buildTape(d.scanResults||[]);
-
-      // Pending
       renderPending(d.pendingTrades||[]);
-
-      // Tabs
       renderBoard(d.scanResults||[]);
-      // Load wallet history from server (persistent)
-      if (d.walletHistory && d.walletHistory.length >= 1) {
-        walletHistory = d.walletHistory;
-      }
+      if (d.walletHistory && d.walletHistory.length >= 1) walletHistory = d.walletHistory;
       drawChart();
       renderOpen(d.openPositions||[]);
       renderHistory(d.recentTrades||[]);

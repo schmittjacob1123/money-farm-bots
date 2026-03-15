@@ -298,6 +298,7 @@
 </style>
 </head>
 <body>
+<div class="scanline"></div>
 
 <!-- TICKER -->
 <div class="ticker-wrap">
@@ -541,6 +542,10 @@
 
       <!-- Jacob -->
       <a href="jacob_dashboard.html" class="bot-card g" style="animation-delay:0.1s">
+        <pre class="char-sprite" id="index-jacob-sprite">  .__. ~
+ ( o.o )
+  )   (
+  . . .</pre>
         <div class="bc-header">
           <div class="bc-icon">🦎</div>
           <div class="bc-name g">Jacob</div>
@@ -567,6 +572,10 @@
 
       <!-- Seraphina -->
       <a href="seraphina_dashboard.html" class="bot-card p" style="animation-delay:0.2s">
+        <pre class="char-sprite" id="index-sera-sprite">  /\ /\
+ (=^.^=)
+  )   (
+  -"-"-</pre>
         <div class="bc-header">
           <div class="bc-icon">🐱</div>
           <div class="bc-name p">Seraphina</div>
@@ -912,6 +921,36 @@ function resetBot(name, e) {
     })
     .catch(() => alert('API offline'));
 }
+
+// ── INDEX PAGE SPRITE ANIMATIONS ──
+const INDEX_CAT_FRAMES = {
+  hunting:  ['  /\\ /\\  \n (=>^.^)$ \n  )   (  \n  -"-"-  ', '  /\\ /\\  \n (=^.^=>)$\n  )   (  \n  -"-"-  '],
+  watching: ['  /\\ /\\  \n (=^.^=)  \n  )   (  \n  -"-"-  ', '  /\\ /\\  \n (=^.-=)  \n  )   (  \n  -"-"-  '],
+  sleeping: ['  /\\ /\\  \n (=-.-=)  \n  )   (  \n zz-"-"- ', '  /\\ /\\  \n (=-.~=)  \n  )   (  \nzzz-"-"- ']
+};
+const INDEX_LIZARD_FRAMES = {
+  hunting:  ['   .__. ~  \n  ( *>* )  \n   ) > (   \n  ALPHA!   ', '   .__.    \n  ( >.< )  \n   )   (   \n  TRADE    '],
+  watching: ['  .__. ~   \n ( o.o )   \n  )   (    \n  . . .    ', '  .__. ~   \n ( o.- )   \n  )   (    \n  . . .    '],
+  sleeping: ['  .__. ~   \n ( -.- )   \n  )   (    \n  zzz.     ', '  .__. ~   \n ( -.~ )   \n  )   (    \n  zZz.     ']
+};
+let idxCatFrame=0, idxCatMood='watching', idxLizFrame=0, idxLizMood='watching';
+function tickIndexSprites() {
+  const catFrames = INDEX_CAT_FRAMES[idxCatMood] || INDEX_CAT_FRAMES.watching;
+  idxCatFrame = (idxCatFrame + 1) % catFrames.length;
+  const el1 = document.getElementById('index-sera-sprite');
+  if (el1) el1.textContent = catFrames[idxCatFrame].replace(/\\n/g,'\n');
+
+  const lizFrames = INDEX_LIZARD_FRAMES[idxLizMood] || INDEX_LIZARD_FRAMES.watching;
+  idxLizFrame = (idxLizFrame + 1) % lizFrames.length;
+  const el2 = document.getElementById('index-jacob-sprite');
+  if (el2) el2.textContent = lizFrames[idxLizFrame].replace(/\\n/g,'\n');
+}
+setInterval(tickIndexSprites, 600);
+
+// Update sprite moods when data loads
+const _origLoadJacob = typeof loadJacob === 'function' ? loadJacob : null;
+const _origLoadSera  = typeof loadSera  === 'function' ? loadSera  : null;
+
 </script>
 
 
