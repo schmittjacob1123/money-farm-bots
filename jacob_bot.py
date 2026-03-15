@@ -46,7 +46,7 @@ CONFIG = {
     ],
 
     # Risk
-    "paper_budget":          500.0,
+    "paper_budget":          1000.0,
     "max_position_size_pct": 0.10,   # 10% of wallet per trade
     "max_position_size_usd": 50.0,   # hard cap $50
     "min_position_size_usd": 5.0,

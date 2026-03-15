@@ -31,7 +31,7 @@ WORK_DIR = "/home/ubuntu"
 
 BOTS = {
     "jacob":     {"script": "jacob_bot.py",  "screen": "jacob", "state": ["jacob_state.json", "jacob_trades.csv", "jacob_data.json"]},
-    "seraphina": {"script": "seraphina_bot.py",   "screen": "seraphina",  "state": ["seraphina_state.json", "seraphina_trades.csv", "seraphina_data.json"]},
+    "seraphina": {"script": "seraphina_bot.py",   "screen": "seraphina",  "state": ["seraphina_state.json", "seraphina_trades.csv", "seraphina_data.json", "seraphina_daily.json"]},
     "loachy":    {"script": "loachy_bot.py",      "screen": "loachy",     "state": ["loachy_state.json", "loachy_trades.csv", "loachy_data.json", "loachy_pending.json"]},
 }
 
@@ -49,7 +49,11 @@ CSV_HEADERS = {
     "loachy_trades.csv":    "timestamp,sport,game,bet,odds,size,result,pnl,source\n",
 }
 
-DELETE_ON_RESET = ["live_data.json", "seraphina_data.json", "loachy_data.json"]
+DELETE_ON_RESET = [
+    "seraphina_state.json", "seraphina_data.json", "seraphina_daily.json",
+    "jacob_state.json",     "jacob_data.json",
+    "loachy_data.json",     "live_data.json",
+]
 
 
 def get_screen_pid(screen_name):
@@ -139,7 +143,15 @@ def reset_bot(botname):
 
     if errors:
         return jsonify({"ok": False, "error": "Some files failed: " + ", ".join(errors)})
-    return jsonify({"ok": True, "message": f"{botname} reset to fresh $50 simulation"})
+
+    # Auto-restart bot after reset
+    try:
+        restart_cmd = f"cd {WORK_DIR} && env $(cat {WORK_DIR}/.env | xargs) python3 {WORK_DIR}/{cfg['script']}"
+        subprocess.Popen(["screen", "-dmS", cfg["screen"], "bash", "-c", restart_cmd])
+    except Exception as restart_err:
+        return jsonify({"ok": True, "message": f"{botname} reset to $1,000 (restart failed: {restart_err})"})
+
+    return jsonify({"ok": True, "message": f"{botname} reset to $1,000 and restarted"})
 
 
 @app.route("/sports-config", methods=["GET", "POST"])
