@@ -1007,28 +1007,63 @@ class JacobBot:
             cost      = pos.get("cost",0)
 
             if pos_type == "option":
-                # CSP: if stock above strike at expiry → keep full premium (win)
-                #      if below → lose a portion (assignment sim)
-                # Long call: if stock above strike → profit; else lose premium
-                strategy  = direction  # "CSP" or "CALL"
+                # v4: Realistic options settlement using theta decay + intrinsic value.
+                # Uses strike, expiry, DTE stored on the position at entry.
+                strategy   = direction  # "CSP" or "CALL"
                 live_stock = live_prices.get(ticker) or self.market.get_live_price(ticker)
                 strike     = pos.get("strike", 0)
-                if strategy == "CSP" and live_stock and strike:
-                    if live_stock >= strike:
-                        pnl = round(cost * 0.85, 4)   # kept most of premium
-                    else:
-                        loss_pct = (strike - live_stock) / strike
-                        pnl = round(-cost * min(loss_pct * 2, 1.0), 4)
-                elif strategy == "CALL" and live_stock and strike:
-                    if live_stock > strike:
-                        pnl = round(cost * (live_stock - strike) / strike, 4)
-                    else:
-                        pnl = round(-cost * 0.8, 4)  # option expires worthless
-                else:
-                    # Fallback if no live price — confidence-weighted
+
+                if not live_stock or not strike:
+                    # No price data — confidence-weighted fallback
                     conf = pos.get("ai_confidence", 0.60)
                     won  = random.random() < conf
-                    pnl  = round(cost * 0.8 if won else -cost * 0.5, 4)
+                    pnl  = round(cost * 0.5 if won else -cost * 0.5, 4)
+                else:
+                    # Theta ratio: how much of the option's life has elapsed
+                    try:
+                        opened_dt    = datetime.fromisoformat(pos.get("opened_at","")).astimezone(ET)
+                        elapsed_days = max(1, (datetime.now(ET) - opened_dt).days)
+                        original_dte = max(pos.get("dte", 14), 1)
+                        theta_ratio  = min(elapsed_days / original_dte, 1.0)
+                    except:
+                        theta_ratio = 0.5
+
+                    # IV scaling — higher IV means more extrinsic value in play
+                    iv_scale = min(max(pos.get("iv", 30) / 30.0, 0.5), 2.0)
+
+                    if strategy == "CSP":
+                        # Short put: we SOLD the put, collecting premium.
+                        # Win: stock stays above strike → keep theta-decayed premium.
+                        # Loss: stock falls below strike → assignment = buy at strike.
+                        if live_stock >= strike:
+                            # OTM: keep portion of premium proportional to theta elapsed
+                            # (theta decay is faster near expiry, simplified as linear here)
+                            pnl = round(cost * theta_ratio * 0.88, 4)
+                        else:
+                            # ITM: net loss = (strike - stock) offset by premium collected
+                            itm_pct    = (strike - live_stock) / strike
+                            raw_loss   = itm_pct * iv_scale         # leverage to ITM depth
+                            premium_offset = pos.get("premium_pct", 1.5) / 100  # premium as % of strike
+                            net_loss   = max(0.0, raw_loss - premium_offset)     # premium softens blow
+                            pnl        = round(-cost * min(net_loss * 3.0, 1.2), 4)
+
+                    elif strategy == "CALL":
+                        # Long call: we BOUGHT the call, paying premium.
+                        # Win: stock rises above strike → intrinsic value + remaining time value.
+                        # Loss: stock stays below → theta erodes premium to zero.
+                        if live_stock > strike:
+                            # ITM: intrinsic value × delta (approx) + remaining time value
+                            intrinsic   = (live_stock - strike) / strike
+                            # Delta ≈ 0.5 ATM, higher deeper ITM (capped at 0.85)
+                            moneyness   = (live_stock - strike) / (strike * max(pos.get("iv", 30) / 100, 0.1))
+                            delta       = min(0.5 + moneyness * 0.3, 0.85)
+                            time_value  = max(0, (1 - theta_ratio) * 0.4)  # erodes linearly
+                            pnl         = round(cost * (intrinsic * delta + time_value), 4)
+                        else:
+                            # OTM: theta eats the premium — total loss at expiry
+                            pnl = round(-cost * theta_ratio * 0.90, 4)
+                    else:
+                        pnl = 0.0
             else:
                 # Stock: use real current price
                 live = live_prices.get(ticker) or self.market.get_live_price(ticker)
@@ -1178,11 +1213,16 @@ class JacobBot:
                 scan_results.append(result)
                 continue
 
-            # v3: Regime gate
+            # v3/v4: Regime gate
             sig_dir = signal["direction"]
             if regime == "bear" and sig_dir == "LONG":
                 result["action"]      = "skip"
                 result["skip_reason"] = f"BEAR market — longs blocked (SPY 5d={spy5:+.1f}%)"
+                scan_results.append(result)
+                continue
+            if regime == "bull" and sig_dir == "SHORT":
+                result["action"]      = "skip"
+                result["skip_reason"] = f"BULL market — shorts blocked (SPY 5d={spy5:+.1f}%)"
                 scan_results.append(result)
                 continue
 
@@ -1195,6 +1235,18 @@ class JacobBot:
 
             confirmed, confidence, reasoning = self.rules.analyse_stock(quote, signal)
             self.rules_evals += 1
+
+            # v4: Regime confidence adjustment — regime tail/headwinds
+            if regime == "bear" and sig_dir == "SHORT":
+                confidence = min(1.0, confidence + 0.07)
+                reasoning += " | Bear regime: short tailwind"
+            elif regime == "bull" and sig_dir == "LONG":
+                confidence = min(1.0, confidence + 0.05)
+                reasoning += " | Bull regime: long tailwind"
+            elif regime == "neutral" and sig_dir == "SHORT":
+                # Shorting into neutral tape: slight penalty — needs strong signal
+                confidence = max(0.0, confidence - 0.04)
+
             result["ai_confidence"] = round(confidence, 2)
             result["ai_reasoning"]  = reasoning
 
@@ -1345,7 +1397,7 @@ class JacobBot:
         return max(0, int((candidate - now).total_seconds()))
 
     def run_loop(self):
-        log.info("Jacob v3 starting | %s | $%.0f budget | %d tickers | rules engine",
+        log.info("Jacob v4 starting | %s | $%.0f budget | %d tickers | rules engine",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], len(CONFIG["watchlist"]))
         log.info("Scan interval: %ds | Stop loss: %.0f%% | Daily loss cap: $%.0f",
