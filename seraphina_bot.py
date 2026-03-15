@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SERAPHINA'S CRYPTO ENGINE v7.0 — GRID TRADER        ║
+║         SERAPHINA'S CRYPTO ENGINE v8.1 — GRID TRADER        ║
 ║  Strategy: Automated grid trading on BTC, ETH, SOL, DOGE    ║
 ║  Places buy/sell orders at fixed price intervals.            ║
 ║  Profits from volatility — no direction prediction needed.   ║
@@ -95,6 +95,9 @@ CONFIG = {
     "daily_loss_cap":       20.0,
     "grid_drift_pct":       0.04,  # v8: less thrashing in mild trends
     "downward_drift_limit": 2,     # v8: halve size after N downward drifts per session
+    "max_corr_open":         5,     # v8.1: max open positions across BTC+ETH+SOL group
+    "stale_hold_hours":      72,    # v8.1: force-close stale losing positions after 72h
+    "stale_loss_threshold":  -0.03, # v8.1: only close stale if down >3%
     "drawdown_pause_pct":   0.15,
     "drawdown_resume_pct":  0.08,
     "coin_stoploss_pct":    0.12,  # v8: tighter per-coin stop
@@ -459,7 +462,9 @@ class SeraphinaBot:
         self.scan_count      = 0
         # v7 momentum state
         self.momentum_hist   = {}   # coin → deque of recent prices
-        self.reversal_count  = {}   # coin → consecutive up-ticks
+        self.reversal_count    = {}   # coin → consecutive up-ticks
+        self.drift_down_count  = {c: 0 for c in CONFIG["coins"]}  # v8.1: crash fix
+        self._last_drift_reset = datetime.now(ET).date().isoformat()  # v8.1: own tracking
         self.momentum_paused = {}   # coin → bool
         self._daily_history  = []
         self._load_state()
@@ -582,14 +587,14 @@ class SeraphinaBot:
             return "cold",   0.75, 0.9  # v8: tighter spacing in cold — must still trade
         return "normal", 1.0, 1.0
 
-    def _new_grid(self, coin, price, spacing_mult=1.0):
+    def _new_grid(self, coin, price, spacing_mult=1.0, drift_mult=1.0):  # v8.1
         g = Grid(coin, price, spacing_mult)
         n = CONFIG["prefill_levels"]
         to_fill = g.prefill(price, n)
         for idx, lvl in to_fill:
             if self.wallet.cash < CONFIG["trade_size_min"]:
                 break
-            size = self.wallet.trade_size(self.wallet.cash)
+            size = round(self.wallet.trade_size(self.wallet.cash) * drift_mult, 2)  # v8.1
             actual = self.wallet.prefill_buy(coin, lvl, size)
             g.record_buy(idx, lvl, actual)
             log.info("  [GRID/%s] PREFILL buy | level=$%.4f | size=$%.2f | cash=$%.2f",
@@ -703,10 +708,12 @@ class SeraphinaBot:
         self.wallet.reset_daily_if_needed()
 
         log.info("=" * 60)
-        # v8: reset downward drift counts at start of each new day
-        if self.wallet.last_date != datetime.now(ET).date().isoformat():
-            self.drift_down_count = {c: 0 for c in CONFIG["coins"]}
-            log.info("  [v8] New day — drift down counters reset")
+        # v8.1: reset downward drift counts at start of each new day (own var)
+        _today = datetime.now(ET).date().isoformat()
+        if _today != self._last_drift_reset:
+            self.drift_down_count  = {c: 0 for c in CONFIG["coins"]}
+            self._last_drift_reset = _today
+            log.info("  [v8.1] New day — drift counters reset")
         log.info("  SERAPHINA v8 #%d | %s | cash=$%.2f | total_pnl=$%+.2f | daily=$%+.2f | streak=%dW",
                  self.scan_count,
                  datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
@@ -753,14 +760,11 @@ class SeraphinaBot:
                     log.info("  [DRIFT/%s] Drifted UP — resetting down counter", coin)
                 log.info("  [GRID/%s] Drifted >4%% — closed %d positions, rebuilding at $%.4f",
                          coin, n_closed, price)
-                self._new_grid(coin, price, spacing_mult)
+                _dm = 0.5 if self.drift_down_count.get(coin, 0) >= CONFIG["downward_drift_limit"] else 1.0
+                self._new_grid(coin, price, spacing_mult, drift_mult=_dm)  # v8.1: pass drift_mult
 
-        # ── Step 3: Portfolio drawdown circuit breaker ──
-        open_position_value = sum(
-            sum(b["size_usd"] for b in g.open_buys.values())
-            for g in self.grids.values()
-        )
-        portfolio_value_now = round(self.wallet.cash + open_position_value, 2)
+        # ── Step 3: Portfolio drawdown circuit breaker (v8.1: mark-to-market) ──
+        portfolio_value_now = self._portfolio_value(prices)  # v8.1: real value not cost basis
         drawdown = self.wallet.update_peak(portfolio_value_now)
 
         # ── Step 3b: Per-coin stop loss ──
@@ -806,6 +810,26 @@ class SeraphinaBot:
                 log.info("  [TRAIL/%s] SELL | $%.4f | bought=$%.4f | profit=$%+.4f | cash=$%.2f",
                          coin, price, buy["buy_price"], profit, self.wallet.cash)
 
+        # ── Step 3d: Stale position cleanup (v8.1) ──
+        _now_dt = datetime.now(ET)
+        for _sc, _sp in list(prices.items()):
+            if _sc not in self.grids:
+                continue
+            _sg = self.grids[_sc]
+            for _si, _sb in list(_sg.open_buys.items()):
+                try:
+                    _age = (_now_dt - datetime.fromisoformat(_sb["bought_at"]).astimezone(ET)).total_seconds() / 3600
+                except:
+                    continue
+                _gain = (_sp - _sb["buy_price"]) / _sb["buy_price"] if _sb["buy_price"] else 0
+                if _age >= CONFIG["stale_hold_hours"] and _gain <= CONFIG["stale_loss_threshold"]:
+                    _pnl = round(_sb["size_usd"] * _gain, 4)
+                    self.wallet.sell(_sc, _sp, _sb["size_usd"], _pnl)
+                    _sg.record_sell(_si)
+                    trades_this_scan += 1
+                    log.warning("  [STALE/%s] Closed %dh-old position | entry=$%.4f | gain=%.1f%% | P&L=$%+.4f",
+                               _sc, int(_age), _sb["buy_price"], _gain * 100, _pnl)
+
         # ── Step 4: Check grid crossings ──
         for coin, price in prices.items():
             if coin not in self.grids:
@@ -842,6 +866,16 @@ class SeraphinaBot:
                         continue
                     if idx in g.open_buys:
                         continue
+
+                    # v8.1: correlation guard — BTC/ETH/SOL crash together
+                    _CORR = {"BTC", "ETH", "SOL"}
+                    if coin in _CORR:
+                        corr_open = sum(len(self.grids[c].open_buys)
+                                        for c in _CORR if c in self.grids)
+                        if corr_open >= CONFIG["max_corr_open"]:
+                            log.info("  [GRID/%s] Corr group full (%d/%d) — skip",
+                                     coin, corr_open, CONFIG["max_corr_open"])
+                            continue
 
                     # v7: momentum filter
                     mom_ok, mom_mult = self._momentum_ok_to_buy(coin, price)
