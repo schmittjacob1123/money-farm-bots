@@ -7,7 +7,7 @@ RUN:    screen -S farmapi -> python3 farm_api.py -> Ctrl+A D
 """
 
 import subprocess, os, json, time, secrets, hashlib
-from flask import Flask, jsonify, request, make_response
+from flask import Flask, jsonify, request, make_response, Response
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -300,6 +300,133 @@ def read_file():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+
+# ══════════════════════════════════════════════════════════════
+# SMS WEBHOOK — two-way reply handler (Twilio -> POST here)
+# Configure Twilio webhook URL to:
+#   https://jacobsmoneyfarm.duckdns.org/api/sms/webhook
+# ══════════════════════════════════════════════════════════════
+
+import logging
+_sms_log = logging.getLogger("sms_webhook")
+
+def _sms_send(message):
+    """Send an SMS reply via Twilio."""
+    sid   = os.environ.get("TWILIO_SID", "")
+    token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    frm   = os.environ.get("TWILIO_FROM", "")
+    to    = os.environ.get("ALERT_TO", "")
+    if not all([sid, token, frm, to]):
+        _sms_log.warning(f"[SMS] Creds missing — would have sent: {message[:60]}")
+        return
+    try:
+        from twilio.rest import Client
+        Client(sid, token).messages.create(body=message, from_=frm, to=to)
+        _sms_log.info(f"[SMS] Reply sent: {message[:60]}")
+    except Exception as e:
+        _sms_log.error(f"[SMS] Reply failed: {e}")
+
+
+def _approve_reject_pending(action):
+    """Approve or reject the last alerted Loachy pending bet."""
+    fpath_alerted = os.path.join(WORK_DIR, "last_alerted_bet.json")
+    fpath_pending = os.path.join(WORK_DIR, "loachy_pending.json")
+    try:
+        with open(fpath_alerted) as f:
+            game_id = json.load(f).get("game_id", "")
+        if not game_id:
+            return "No pending bet on record."
+
+        with open(fpath_pending) as f:
+            data = json.load(f)
+
+        bet = next((p for p in data.get("pending", []) if p["game_id"] == game_id), None)
+        if not bet:
+            return "Bet already actioned or expired."
+
+        data["pending"] = [p for p in data["pending"] if p["game_id"] != game_id]
+        key = "approved" if action == "approve" else "rejected"
+        bet["status"] = action.upper()
+        data.setdefault(key, []).append(bet)
+
+        with open(fpath_pending, "w") as f:
+            json.dump(data, f, indent=2)
+
+        matchup = f"{bet.get('away','?')} @ {bet.get('home','?')}"
+        odds    = bet.get("best_price", "?")
+        return f"Bet {action.upper()}: {matchup} {odds}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def _handle_pause(bot_name):
+    if bot_name not in BOTS:
+        return f"Unknown bot: {bot_name}. Try SERAPHINA or JACOB."
+    cfg = BOTS[bot_name]
+    try:
+        subprocess.run(["screen", "-X", "-S", cfg["screen"], "quit"], capture_output=True)
+        return f"{bot_name.upper()} paused. Reply RESUME {bot_name.upper()} to restart."
+    except Exception as e:
+        return f"Failed to pause {bot_name}: {e}"
+
+
+def _handle_resume(bot_name):
+    if bot_name not in BOTS:
+        return f"Unknown bot: {bot_name}. Try SERAPHINA or JACOB."
+    cfg = BOTS[bot_name]
+    try:
+        cmd = f"cd {WORK_DIR} && env $(cat {WORK_DIR}/.env | xargs) python3 {WORK_DIR}/{cfg['script']}"
+        subprocess.Popen(["screen", "-dmS", cfg["screen"], "bash", "-c", cmd])
+        return f"{bot_name.upper()} restarted. Check dashboard to confirm."
+    except Exception as e:
+        return f"Failed to resume {bot_name}: {e}"
+
+
+def _handle_status():
+    lines = ["Farm Status:"]
+    for name, cfg in BOTS.items():
+        status = "RUNNING" if is_running(cfg["screen"]) else "DOWN"
+        lines.append(f"  {name}: {status}")
+    try:
+        import json as _j
+        sera = _j.load(open(os.path.join(WORK_DIR, "seraphina_data.json")))
+        jac  = _j.load(open(os.path.join(WORK_DIR, "jacob_data.json")))
+        lines.append(f"Sera: ${sera.get('portfolioValue',0):.2f} | {sera.get('dailyPnl',0):+.2f} today")
+        lines.append(f"Jacob: ${jac.get('portfolioValue',0):.2f} | {jac.get('dailyPnl',0):+.2f} today")
+    except:
+        pass
+    return "\n".join(lines)
+
+
+@app.route("/sms/webhook", methods=["POST"])
+def sms_webhook():
+    """Twilio webhook — handles two-way SMS replies from Jacob."""
+    body = (request.form.get("Body") or "").strip().upper()
+    _sms_log.info(f"[SMS] Incoming reply: {body!r}")
+
+    reply = None
+
+    if body == "APPROVE":
+        reply = _approve_reject_pending("approve")
+    elif body == "REJECT":
+        reply = _approve_reject_pending("reject")
+    elif body.startswith("PAUSE "):
+        bot = body[6:].strip().lower()
+        reply = _handle_pause(bot)
+    elif body.startswith("RESUME "):
+        bot = body[7:].strip().lower()
+        reply = _handle_resume(bot)
+    elif body == "STATUS":
+        reply = _handle_status()
+    else:
+        reply = "Commands: APPROVE, REJECT, PAUSE [BOT], RESUME [BOT], STATUS"
+
+    if reply:
+        _sms_send(reply)
+
+    # Return empty TwiML so Twilio doesn't send a default reply
+    return Response('<?xml version="1.0"?><Response></Response>', mimetype="application/xml")
 
 if __name__ == "__main__":
     print("Jacob's Money Farm API starting on port 5000...")
