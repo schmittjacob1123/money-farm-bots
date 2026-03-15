@@ -677,6 +677,7 @@ class SeraphinaBot:
                     "dailyPnl":        round(self.wallet.daily_pnl, 4),
                     "winRate":         self.wallet.win_rate(),
                     "winStreak":       self.wallet.win_streak,
+                    "tradesTotal":     len([t for t in self.wallet.trade_log if t["action"] == "SELL"]),
                     "sizePct":         round(self.wallet.size_pct() * 100, 1),
                     "startingBudget":  CONFIG["paper_budget"],
                     "scanCount":       self.scan_count,
