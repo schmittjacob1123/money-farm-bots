@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         JACOB'S STOCK & OPTIONS ENGINE  v4.1                ║
+║         JACOB'S STOCK & OPTIONS ENGINE  v4.2                ║
 ║  Strategy: Momentum + mean reversion scanner                 ║
 ║  Options:  CSP / Long Calls via rules engine                 ║
 ║  Human-in-the-loop for borderline trades                     ║
@@ -92,6 +92,10 @@ CONFIG = {
 
     # v4.1: Sector concentration
     "max_per_sector":  2,       # max open positions per sector (tech/finance/etc)
+
+    # v4.2: Spread simulation (Alpaca $0 commission, but spreads are real)
+    "stock_spread_pct":  0.0005,  # 0.05% per side = 0.10% round trip
+    "option_spread_pct": 0.02,    # 2% per side = 4% round trip (wide option spreads)
     "premarket_wake_min": 30,        # wake 30 min before open
 
     # Pending
@@ -644,6 +648,7 @@ class Wallet:
         self.open_positions = {}   # pos_id → trade dict
         self.trade_history  = []
         self.wallet_history = []
+        self.total_fees     = 0.0  # v4.2: cumulative spread costs
 
     def reset_daily_if_needed(self):
         today = datetime.now(ET).date().isoformat()
@@ -666,7 +671,12 @@ class Wallet:
 
     def open(self, trade):
         cost = trade["cost"]
-        self.cash -= cost
+        # v4.2: deduct entry-side spread (Alpaca $0 commission, spread is real)
+        spread_pct = CONFIG["option_spread_pct"] if trade.get("type") == "option" else CONFIG["stock_spread_pct"]
+        fee = round(cost * spread_pct, 4)
+        self.cash -= cost + fee
+        self.total_fees = round(self.total_fees + fee, 4)
+        trade["entry_fee"] = fee
         self.trades_today += 1
         self.open_positions[trade["pos_id"]] = trade
 
@@ -674,10 +684,15 @@ class Wallet:
         pos = self.open_positions.pop(pos_id, None)
         if not pos:
             return None
+        # v4.2: deduct exit-side spread
+        spread_pct = CONFIG["option_spread_pct"] if pos.get("type") == "option" else CONFIG["stock_spread_pct"]
+        fee = round(pos["cost"] * spread_pct, 4)
+        pnl = round(pnl - fee, 4)
+        self.total_fees = round(self.total_fees + fee, 4)
         self.cash       += pos["cost"] + pnl
         self.total_pnl  += pnl
         self.daily_pnl  += pnl
-        entry = {**pos, "pnl": round(pnl,4), "settled_at": datetime.now(ET).isoformat()}
+        entry = {**pos, "pnl": round(pnl,4), "exit_fee": fee, "settled_at": datetime.now(ET).isoformat()}
         self.trade_history.append(entry)
         return entry
 
@@ -731,6 +746,7 @@ class Wallet:
             "open_positions": self.open_positions,
             "trade_history":  self.trade_history[-500:],
             "wallet_history": self.wallet_history[-500:],
+            "total_fees":     round(self.total_fees, 4),  # v4.2
         }
 
     def load_dict(self, d):
@@ -742,6 +758,7 @@ class Wallet:
         self.open_positions = d.get("open_positions", {})
         self.trade_history  = d.get("trade_history", [])
         self.wallet_history = d.get("wallet_history", [])
+        self.total_fees     = d.get("total_fees", 0.0)  # v4.2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1138,6 +1155,7 @@ class JacobBot:
                     "winRate":        self.wallet.win_rate(),
                     "roi":            self.wallet.roi(),
                     "tradesTotal":    len(self.wallet.trade_history),
+                    "totalFees":      round(self.wallet.total_fees, 4),  # v4.2
                     "openCount":      len(self.wallet.open_positions),
                     "scanCount":      self.scan_count,
                     "rulesEvals":     self.rules_evals,
@@ -1425,7 +1443,7 @@ class JacobBot:
         return max(0, int((candidate - now).total_seconds()))
 
     def run_loop(self):
-        log.info("Jacob v4 starting | %s | $%.0f budget | %d tickers | rules engine",
+        log.info("Jacob v4.2 starting | %s | $%.0f budget | %d tickers | rules engine",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], len(CONFIG["watchlist"]))
         log.info("Scan interval: %ds | Stop loss: %.0f%% | Daily loss cap: $%.0f",
