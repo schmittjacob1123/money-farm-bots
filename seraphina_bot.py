@@ -70,7 +70,11 @@ CONFIG = {
     "coins":            ["BTC", "ETH", "SOL", "DOGE"],
 
     "grid_levels":      8,
-    "grid_spacing_pct": 0.006,   # v8: tighter = more crossings
+    "grid_spacing_pct": 0.010,   # v8.2: 1% — profitable after 0.62% Kraken fees
+
+    # v8.2: Kraken fee simulation — mirrors real trading costs
+    "trading_fee_pct": 0.0026,  # Kraken taker fee 0.26% per trade
+    "spread_pct":      0.0005,  # bid/ask spread ~0.05% per side
 
     "trade_size_pct":   0.08,
     "trade_size_min":   1.0,
@@ -317,6 +321,7 @@ class Wallet:
         self.wallet_history        = []
         self.peak_portfolio        = CONFIG["paper_budget"]
         self.circuit_breaker_active = False
+        self.total_fees            = 0.0   # v8.2: track cumulative fees paid
 
     def reset_daily_if_needed(self):
         today = datetime.now(ET).date().isoformat()
@@ -328,15 +333,22 @@ class Wallet:
     def buy(self, coin, price, size_usd):
         size_usd = min(size_usd, self.cash)
         size_usd = round(size_usd, 2)
-        self.cash = round(self.cash - size_usd, 4)
+        # v8.2: apply Kraken taker fee + bid/ask spread
+        fee = round(size_usd * (CONFIG["trading_fee_pct"] + CONFIG["spread_pct"]), 4)
+        self.cash = round(self.cash - size_usd - fee, 4)
+        self.total_fees = round(self.total_fees + fee, 4)
         self.trade_log.append({
             "ts": datetime.now(ET).isoformat(), "coin": coin,
             "action": "BUY", "price": price, "size": size_usd,
-            "pnl": 0, "cash": round(self.cash, 2),
+            "fee": fee, "pnl": 0, "cash": round(self.cash, 2),
         })
         return size_usd
 
     def sell(self, coin, price, size_usd, profit_usd):
+        # v8.2: apply Kraken taker fee + spread on sell side
+        fee = round(size_usd * (CONFIG["trading_fee_pct"] + CONFIG["spread_pct"]), 4)
+        profit_usd      = round(profit_usd - fee, 4)
+        self.total_fees = round(self.total_fees + fee, 4)
         returned = round(size_usd + profit_usd, 4)
         self.cash       = round(self.cash + returned, 4)
         self.total_pnl  = round(self.total_pnl + profit_usd, 4)
@@ -355,11 +367,13 @@ class Wallet:
     def prefill_buy(self, coin, price, size_usd):
         size_usd = min(size_usd, self.cash)
         size_usd = round(size_usd, 2)
-        self.cash = round(self.cash - size_usd, 4)
+        fee = round(size_usd * (CONFIG["trading_fee_pct"] + CONFIG["spread_pct"]), 4)  # v8.2
+        self.cash = round(self.cash - size_usd - fee, 4)
+        self.total_fees = round(self.total_fees + fee, 4)
         self.trade_log.append({
             "ts": datetime.now(ET).isoformat(), "coin": coin,
             "action": "BUY", "price": price, "size": size_usd,
-            "pnl": 0, "cash": round(self.cash, 2), "prefill": True,
+            "fee": fee, "pnl": 0, "cash": round(self.cash, 2), "prefill": True,
         })
         return size_usd
 
@@ -410,6 +424,7 @@ class Wallet:
             "wallet_history":         self.wallet_history[-500:],
             "peak_portfolio":         round(self.peak_portfolio, 4),
             "circuit_breaker_active": self.circuit_breaker_active,
+            "total_fees":             round(self.total_fees, 4),  # v8.2
         }
 
     def load_dict(self, d):
@@ -422,6 +437,7 @@ class Wallet:
         self.wallet_history         = d.get("wallet_history", [])
         self.peak_portfolio         = d.get("peak_portfolio", CONFIG["paper_budget"])
         self.circuit_breaker_active = d.get("circuit_breaker_active", False)
+        self.total_fees             = d.get("total_fees", 0.0)  # v8.2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -582,9 +598,9 @@ class SeraphinaBot:
 
         swing = (max(hist) - min(hist)) / min(hist) * 100
         if swing >= CONFIG["vol_hot_threshold"]:
-            return "hot",    0.7, 1.2
+            return "hot",    0.85, 1.2  # v8.2: was 0.7, too thin after fees
         elif swing <= CONFIG["vol_cold_threshold"]:
-            return "cold",   0.75, 0.9  # v8: tighter spacing in cold — must still trade
+            return "cold",   0.90, 0.9  # v8.2: was 0.75, raised to stay above fee breakeven
         return "normal", 1.0, 1.0
 
     def _new_grid(self, coin, price, spacing_mult=1.0, drift_mult=1.0):  # v8.1
@@ -684,6 +700,8 @@ class SeraphinaBot:
                     "winRate":         self.wallet.win_rate(),
                     "winStreak":       self.wallet.win_streak,
                     "tradesTotal":     len([t for t in self.wallet.trade_log if t["action"] == "SELL"]),
+                    "totalFees":       round(self.wallet.total_fees, 4),  # v8.2
+                    "feePerTrade":     round(self.wallet.total_fees / max(1, len([t for t in self.wallet.trade_log if t["action"] == "SELL"])), 4),
                     "sizePct":         round(self.wallet.size_pct() * 100, 1),
                     "startingBudget":  CONFIG["paper_budget"],
                     "scanCount":       self.scan_count,
