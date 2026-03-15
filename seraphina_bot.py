@@ -70,7 +70,7 @@ CONFIG = {
     "coins":            ["BTC", "ETH", "SOL", "DOGE"],
 
     "grid_levels":      8,
-    "grid_spacing_pct": 0.010,
+    "grid_spacing_pct": 0.006,   # v8: tighter = more crossings
 
     "trade_size_pct":   0.08,
     "trade_size_min":   1.0,
@@ -89,21 +89,22 @@ CONFIG = {
 
     "prefill_levels":   1,
 
-    "max_open_per_coin": 2,
-    "max_open_total":   8,
+    "max_open_per_coin": 3,   # v8: more exposure per coin
+    "max_open_total":   12,   # v8: more total exposure
 
     "daily_loss_cap":       20.0,
-    "grid_drift_pct":       0.03,
+    "grid_drift_pct":       0.04,  # v8: less thrashing in mild trends
+    "downward_drift_limit": 2,     # v8: halve size after N downward drifts per session
     "drawdown_pause_pct":   0.15,
     "drawdown_resume_pct":  0.08,
-    "coin_stoploss_pct":    0.20,
+    "coin_stoploss_pct":    0.12,  # v8: tighter per-coin stop
 
     # ── Trailing momentum exit (v6) ──
-    "trail_activate_pct": 0.005,
-    "trail_stop_pct":     0.004,
+    "trail_activate_pct": 0.010,  # v8: arm at +1% (not 0.5%)
+    "trail_stop_pct":     0.006,  # v8: fire at -0.6% (not 0.4%)
 
     # ── Cash floor (v7) ──
-    "cash_floor_pct":     0.25,   # never deploy if cash < 25% of portfolio value
+    "cash_floor_pct":     0.15,   # v8: deploy more capital   # never deploy if cash < 25% of portfolio value
 
     # ── Momentum filter (v7) ──
     "momentum_lookback":  5,      # scans to look back
@@ -578,7 +579,7 @@ class SeraphinaBot:
         if swing >= CONFIG["vol_hot_threshold"]:
             return "hot",    0.7, 1.2
         elif swing <= CONFIG["vol_cold_threshold"]:
-            return "cold",   1.8, 0.8
+            return "cold",   0.75, 0.9  # v8: tighter spacing in cold — must still trade
         return "normal", 1.0, 1.0
 
     def _new_grid(self, coin, price, spacing_mult=1.0):
@@ -702,7 +703,11 @@ class SeraphinaBot:
         self.wallet.reset_daily_if_needed()
 
         log.info("=" * 60)
-        log.info("  SERAPHINA v7 #%d | %s | cash=$%.2f | total_pnl=$%+.2f | daily=$%+.2f | streak=%dW",
+        # v8: reset downward drift counts at start of each new day
+        if self.wallet.last_date != datetime.now(ET).date().isoformat():
+            self.drift_down_count = {c: 0 for c in CONFIG["coins"]}
+            log.info("  [v8] New day — drift down counters reset")
+        log.info("  SERAPHINA v8 #%d | %s | cash=$%.2f | total_pnl=$%+.2f | daily=$%+.2f | streak=%dW",
                  self.scan_count,
                  datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
                  self.wallet.cash, self.wallet.total_pnl,
@@ -738,7 +743,15 @@ class SeraphinaBot:
                     log.info("  [GRID/%s] DRIFT CLOSE | bought=$%.4f | profit=%s$%.4f | cash=$%.2f",
                              coin, buy["buy_price"], sign, profit, self.wallet.cash)
                     n_closed += 1
-                log.info("  [GRID/%s] Drifted >3%% — closed %d positions, rebuilding at $%.4f",
+                # v8: track downward drifts for trend awareness
+                old_center = old_g.center
+                if price < old_center:
+                    self.drift_down_count[coin] = self.drift_down_count.get(coin, 0) + 1
+                    log.info("  [DRIFT/%s] Drifted DOWN (count=%d)", coin, self.drift_down_count[coin])
+                else:
+                    self.drift_down_count[coin] = 0  # reset on upward drift
+                    log.info("  [DRIFT/%s] Drifted UP — resetting down counter", coin)
+                log.info("  [GRID/%s] Drifted >4%% — closed %d positions, rebuilding at $%.4f",
                          coin, n_closed, price)
                 self._new_grid(coin, price, spacing_mult)
 
@@ -839,7 +852,12 @@ class SeraphinaBot:
                     if not self._cash_floor_ok(portfolio_value_now):
                         continue
 
-                    effective_pct = min(0.14, self.wallet.size_pct() * size_mult * mom_mult)
+                    # v8: reduce size if coin has been drifting downward (trending)
+                    down_drifts = self.drift_down_count.get(coin, 0)
+                    drift_mult  = 0.5 if down_drifts >= CONFIG["downward_drift_limit"] else 1.0
+                    if drift_mult < 1.0:
+                        log.info("  [DRIFT/%s] %d downward drifts — halving size", coin, down_drifts)
+                    effective_pct = min(0.14, self.wallet.size_pct() * size_mult * mom_mult * drift_mult)
                     raw = self.wallet.cash * effective_pct
                     size = round(max(CONFIG["trade_size_min"],
                                      min(CONFIG["trade_size_max"], raw)), 2)
@@ -885,7 +903,7 @@ class SeraphinaBot:
         self._write_dashboard(prices, mood, trades_this_scan, vol_regimes, portfolio_value_now)
 
     def run_loop(self):
-        log.info("Seraphina v7 starting | mode=%s | budget=$%.0f | coins=%s",
+        log.info("Seraphina v8 starting | mode=%s | budget=$%.0f | coins=%s",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], ", ".join(CONFIG["coins"]))
         log.info("Grid: %d levels | %.1f%% spacing | %.0f%% base size | 15s scans | NO API CALLS",
