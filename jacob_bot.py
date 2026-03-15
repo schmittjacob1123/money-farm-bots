@@ -1,22 +1,23 @@
+#!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         JACOB'S STOCK & OPTIONS ENGINE  v4.2                ║
-║  Strategy: Momentum + mean reversion scanner                 ║
-║  Options:  CSP / Long Calls via rules engine                 ║
-║  Human-in-the-loop for borderline trades                     ║
+║         JACOB'S STOCK ENGINE  v5.0                          ║
+║  Strategy: MA50 trend filter + daily RSI entry/exit         ║
+║  Long-only. Cash in bear markets. Signal-based exits.       ║
 ║  The lizard sees alpha where the market doesn't.            ║
 ╚══════════════════════════════════════════════════════════════╝
 
-FIXES vs v1:
-  - Settlement uses REAL current price, not random simulation
-  - Scan interval uses CONFIG value (not hardcoded 300)
-  - Options excluded from stock stop-loss check
-  - ROI uses starting budget as denominator
-  - Pre-market gate: scans but never places trades before 9:30am
-  - Score threshold lowered to 62 (catches more setups in quiet markets)
-  - daily_loss_cap fixed to starting value, not moving target
-  - Dead code removed (open_ticker_dirs)
-  - Position size cap corrected to match budget
+v5 vs v4.2:
+  - Daily candles (3mo) for MA50 + RSI instead of hourly (less noise)
+  - Per-ticker MA50 gate: no longs when price < MA50
+  - Long-only: bear regime → skip all new entries (go to cash)
+  - Signal-based exits: RSI > 65 or +2.5% TP (no arbitrary 2-day hold)
+  - Max hold extended to 5 days (safety net only)
+  - Score threshold raised 62 → 68 (fewer, better trades)
+  - Stop loss tightened 8% → 6%
+  - Options disabled: 4% round-trip spread kills edge at $1000 budget
+  - No mock fallback: skip ticker on API failure (no fake trades)
+  - Trailing stop refined: arm +2.5%, fire -1.5% from peak
 
 NO AI API CALLS. Zero Anthropic credits. Pure rules engine.
 """
@@ -25,14 +26,14 @@ import os, csv, json, logging, time, sys, random
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
-ET = ZoneInfo("America/New_York")
 from dotenv import load_dotenv
-load_dotenv()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
+load_dotenv()
+ET = ZoneInfo("America/New_York")
+
+# ══════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════
 CONFIG = {
     "dry_run":           os.getenv("DRY_RUN", "true").lower() != "false",
     "alpaca_api_key":    os.getenv("ALPACA_API_KEY", ""),
@@ -47,213 +48,210 @@ CONFIG = {
 
     # Risk
     "paper_budget":          1000.0,
-    "max_position_size_pct": 0.10,   # 10% of wallet per trade
-    "max_position_size_usd": 80.0,   # v4.1: raised to 8% of $1000 budget
+    "max_position_size_pct": 0.10,   # 10% of cash per trade
+    "max_position_size_usd": 80.0,
     "min_position_size_usd": 5.0,
     "max_open_positions":    8,
-    "daily_loss_cap_pct":    0.05,   # 5% of STARTING budget = $25 fixed cap
-    "max_trades_per_day":    10,
-    "stop_loss_pct":         0.08,   # v3: tightened from 0.25   # cut stock positions at -25%
+    "daily_loss_cap_pct":    0.05,   # 5% of starting budget = $50 fixed
+    "max_trades_per_day":    8,
 
-    # Signals
-    "rsi_oversold":           30,   # v3: stricter oversold
-    "rsi_overbought":         70,   # v3: stricter overbought
+    # Indicators (daily candles)
+    "ma_period":             50,     # 50-day MA trend filter
+    "rsi_period":            14,     # RSI period
+    "rsi_entry":             40,     # buy when daily RSI < 40
+    "rsi_exit":              65,     # sell when daily RSI > 65
+    "candle_range":          "3mo",  # Yahoo range for daily candles
     "volume_surge_threshold": 1.5,
-    "score_threshold":        62,    # lowered from 68 — catches more setups
-    "auto_trade_confidence":  0.70,
-    "pending_confidence":     0.55,
-    "min_ai_confidence":      0.60,
 
-    # Options
-    "options_enabled":      True,
-    "options_score_min":    72,
-    "options_conf_min":     0.65,
-    "csp_min_premium_pct":  1.0,     # min 1% premium vs strike
-    "options_dte_min":      7,
-    "options_dte_max":      45,
+    # Scoring / confidence
+    "score_threshold":       68,     # raised from 62
+    "auto_trade_confidence": 0.72,
+    "pending_confidence":    0.58,
+    "min_confidence":        0.58,
 
-    # Holding periods
-    "stock_hold_days":   2,   # v3: faster exits
-    "options_hold_days": 14,         # raised from 3 — more realistic
+    # Trade management
+    "take_profit_pct":       0.025,  # 2.5% TP
+    "stop_loss_pct":         0.06,   # 6% hard stop (tightened from 8%)
+    "quick_cut_pct":         0.05,   # cut -5% within first 24h
+    "trail_arm_pct":         0.025,  # arm trailing stop at +2.5%
+    "trail_fire_pct":        0.015,  # fire if -1.5% from peak
+    "max_hold_days":         5,      # safety net max hold
 
-    # Timing — used by run_loop
-    "scan_interval_sec":  300,       # 5 min during market hours
+    # Fees (Alpaca: $0 commission, spread only)
+    "stock_spread_pct":      0.0005, # 0.05% per side = 0.10% round trip
 
-    # v3: Regime detection thresholds (SPY+QQQ 5d momentum)
-    "bear_threshold_pct":    -2.0,   # both below → BEAR (block longs)
-    "bull_threshold_pct":     1.5,   # both above → BULL (boost longs)
+    # Market regime (SPY + QQQ 5-day momentum)
+    "bear_threshold_pct":    -2.0,
+    "bull_threshold_pct":     1.5,
 
-    # v3: Trailing stop
-    "trail_arm_pct":   0.03,   # arm when up +3% from entry
-    "trail_fire_pct":  0.02,   # fire if drops -2% from peak
+    # Sector concentration
+    "max_per_sector":         2,
 
-    # v3: Quick cut for fast losers
-    "quick_cut_pct":   0.04,   # cut if down >4% within first 24h
-
-    # v4.1: Sector concentration
-    "max_per_sector":  2,       # max open positions per sector (tech/finance/etc)
-
-    # v4.2: Spread simulation (Alpaca $0 commission, but spreads are real)
-    "stock_spread_pct":  0.0005,  # 0.05% per side = 0.10% round trip
-    "option_spread_pct": 0.02,    # 2% per side = 4% round trip (wide option spreads)
-    "premarket_wake_min": 30,        # wake 30 min before open
+    # Timing
+    "scan_interval_sec":     300,    # 5 min during market hours
 
     # Pending
-    "pending_expiry_mins": 1080,
+    "pending_expiry_mins":   1080,   # 18h
 
     # Files
-    "state_file":    "jacob_state.json",
-    "dashboard_file":"jacob_data.json",
-    "pending_file":  "jacob_pending.json",
-    "csv_file":      "jacob_trades.csv",
-    "log_file":      "jacob.log",
+    "state_file":     "jacob_state.json",
+    "dashboard_file": "jacob_data.json",
+    "pending_file":   "jacob_pending.json",
+    "csv_file":       "jacob_trades.csv",
+    "log_file":       "jacob.log",
 }
 
-# Fixed daily loss cap (doesn't shrink as wallet drops)
 DAILY_LOSS_CAP = CONFIG["paper_budget"] * CONFIG["daily_loss_cap_pct"]
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 # LOGGING
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(CONFIG["log_file"], encoding="utf-8")]
+    handlers=[logging.FileHandler(CONFIG["log_file"], encoding="utf-8")],
 )
 log = logging.getLogger("jacob")
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-log.addHandler(console)
+_con = logging.StreamHandler()
+_con.setLevel(logging.INFO)
+_con.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(_con)
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 # PERSONALITY
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 QUOTES = {
     "hunting": [
-        '"That RSI divergence just spoke to me. Position opened."',
-        '"Volume spike confirmed. The lizard is in."',
-        '"Market mispriced this. Classic. We are in."',
-        '"IV crush incoming on that CSP. Premium collected."',
+        "RSI dip in an uptrend. MA50 holding. Entering.",
+        "Volume surge confirmed. The lizard is in.",
+        "Oversold below MA50? Wrong. Above MA50. Signal is clean.",
+        "Price pulled back to RSI 40. Textbook entry.",
     ],
     "watching": [
-        '"Scanning 20 tickers. The right setup is in here somewhere."',
-        '"RSI cooling. Momentum building. Almost time."',
-        '"Waiting for volume confirmation. Patience is alpha."',
-        '"Nothing trades yet. Discipline beats FOMO."',
+        "Scanning 20 tickers. Looking for RSI < 40 above MA50.",
+        "Good tape today. Waiting for the right pullback.",
+        "Regime is neutral. Patience is alpha.",
+        "Nothing at threshold yet. The right setup is coming.",
     ],
     "sleeping": [
-        '"No edge above threshold. Cash is a position."',
-        '"Choppy tape. Lizard doesn\'t trade chop."',
-        '"Market close. Lizard rests. Watchlist ready for morning."',
-        '"Zero trades = zero losses. Math is math."',
+        "Bear regime. All cash. Preservation mode.",
+        "Market closed. Watchlist ready for morning.",
+        "Zero trades = zero losses. Math is math.",
+        "Choppy tape. The lizard doesn't trade chop.",
     ],
     "pending": [
-        '"Found something with potential. Want your eyes on it first."',
-        '"Borderline signal. Your call."',
-        '"Options setup looks clean but IV is high. Review pending."',
+        "Found something. Want your eyes on it first.",
+        "Borderline signal above threshold — your call.",
+        "MA50 confirmed, RSI borderline. Pending your review.",
+    ],
+    "exiting": [
+        "RSI overbought. Taking profit. Moving on.",
+        "Target hit. Booked. Waiting for the next dip.",
+        "Sold into strength. Patience paid off.",
     ],
 }
-ART = {
-    "hunting":  ['"  .__.\n ( >.< )\n  )   (\n TRADES"', '"  .__.\n ( *>* )\n  )   (\n ALPHA!"'],
-    "watching": ['"  .__.\n ( o.o )\n  )   (\n  . . ."', '"  .__.\n ( -.o )\n  )   (\n  hmm."'],
-    "sleeping": ['"  .__.\n ( -.- )\n  )   (\n  zzz."'],
-    "pending":  ['"  .__.\n ( ?.? )\n  )   (\n  ???"'],
-}
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODULE 1: MARKET DATA
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# MODULE 1 — MARKET DATA
+# ══════════════════════════════════════════════════════════════
 class MarketData:
-    """Fetches quotes and technicals from Yahoo Finance. Free, no API key."""
+    """
+    Fetches daily candles from Yahoo Finance.
+    Computes MA50 + RSI14 on daily closes — less noise than hourly.
+    No mock fallback: if Yahoo fails, returns None (ticker skipped).
+    """
+    _cache     = {}
+    CACHE_SECS = 270  # 4.5 min — slightly under 5-min scan interval
 
-    _cache = {}
-    CACHE_SECS = 240  # 4 min cache
-
-    def _yahoo_quote(self, ticker):
+    def _yahoo_daily(self, ticker):
+        now = time.time()
         if ticker in self._cache:
             ts, data = self._cache[ticker]
-            if time.time() - ts < self.CACHE_SECS:
+            if now - ts < self.CACHE_SECS:
                 return data
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-            r = requests.get(url, params={"range": "5d", "interval": "1h",
-                             "includePrePost": "false"},
-                             headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            r = requests.get(
+                url,
+                params={"range": CONFIG["candle_range"], "interval": "1d",
+                        "includePrePost": "false"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
             r.raise_for_status()
             result = r.json().get("chart", {}).get("result", [])
             if not result:
                 return None
             meta    = result[0].get("meta", {})
-            quote   = result[0].get("indicators", {}).get("quote", [{}])[0]
-            closes  = [c for c in quote.get("close",  []) if c is not None]
-            volumes = [v for v in quote.get("volume", []) if v is not None]
-            if not closes:
-                return None
+            q       = result[0].get("indicators", {}).get("quote", [{}])[0]
+            closes  = [c for c in q.get("close",  []) if c is not None]
+            volumes = [v for v in q.get("volume", []) if v is not None]
+            if len(closes) < CONFIG["ma_period"]:
+                return None  # not enough history
+            price = float(meta.get("regularMarketPrice", closes[-1]))
+            avg_vol = int(sum(volumes[-20:]) / max(len(volumes[-20:]), 1)) if volumes else 1
             data = {
                 "ticker":     ticker,
-                "price":      round(meta.get("regularMarketPrice", closes[-1]), 4),
-                "prev_close": round(meta.get("chartPreviousClose", closes[0]),  4),
-                "change_pct": 0.0,
-                "volume":     meta.get("regularMarketVolume", volumes[-1] if volumes else 0),
-                "avg_volume": int(sum(volumes[-20:]) / max(len(volumes[-20:]), 1)) if volumes else 0,
-                "closes":     closes[-30:],
-                "volumes":    volumes[-30:],
+                "price":      round(price, 4),
+                "prev_close": round(float(meta.get("chartPreviousClose", closes[-1])), 4),
+                "volume":     int(meta.get("regularMarketVolume", volumes[-1] if volumes else 0)),
+                "avg_volume": avg_vol,
+                "closes":     closes,
+                "volumes":    volumes,
             }
             if data["prev_close"] > 0:
                 data["change_pct"] = round(
-                    (data["price"] - data["prev_close"]) / data["prev_close"] * 100, 2)
-            self._cache[ticker] = (time.time(), data)
+                    (price - data["prev_close"]) / data["prev_close"] * 100, 2)
+            else:
+                data["change_pct"] = 0.0
+            self._cache[ticker] = (now, data)
             return data
         except Exception as e:
-            log.debug(f"Yahoo quote failed {ticker}: {e}")
+            log.debug("Yahoo daily failed %s: %s", ticker, e)
             return None
 
-    def _calc_rsi(self, closes, period=14):
+    @staticmethod
+    def _calc_rsi(closes, period=14):
         if len(closes) < period + 1:
             return 50.0
-        deltas = [closes[i+1] - closes[i] for i in range(len(closes)-1)]
-        gains  = [max(d, 0) for d in deltas]
-        losses = [max(-d, 0) for d in deltas]
-        ag = sum(gains[:period])  / period
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            d = closes[i] - closes[i - 1]
+            gains.append(max(d, 0.0))
+            losses.append(max(-d, 0.0))
+        ag = sum(gains[:period]) / period
         al = sum(losses[:period]) / period
         for i in range(period, len(gains)):
-            ag = (ag * (period-1) + gains[i])  / period
-            al = (al * (period-1) + losses[i]) / period
+            ag = (ag * (period - 1) + gains[i]) / period
+            al = (al * (period - 1) + losses[i]) / period
         if al == 0:
             return 100.0
-        return round(100 - 100 / (1 + ag / al), 1)
+        return round(100.0 - 100.0 / (1.0 + ag / al), 1)
 
-    def _calc_momentum(self, closes, period=10):
+    @staticmethod
+    def _calc_ma(closes, period=50):
+        if len(closes) < period:
+            return None
+        return round(sum(closes[-period:]) / period, 4)
+
+    @staticmethod
+    def _calc_momentum(closes, period=10):
         if len(closes) < period + 1:
             return 0.0
-        return round((closes[-1] - closes[-period-1]) / max(closes[-period-1], 0.01) * 100, 2)
-
-    def _mock(self, ticker):
-        base = {"AAPL":227,"MSFT":415,"NVDA":875,"GOOGL":185,"AMZN":220,
-                "META":575,"TSLA":248,"AMD":168,"NFLX":980,"JPM":235,
-                "SPY":565,"QQQ":488,"GLD":245,"TLT":92,"BAC":44,
-                "DIS":113,"PLTR":82,"COIN":255,"SNOW":148,"UBER":82}
-        price   = base.get(ticker, 100) * (1 + random.uniform(-0.02, 0.02))
-        closes  = [price * (1 + random.uniform(-0.01, 0.01)) for _ in range(30)]
-        closes[-1] = price
-        volumes = [random.randint(5_000_000, 50_000_000) for _ in range(30)]
-        return {"ticker": ticker, "price": round(price, 2),
-                "prev_close": round(closes[-2], 2),
-                "change_pct": round((closes[-1]-closes[-2])/closes[-2]*100, 2),
-                "volume": volumes[-1], "avg_volume": int(sum(volumes)/len(volumes)),
-                "closes": [round(c,2) for c in closes], "volumes": volumes}
+        return round((closes[-1] - closes[-period - 1]) / max(closes[-period - 1], 0.01) * 100, 2)
 
     def get_quote(self, ticker):
-        data = self._yahoo_quote(ticker) or self._mock(ticker)
-        closes  = data["closes"]
-        volumes = data["volumes"]
-        data["rsi"]          = self._calc_rsi(closes)
+        """Returns enriched quote dict or None if data unavailable."""
+        data = self._yahoo_daily(ticker)
+        if not data:
+            return None
+        closes = data["closes"]
+        data["rsi"]          = self._calc_rsi(closes, CONFIG["rsi_period"])
+        data["ma50"]         = self._calc_ma(closes, CONFIG["ma_period"])
+        data["above_ma50"]   = data["price"] > data["ma50"] if data["ma50"] else False
         data["momentum_5d"]  = self._calc_momentum(closes, 5)
         data["momentum_10d"] = self._calc_momentum(closes, 10)
         avg_vol = data["avg_volume"] or 1
@@ -261,8 +259,7 @@ class MarketData:
         return data
 
     def get_live_price(self, ticker):
-        """Fetch latest price only — for settlement and stop loss checks."""
-        # Bypass cache for live price
+        """Live price bypass — for stop loss and TP checks."""
         clean = ticker.replace("_OPT", "")
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{clean}"
@@ -275,382 +272,288 @@ class MarketData:
             price = result[0].get("meta", {}).get("regularMarketPrice")
             return round(float(price), 4) if price else None
         except Exception as e:
-            log.debug(f"Live price failed {clean}: {e}")
+            log.debug("Live price failed %s: %s", clean, e)
             return None
 
-    def get_options_chain(self, ticker):
-        try:
-            url = f"https://query1.finance.yahoo.com/v7/finance/options/{ticker}"
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-            r.raise_for_status()
-            chain = r.json().get("optionChain", {}).get("result", [])
-            if not chain:
-                return []
-            expirations   = chain[0].get("expirationDates", [])
-            current_price = chain[0].get("quote", {}).get("regularMarketPrice", 0)
-            now     = datetime.utcnow()
-            results = []
-            dte_min = CONFIG["options_dte_min"]
-            dte_max = CONFIG["options_dte_max"]
-            for exp_ts in expirations:
-                exp_dt = datetime.utcfromtimestamp(exp_ts)
-                dte    = (exp_dt - now).days
-                if not (dte_min <= dte <= dte_max):
-                    continue
-                exp_str = exp_dt.strftime("%Y-%m-%d")
-                r2 = requests.get(
-                    f"https://query1.finance.yahoo.com/v7/finance/options/{ticker}?date={exp_ts}",
-                    headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-                r2.raise_for_status()
-                opts = r2.json().get("optionChain", {}).get("result", [{}])[0].get("options", [{}])[0]
-                for put in opts.get("puts", []):
-                    strike = put.get("strike", 0)
-                    if not (current_price * 0.90 <= strike <= current_price * 1.01):
-                        continue
-                    bid = put.get("bid", 0) or 0
-                    ask = put.get("ask", 0) or 0
-                    iv  = put.get("impliedVolatility", 0) or 0
-                    if bid <= 0:
-                        continue
-                    results.append({
-                        "type": "put", "strategy": "CSP", "ticker": ticker,
-                        "strike": strike, "expiry": exp_str, "dte": dte,
-                        "bid": round(bid,2), "ask": round(ask,2),
-                        "mid": round((bid+ask)/2, 2),
-                        "iv":  round(iv*100, 1),
-                        "volume": put.get("volume", 0) or 0,
-                        "current_price": current_price,
-                        "otm_pct":     round((current_price-strike)/current_price*100, 1),
-                        "premium_pct": round(bid/strike*100, 2) if strike else 0,
-                    })
-                for call in opts.get("calls", []):
-                    strike = call.get("strike", 0)
-                    if not (current_price * 0.99 <= strike <= current_price * 1.08):
-                        continue
-                    bid = call.get("bid", 0) or 0
-                    ask = call.get("ask", 0) or 0
-                    iv  = call.get("impliedVolatility", 0) or 0
-                    if bid <= 0:
-                        continue
-                    results.append({
-                        "type": "call", "strategy": "CALL", "ticker": ticker,
-                        "strike": strike, "expiry": exp_str, "dte": dte,
-                        "bid": round(bid,2), "ask": round(ask,2),
-                        "mid": round((bid+ask)/2, 2),
-                        "iv":  round(iv*100, 1),
-                        "volume": call.get("volume", 0) or 0,
-                        "current_price": current_price,
-                        "otm_pct":     round((strike-current_price)/current_price*100, 1),
-                        "premium_pct": round(bid/strike*100, 2) if strike else 0,
-                    })
-                time.sleep(0.2)
-                break  # first qualifying expiry only
-            return sorted(results, key=lambda x: x["premium_pct"], reverse=True)
-        except Exception as e:
-            log.debug(f"Options chain failed {ticker}: {e}")
-            return []
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODULE 2: SIGNAL SCORER
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODULE 1b: MARKET REGIME DETECTOR                                      [v3]
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# MODULE 2 — MARKET REGIME
+# ══════════════════════════════════════════════════════════════
 class MarketRegime:
     """
-    Fetches SPY + QQQ once per scan to determine broad market direction.
-      BEAR   → SPY and QQQ both down >2% over 5 days — block new longs
-      BULL   → SPY and QQQ both up  >1.5% over 5 days — boost long confidence
-      NEUTRAL→ everything else — normal operation
+    SPY + QQQ 5-day momentum → BEAR / NEUTRAL / BULL.
+    BEAR: block all new long entries (go to cash on exits).
+    BULL: boost confidence slightly.
     """
     def __init__(self, market):
         self.market      = market
-        self._cache      = "neutral"
+        self._regime     = "neutral"
         self._spy5       = 0.0
         self._qqq5       = 0.0
         self._spy_chg    = 0.0
         self._cache_time = None
 
     def get(self):
-        """Returns (regime, spy_5d, qqq_5d). Cached per scan (~5 min)."""
         now = datetime.now(ET)
         if self._cache_time and (now - self._cache_time).total_seconds() < 290:
-            return self._cache, self._spy5, self._qqq5
+            return self._regime, self._spy5, self._qqq5
         try:
             spy = self.market.get_quote("SPY")
             qqq = self.market.get_quote("QQQ")
-            spy5 = spy.get("momentum_5d", 0)
-            qqq5 = qqq.get("momentum_5d", 0)
-            self._spy_chg = spy.get("change_pct", 0)
+            spy5 = spy["momentum_5d"] if spy else 0
+            qqq5 = qqq["momentum_5d"] if qqq else 0
+            self._spy_chg = spy["change_pct"] if spy else 0
 
             if spy5 < CONFIG["bear_threshold_pct"] and qqq5 < CONFIG["bear_threshold_pct"]:
-                regime = "bear"
+                self._regime = "bear"
             elif spy5 > CONFIG["bull_threshold_pct"] and qqq5 > CONFIG["bull_threshold_pct"]:
-                regime = "bull"
+                self._regime = "bull"
             else:
-                regime = "neutral"
+                self._regime = "neutral"
 
-            self._cache      = regime
             self._spy5       = spy5
             self._qqq5       = qqq5
             self._cache_time = now
-            log.info("  [REGIME] SPY 5d=%+.1f%% | QQQ 5d=%+.1f%% | Today=%+.1f%% → %s",
-                     spy5, qqq5, self._spy_chg, regime.upper())
+            log.info("  [REGIME] SPY 5d=%+.1f%% | QQQ 5d=%+.1f%% | today=%+.1f%% → %s",
+                     spy5, qqq5, self._spy_chg, self._regime.upper())
         except Exception as e:
-            log.warning("  [REGIME] Fetch failed: %s — using %s", e, self._cache.upper())
-        return self._cache, self._spy5, self._qqq5
+            log.warning("  [REGIME] Fetch failed: %s — keeping %s", e, self._regime.upper())
+        return self._regime, self._spy5, self._qqq5
 
     @property
     def high_vol_day(self):
-        """True if today's SPY move >2% — reduce size on high vol days."""
         return abs(self._spy_chg) > 2.0
 
 
+# ══════════════════════════════════════════════════════════════
+# MODULE 3 — SIGNAL SCORER
+# ══════════════════════════════════════════════════════════════
 class SignalScorer:
-    """Scores each ticker 0-100. High score = strong setup."""
+    """
+    Scores tickers 0–100 for LONG setups only.
+    Requires price > MA50 as a hard pre-filter before scoring matters.
+    """
 
     def score(self, quote):
         rsi       = quote.get("rsi", 50)
-        mom5      = quote.get("momentum_5d",  0)
+        mom5      = quote.get("momentum_5d", 0)
         mom10     = quote.get("momentum_10d", 0)
         vol_ratio = quote.get("volume_ratio", 1.0)
-        chg_pct   = quote.get("change_pct",   0)
+        chg_pct   = quote.get("change_pct", 0)
+        above_ma  = quote.get("above_ma50", False)
 
-        score     = 50
-        direction = "LONG"
-        signals   = []
+        score   = 50
+        signals = []
 
-        # RSI
-        if rsi < CONFIG["rsi_oversold"]:
-            score += 15; signals.append(f"RSI oversold ({rsi:.0f})"); direction = "LONG"
-        elif rsi > CONFIG["rsi_overbought"]:
-            score += 10; signals.append(f"RSI overbought ({rsi:.0f})"); direction = "SHORT"
-        elif 40 <= rsi <= 60:
-            signals.append(f"RSI neutral ({rsi:.0f})")
+        # MA50 gate contributes to score too
+        if above_ma:
+            score += 5; signals.append("Above MA50 — uptrend confirmed")
+        else:
+            score -= 15; signals.append("Below MA50 — downtrend, skipping")
 
-        # Momentum
-        if mom5 > 3:
-            score += 12; signals.append(f"Strong 5d momentum (+{mom5:.1f}%)"); direction = "LONG"
+        # RSI: buy the dip in an uptrend
+        if rsi < CONFIG["rsi_entry"]:
+            score += 18; signals.append(f"RSI {rsi:.0f} — oversold dip")
+        elif rsi < 50:
+            score += 8;  signals.append(f"RSI {rsi:.0f} — cooling")
+        elif rsi > CONFIG["rsi_exit"]:
+            score -= 15; signals.append(f"RSI {rsi:.0f} — overbought, no entry")
+
+        # Momentum: want positive but not chasing
+        if 2 <= mom5 <= 8:
+            score += 12; signals.append(f"Healthy momentum +{mom5:.1f}%")
+        elif mom5 > 8:
+            score += 5;  signals.append(f"Hot momentum +{mom5:.1f}% — extended")
         elif mom5 < -3:
-            score += 12; signals.append(f"Negative 5d momentum ({mom5:.1f}%)"); direction = "SHORT"
+            score -= 10; signals.append(f"Falling momentum {mom5:.1f}%")
 
         if mom10 > 5:
-            score += 8; signals.append(f"10d uptrend (+{mom10:.1f}%)")
-        elif mom10 < -5:
-            score += 8; signals.append(f"10d downtrend ({mom10:.1f}%)")
+            score += 8;  signals.append(f"10d uptrend +{mom10:.1f}%")
 
-        # Volume
-        if vol_ratio >= CONFIG["volume_surge_threshold"]:
-            score += 12; signals.append(f"Volume surge ({vol_ratio:.1f}x avg)")
+        # Volume conviction
+        if vol_ratio >= 2.0:
+            score += 14; signals.append(f"Volume surge {vol_ratio:.1f}x — conviction")
+        elif vol_ratio >= CONFIG["volume_surge_threshold"]:
+            score += 8;  signals.append(f"Volume elevated {vol_ratio:.1f}x")
+        elif vol_ratio < 0.6:
+            score -= 8;  signals.append(f"Low volume {vol_ratio:.1f}x — weak")
 
         # Daily move
-        if abs(chg_pct) > 2:
-            score += 8; signals.append(f"Big daily move ({chg_pct:+.1f}%)")
+        if 1 < chg_pct < 5:
+            score += 6;  signals.append(f"Positive day +{chg_pct:.1f}%")
+        elif chg_pct > 5:
+            score += 2;  signals.append(f"Large move +{chg_pct:.1f}% — may be extended")
+        elif chg_pct < -3:
+            score -= 5;  signals.append(f"Selling pressure {chg_pct:.1f}%")
 
-        return {"score": min(score, 100), "direction": direction, "signals": signals}
+        return {"score": max(0, min(100, score)), "direction": "LONG", "signals": signals}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MODULE 3: RULES ENGINE (zero-cost AI analyst)
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# MODULE 4 — RULES ENGINE
+# ══════════════════════════════════════════════════════════════
 class RulesEngine:
     """
-    Jacob's market knowledge distilled into rules.
-    No API calls. No credits. Mirrors what Claude would evaluate.
+    Per-ticker knowledge + rules-based confidence scorer.
+    No API calls. Outputs confidence 0.0–1.0 for LONG setups.
     """
 
     PROFILES = {
-        "AAPL":  {"sector":"tech",      "beta":1.2,  "earnings":True,  "tq":"high",   "note":"Strong brand moat. Momentum trades well. Avoid before earnings."},
-        "MSFT":  {"sector":"tech",      "beta":0.9,  "earnings":True,  "tq":"high",   "note":"Cloud+AI tailwind. Lower beta, dips recover. CSP-friendly."},
-        "NVDA":  {"sector":"semis",     "beta":1.9,  "earnings":True,  "tq":"high",   "note":"AI capex dominant. High beta — volume surges are meaningful."},
-        "GOOGL": {"sector":"tech",      "beta":1.1,  "earnings":True,  "tq":"high",   "note":"Ad revenue + cloud. Solid floor. Lags NVDA in momentum."},
-        "AMZN":  {"sector":"tech",      "beta":1.3,  "earnings":True,  "tq":"high",   "note":"AWS growth driver. Momentum works in bull tape."},
-        "META":  {"sector":"tech",      "beta":1.4,  "earnings":True,  "tq":"high",   "note":"Ad market dominant. Momentum very reliable."},
-        "TSLA":  {"sector":"ev",        "beta":2.2,  "earnings":True,  "tq":"low",    "note":"Narrative-driven. Technicals unreliable — skip unless volume massive."},
-        "AMD":   {"sector":"semis",     "beta":1.8,  "earnings":True,  "tq":"medium", "note":"NVDA competitor. Volume surges worth acting on."},
-        "NFLX":  {"sector":"streaming", "beta":1.3,  "earnings":True,  "tq":"medium", "note":"Ad tier tailwind. Momentum trades OK."},
-        "JPM":   {"sector":"finance",   "beta":1.1,  "earnings":True,  "tq":"medium", "note":"Best-in-class bank. CSP works well — strong floor."},
-        "SPY":   {"sector":"etf",       "beta":1.0,  "earnings":False, "tq":"high",   "note":"S&P 500 ETF. Very reliable technicals. CSP in dips classic."},
-        "QQQ":   {"sector":"etf",       "beta":1.2,  "earnings":False, "tq":"high",   "note":"Nasdaq 100 ETF. High IV — CSP premium attractive in pullbacks."},
-        "GLD":   {"sector":"commodity", "beta":0.1,  "earnings":False, "tq":"medium", "note":"Gold. Inverse to real rates. Momentum works in risk-off."},
-        "TLT":   {"sector":"bonds",     "beta":-0.3, "earnings":False, "tq":"medium", "note":"20yr Treasury. Inversely correlated to rates. Short momentum reliable."},
-        "BAC":   {"sector":"finance",   "beta":1.3,  "earnings":True,  "tq":"medium", "note":"Rate-sensitive bank. More beta than JPM. Wider stop needed."},
-        "DIS":   {"sector":"media",     "beta":1.1,  "earnings":True,  "tq":"low",    "note":"Turnaround story, fundamentals mixed. Be cautious on momentum."},
-        "PLTR":  {"sector":"tech",      "beta":1.7,  "earnings":True,  "tq":"low",    "note":"High beta, momentum bursts but mean-reverts hard. Volume surge key."},
-        "COIN":  {"sector":"crypto",    "beta":2.5,  "earnings":True,  "tq":"low",    "note":"Crypto proxy. Only trade on strong volume + momentum alignment."},
-        "SNOW":  {"sector":"tech",      "beta":1.6,  "earnings":True,  "tq":"medium", "note":"Cloud data. AI tailwind returning. Volume surges meaningful."},
-        "UBER":  {"sector":"transport", "beta":1.4,  "earnings":True,  "tq":"medium", "note":"Profitable now. Momentum trades well."},
+        "AAPL":  {"sector": "tech",      "beta": 1.2, "tq": "high",
+                  "note": "Strong brand moat. Momentum trades well. Dips above MA50 are reliable entries."},
+        "MSFT":  {"sector": "tech",      "beta": 0.9, "tq": "high",
+                  "note": "Cloud+AI tailwind. Lower beta, dips recover steadily."},
+        "NVDA":  {"sector": "semis",     "beta": 1.9, "tq": "high",
+                  "note": "AI capex dominant. High beta — volume surges are meaningful entries."},
+        "GOOGL": {"sector": "tech",      "beta": 1.1, "tq": "high",
+                  "note": "Ad revenue + cloud. Solid floor. Lags NVDA in momentum."},
+        "AMZN":  {"sector": "tech",      "beta": 1.3, "tq": "high",
+                  "note": "AWS growth driver. Momentum works in bull tape."},
+        "META":  {"sector": "tech",      "beta": 1.4, "tq": "high",
+                  "note": "Ad market dominant. Momentum very reliable."},
+        "TSLA":  {"sector": "ev",        "beta": 2.2, "tq": "low",
+                  "note": "Narrative-driven. Technicals unreliable — only trade on massive volume surges."},
+        "AMD":   {"sector": "semis",     "beta": 1.8, "tq": "medium",
+                  "note": "NVDA competitor. Volume surges and MA50 holding are key."},
+        "NFLX":  {"sector": "streaming", "beta": 1.3, "tq": "medium",
+                  "note": "Ad tier tailwind. Momentum trades OK."},
+        "JPM":   {"sector": "finance",   "beta": 1.1, "tq": "medium",
+                  "note": "Best-in-class bank. Strong floor. Dips above MA50 buy well."},
+        "SPY":   {"sector": "etf",       "beta": 1.0, "tq": "high",
+                  "note": "S&P 500. Very reliable technicals. Dips above MA50 are classic buys."},
+        "QQQ":   {"sector": "etf",       "beta": 1.2, "tq": "high",
+                  "note": "Nasdaq 100. MA50 dips in uptrend work well."},
+        "GLD":   {"sector": "commodity", "beta": 0.1, "tq": "medium",
+                  "note": "Gold. Inverse to real rates. Momentum works in risk-off."},
+        "TLT":   {"sector": "bonds",     "beta": -0.3, "tq": "medium",
+                  "note": "20yr Treasury. Rate-sensitive. MA50 trend is everything here."},
+        "BAC":   {"sector": "finance",   "beta": 1.3, "tq": "medium",
+                  "note": "Rate-sensitive bank. More beta than JPM — needs volume confirmation."},
+        "DIS":   {"sector": "media",     "beta": 1.1, "tq": "low",
+                  "note": "Turnaround story. Fundamentals mixed — needs strong volume to confirm."},
+        "PLTR":  {"sector": "tech",      "beta": 1.7, "tq": "low",
+                  "note": "High beta, momentum bursts but mean-reverts hard. Volume surge is key."},
+        "COIN":  {"sector": "crypto",    "beta": 2.5, "tq": "low",
+                  "note": "Crypto proxy. Only trade on strong volume + momentum + MA50 alignment."},
+        "SNOW":  {"sector": "tech",      "beta": 1.6, "tq": "medium",
+                  "note": "Cloud data, AI tailwind returning. Volume surges meaningful."},
+        "UBER":  {"sector": "transport", "beta": 1.4, "tq": "medium",
+                  "note": "Profitable now. Momentum trades well."},
     }
 
     SECTOR_WEIGHT = {
-        "tech":1.15, "semis":1.20, "etf":1.00, "finance":0.90,
-        "streaming":0.95, "ev":0.85, "crypto":0.80, "commodity":0.90,
-        "bonds":0.95, "media":0.80, "transport":0.95,
+        "tech": 1.12, "semis": 1.18, "etf": 1.05, "finance": 0.92,
+        "streaming": 0.95, "ev": 0.82, "crypto": 0.78, "commodity": 0.90,
+        "bonds": 0.95, "media": 0.80, "transport": 0.95,
     }
-
-    IV_HIGH = 40
-    IV_LOW  = 20
 
     def _profile(self, ticker):
         return self.PROFILES.get(ticker, {
-            "sector":"unknown","beta":1.0,"earnings":False,"tq":"medium",
-            "note":"Unknown ticker — applying neutral rules."
+            "sector": "unknown", "beta": 1.0, "tq": "medium",
+            "note": "Unknown ticker — applying neutral rules.",
         })
 
-    def _regime(self, quote):
-        rsi = quote.get("rsi", 50); mom5 = quote.get("momentum_5d", 0)
-        vol = quote.get("volume_ratio", 1.0)
-        if rsi < 35 and mom5 < -2: return "oversold_bounce"
-        if rsi > 65 and mom5 > 2:  return "overbought"
-        if abs(mom5) > 3 and vol > 1.3: return "trending"
-        return "choppy"
+    def analyse(self, quote, signal, regime):
+        """Returns (confirmed: bool, confidence: float, reasoning: str)."""
+        ticker   = quote["ticker"]
+        rsi      = quote.get("rsi", 50)
+        mom5     = quote.get("momentum_5d", 0)
+        mom10    = quote.get("momentum_10d", 0)
+        vol      = quote.get("volume_ratio", 1.0)
+        chg      = quote.get("change_pct", 0)
+        above_ma = quote.get("above_ma50", False)
+        score    = signal["score"]
+        p        = self._profile(ticker)
+        tq       = p["tq"]
+        beta     = p["beta"]
+        sector   = p["sector"]
+        reasons  = []
+        conf     = 0.50
 
-    def analyse_stock(self, quote, signal):
-        ticker = quote["ticker"]; rsi = quote.get("rsi",50)
-        mom5 = quote.get("momentum_5d",0); mom10 = quote.get("momentum_10d",0)
-        vol   = quote.get("volume_ratio",1.0); chg = quote.get("change_pct",0)
-        direction = signal["direction"]; score = signal["score"]
-        p = self._profile(ticker)
-        tq = p["tq"]; beta = p["beta"]; sector = p["sector"]
-        regime = self._regime(quote)
-        reasons = []
-        conf = 0.50
+        # Hard gates
+        if not above_ma:
+            return False, 0.30, f"{ticker} below MA50 — no long entries"
 
-        # Trend quality gate — low quality tickers need stronger signals
-        tq_bonus = {"high":0,"medium":5,"low":10}[tq]
-        if score < CONFIG["score_threshold"] + tq_bonus:
-            return False, 0.38, f"{ticker} needs score {CONFIG['score_threshold']+tq_bonus}+ (tq:{tq})"
+        # Score gate adjusted for ticker quality
+        tq_bonus = {"high": 0, "medium": 5, "low": 12}[tq]
+        min_score = CONFIG["score_threshold"] + tq_bonus
+        if score < min_score:
+            return False, 0.35, f"{ticker} score {score} < {min_score} needed (tq:{tq})"
 
-        # Sector weight
-        conf += (self.SECTOR_WEIGHT.get(sector, 1.0) - 1.0) * 0.15
+        # RSI: best entries are RSI < rsi_entry
+        if rsi < CONFIG["rsi_entry"]:
+            conf += 0.14; reasons.append(f"RSI {rsi:.0f} — oversold dip in uptrend")
+        elif rsi < 50:
+            conf += 0.07; reasons.append(f"RSI {rsi:.0f} — cooling, room to run")
+        elif rsi > CONFIG["rsi_exit"]:
+            conf -= 0.14; reasons.append(f"RSI {rsi:.0f} — overbought, chasing")
 
-        if direction == "LONG":
-            if rsi < 35:       conf += 0.12; reasons.append(f"RSI {rsi:.0f} oversold — bounce setup")
-            elif rsi < 50:     conf += 0.06; reasons.append(f"RSI {rsi:.0f} cooling, room to run")
-            elif rsi > 65:     conf -= 0.10; reasons.append(f"RSI {rsi:.0f} extended — chasing")
+        # Momentum alignment
+        if mom5 > 3 and mom10 > 5:
+            conf += 0.10; reasons.append(f"Momentum aligned +{mom5:.1f}%/+{mom10:.1f}%")
+        elif mom5 > 1:
+            conf += 0.05; reasons.append(f"Positive 5d momentum +{mom5:.1f}%")
+        elif mom5 < -2:
+            conf -= 0.08; reasons.append(f"Momentum fading {mom5:.1f}%")
 
-            if mom5 > 4 and mom10 > 6:  conf += 0.10; reasons.append(f"Momentum aligned +{mom5:.1f}%/+{mom10:.1f}%")
-            elif mom5 > 2:              conf += 0.05; reasons.append(f"Positive 5d momentum +{mom5:.1f}%")
-            elif mom5 < -1 and rsi > 50: conf -= 0.08; reasons.append("Momentum fading while RSI elevated")
+        # Volume conviction
+        if vol >= 2.0:
+            conf += 0.12; reasons.append(f"Strong volume {vol:.1f}x — institutional buying")
+        elif vol >= CONFIG["volume_surge_threshold"]:
+            conf += 0.07; reasons.append(f"Volume elevated {vol:.1f}x")
+        elif vol < 0.6:
+            conf -= 0.08; reasons.append(f"Low volume {vol:.1f}x — weak conviction")
 
-            if vol >= 2.0:   conf += 0.12; reasons.append(f"Strong volume surge {vol:.1f}x — conviction")
-            elif vol >= 1.5: conf += 0.07; reasons.append(f"Volume surge {vol:.1f}x above average")
-            elif vol < 0.7:  conf -= 0.08; reasons.append("Low volume — weak conviction")
+        # Sector / quality weight
+        sw = self.SECTOR_WEIGHT.get(sector, 1.0)
+        conf += (sw - 1.0) * 0.15
 
-            if regime == "trending":       conf += 0.08; reasons.append("Trending regime")
-            elif regime == "choppy":       conf -= 0.06; reasons.append("Choppy tape")
-            elif regime == "overbought":   conf -= 0.10; reasons.append("Overbought — late entry risk")
+        # High-beta without volume: penalise
+        if beta > 1.8 and vol < 1.5:
+            conf -= 0.08; reasons.append(f"High beta ({beta}) without volume confirmation")
 
-            if beta > 1.8 and vol < 1.5:  conf -= 0.08; reasons.append(f"High beta ({beta}) without volume")
+        # Regime tailwind
+        if regime == "bull":
+            conf += 0.05; reasons.append("Bull regime tailwind")
+        elif regime == "neutral":
+            pass  # no adjustment
+        # bear is blocked upstream — this code won't run in bear
 
-        elif direction == "SHORT":
-            if rsi > 65:     conf += 0.10; reasons.append(f"RSI {rsi:.0f} overbought")
-            elif rsi < 50:   conf -= 0.08; reasons.append("RSI not elevated — risky short")
-
-            if mom5 < -3:    conf += 0.10; reasons.append(f"Negative momentum {mom5:.1f}%")
-            elif mom5 > 2:   conf -= 0.12; reasons.append("Shorting into positive momentum")
-
-            if vol >= 1.5:   conf += 0.07; reasons.append(f"Volume on downside — distribution")
-            if sector in ("etf","tech") and mom10 > 0:
-                conf -= 0.08; reasons.append("Shorting tech/ETF in uptrend")
-
-        # Earnings risk
-        if p["earnings"] and abs(chg) > 4:
-            conf -= 0.12; reasons.append(f"Large move ({chg:+.1f}%) on earnings-sensitive ticker")
-
-        # Crypto/EV in chop
-        if sector in ("crypto","ev") and regime == "choppy":
-            conf -= 0.10; reasons.append(f"{sector.title()} in choppy tape — noisy")
-
-        # ETF bonus
+        # ETF bonus: reliable technicals
         if sector == "etf":
-            conf += 0.06; reasons.append("ETF — reliable technicals")
+            conf += 0.05; reasons.append("ETF — reliable technicals")
+
+        # Crypto/EV need extra conviction
+        if sector in ("crypto", "ev") and vol < 1.8:
+            conf -= 0.10; reasons.append(f"{sector.title()} — needs volume ≥1.8x to confirm")
+
+        # Earnings gap — large day move on earnings-sensitive stock
+        if abs(chg) > 5 and tq in ("low", "medium"):
+            conf -= 0.08; reasons.append(f"Large move {chg:+.1f}% — may be post-earnings noise")
 
         conf = round(max(0.0, min(1.0, conf)), 3)
         reasoning = p["note"] + " | " + "; ".join(reasons[:3]) if reasons else p["note"]
-        return conf >= CONFIG["min_ai_confidence"], conf, reasoning
-
-    def analyse_option(self, opt, quote, signal):
-        strategy = opt.get("strategy","CSP"); iv = opt.get("iv",30)
-        dte = opt.get("dte",14); otm = opt.get("otm_pct",2.0)
-        prem = opt.get("premium_pct",0); rsi = quote.get("rsi",50)
-        mom5 = quote.get("momentum_5d",0); vol = quote.get("volume_ratio",1.0)
-        p = self._profile(opt["ticker"])
-        reasons = []; conf = 0.52
-
-        if strategy == "CSP":
-            if iv >= self.IV_HIGH:     conf += 0.12; reasons.append(f"IV {iv:.0f}% elevated — rich premium")
-            elif iv >= 30:             conf += 0.06; reasons.append(f"IV {iv:.0f}% moderate")
-            elif iv < self.IV_LOW:     conf -= 0.10; reasons.append(f"IV {iv:.0f}% low — thin premium")
-
-            if otm >= 5:               conf += 0.10; reasons.append(f"{otm:.1f}% OTM — good buffer")
-            elif otm >= 3:             conf += 0.05; reasons.append(f"{otm:.1f}% OTM — moderate buffer")
-            elif otm < 2:              conf -= 0.10; reasons.append(f"Only {otm:.1f}% OTM — assignment risk")
-
-            if prem >= 2:              conf += 0.08; reasons.append(f"{prem:.2f}% premium — attractive")
-            elif prem < 0.8:           conf -= 0.08; reasons.append(f"Only {prem:.2f}% premium — not worth it")
-
-            if rsi < 35:               conf -= 0.10; reasons.append("Stock oversold — downside real")
-            elif rsi > 50:             conf += 0.06; reasons.append("Stock above RSI midpoint — CSP backdrop good")
-
-            if mom5 < -3:              conf -= 0.12; reasons.append(f"Stock downtrending — CSP into falling knife")
-            elif mom5 > 1:             conf += 0.06; reasons.append(f"Stock trending up — CSP aligned")
-
-            if 14 <= dte <= 35:        conf += 0.06; reasons.append(f"{dte} DTE — theta sweet spot")
-            elif dte < 7:              conf -= 0.08; reasons.append(f"{dte} DTE — gamma risk")
-            elif dte > 40:             conf -= 0.04; reasons.append(f"{dte} DTE — capital tied up too long")
-
-            if p["beta"] > 1.8 and otm < 5:
-                conf -= 0.10; reasons.append(f"High beta ({p['beta']}) — needs >5% OTM")
-
-        elif strategy == "CALL":
-            if iv > self.IV_HIGH:      conf -= 0.12; reasons.append(f"IV {iv:.0f}% — long call expensive")
-            elif iv < 30:              conf += 0.10; reasons.append(f"IV {iv:.0f}% — options cheap")
-
-            if mom5 > 4:               conf += 0.12; reasons.append(f"Strong momentum {mom5:+.1f}%")
-            elif mom5 > 2:             conf += 0.06; reasons.append(f"Positive momentum {mom5:+.1f}%")
-            elif mom5 < 0:             conf -= 0.12; reasons.append("Negative momentum — wrong direction")
-
-            if vol >= 2.0:             conf += 0.10; reasons.append(f"Volume surge {vol:.1f}x — institutional buying")
-            elif vol < 1.0:            conf -= 0.06; reasons.append("Low volume — lacks conviction")
-
-            if rsi > 70:               conf -= 0.10; reasons.append(f"RSI {rsi:.0f} overbought — late for call")
-            elif 45 <= rsi <= 65:      conf += 0.06; reasons.append(f"RSI {rsi:.0f} — room to run")
-
-            if dte < 14:               conf -= 0.10; reasons.append(f"Only {dte} DTE — not enough time")
-            elif 21 <= dte <= 45:      conf += 0.06; reasons.append(f"{dte} DTE — enough runway")
-
-        conf = round(max(0.0, min(1.0, conf)), 3)
-        reasoning = "; ".join(reasons[:3]) if reasons else f"{strategy} evaluated"
-        return conf >= CONFIG["min_ai_confidence"], conf, reasoning
+        return conf >= CONFIG["min_confidence"], conf, reasoning
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MODULE 4: WALLET (single source of truth)
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# MODULE 5 — WALLET
+# ══════════════════════════════════════════════════════════════
 class Wallet:
-    """
-    Clean accounting:
-      open_position(cost)  → wallet -= cost
-      close_position(cost, pnl) → wallet += cost + pnl
-      daily_pnl tracks REALIZED pnl from closes only.
-      daily_loss_cap is fixed at 5% of starting budget.
-    """
-
     def __init__(self):
         self.cash           = CONFIG["paper_budget"]
         self.total_pnl      = 0.0
         self.daily_pnl      = 0.0
         self.trades_today   = 0
+        self.wins           = 0
+        self.losses         = 0
         self.last_date      = datetime.now(ET).date().isoformat()
-        self.open_positions = {}   # pos_id → trade dict
+        self.open_positions = {}
         self.trade_history  = []
         self.wallet_history = []
-        self.total_fees     = 0.0  # v4.2: cumulative spread costs
+        self.total_fees     = 0.0
 
-    def reset_daily_if_needed(self):
+    def reset_daily(self):
         today = datetime.now(ET).date().isoformat()
         if today != self.last_date:
             self.daily_pnl    = 0.0
@@ -658,83 +561,78 @@ class Wallet:
             self.last_date    = today
             log.info("[WALLET] Daily reset")
 
-    def can_trade(self, ticker, direction="LONG"):
-        self.reset_daily_if_needed()
-        if self.daily_pnl        <= -DAILY_LOSS_CAP:              return False, f"Daily loss cap hit (${DAILY_LOSS_CAP:.0f})"
+    def can_trade(self, ticker):
+        self.reset_daily()
+        if self.daily_pnl        <= -DAILY_LOSS_CAP:                return False, f"Daily loss cap (${DAILY_LOSS_CAP:.0f})"
         if len(self.open_positions) >= CONFIG["max_open_positions"]: return False, "Max open positions"
-        if self.trades_today     >= CONFIG["max_trades_per_day"]:  return False, "Max trades today"
-        if self.cash             < CONFIG["min_position_size_usd"]: return False, "Wallet too low"
+        if self.trades_today      >= CONFIG["max_trades_per_day"]:   return False, "Max trades today"
+        if self.cash              <  CONFIG["min_position_size_usd"]: return False, "Wallet too low"
         for pos in self.open_positions.values():
-            if pos.get("ticker") == ticker and pos.get("direction") == direction:
-                return False, f"Duplicate: already {direction} {ticker}"
+            if pos.get("ticker") == ticker:
+                return False, f"Already long {ticker}"
         return True, "OK"
 
     def open(self, trade):
-        cost = trade["cost"]
-        # v4.2: deduct entry-side spread (Alpaca $0 commission, spread is real)
-        spread_pct = CONFIG["option_spread_pct"] if trade.get("type") == "option" else CONFIG["stock_spread_pct"]
-        fee = round(cost * spread_pct, 4)
-        self.cash -= cost + fee
-        self.total_fees = round(self.total_fees + fee, 4)
-        trade["entry_fee"] = fee
-        self.trades_today += 1
+        fee = round(trade["cost"] * CONFIG["stock_spread_pct"], 4)
+        self.cash       -= trade["cost"] + fee
+        self.total_fees  = round(self.total_fees + fee, 4)
+        trade["entry_fee"]  = fee
+        trade["peak_price"] = trade["entry_price"]
+        self.trades_today  += 1
         self.open_positions[trade["pos_id"]] = trade
 
-    def close(self, pos_id, pnl):
+    def close(self, pos_id, pnl, reason=""):
         pos = self.open_positions.pop(pos_id, None)
         if not pos:
             return None
-        # v4.2: deduct exit-side spread
-        spread_pct = CONFIG["option_spread_pct"] if pos.get("type") == "option" else CONFIG["stock_spread_pct"]
-        fee = round(pos["cost"] * spread_pct, 4)
+        fee = round(pos["cost"] * CONFIG["stock_spread_pct"], 4)
         pnl = round(pnl - fee, 4)
-        self.total_fees = round(self.total_fees + fee, 4)
         self.cash       += pos["cost"] + pnl
         self.total_pnl  += pnl
         self.daily_pnl  += pnl
-        entry = {**pos, "pnl": round(pnl,4), "exit_fee": fee, "settled_at": datetime.now(ET).isoformat()}
+        self.total_fees  = round(self.total_fees + fee, 4)
+        if pnl > 0:
+            self.wins   += 1
+        else:
+            self.losses += 1
+        entry = {**pos, "pnl": round(pnl, 4), "exit_fee": fee,
+                 "exit_reason": reason,
+                 "settled_at": datetime.now(ET).isoformat()}
         self.trade_history.append(entry)
         return entry
 
-    def position_size(self):
+    def position_size(self, regime, high_vol):
         size = self.cash * CONFIG["max_position_size_pct"]
-        return max(CONFIG["min_position_size_usd"],
-                   min(round(size, 2), CONFIG["max_position_size_usd"]))
-
-    def win_rate(self):
-        closed = [t for t in self.trade_history if "pnl" in t]
-        if not closed: return 0.0
-        return round(sum(1 for t in closed if t["pnl"] > 0) / len(closed) * 100, 1)
-
-    def roi(self):
-        # ROI vs starting budget — clean and consistent
-        return round(self.total_pnl / CONFIG["paper_budget"] * 100, 2)
+        if regime == "bull":
+            size = min(size * 1.15, CONFIG["max_position_size_usd"])
+        if high_vol:
+            size *= 0.75
+        return round(max(CONFIG["min_position_size_usd"],
+                         min(size, CONFIG["max_position_size_usd"])), 2)
 
     def portfolio_value(self, live_prices):
-        """Cash + current market value of all open stock positions."""
-        pos_value = 0.0
+        pos_val = 0.0
         for pos in self.open_positions.values():
-            if pos.get("type") == "option":
-                # Options: just use cost as conservative value (no mark-to-market)
-                pos_value += pos["cost"]
-                continue
-            ticker = pos.get("ticker","").replace("_OPT","")
+            ticker = pos.get("ticker", "")
             live   = live_prices.get(ticker)
             entry  = pos.get("entry_price", 0)
             if live and entry:
-                direction = pos.get("direction","LONG")
-                if direction == "LONG":
-                    pos_value += pos["cost"] * (live / entry)
-                else:  # SHORT: profit when price drops
-                    pos_value += pos["cost"] * (2 - live / entry)
+                pos_val += pos["cost"] * (live / entry)
             else:
-                pos_value += pos["cost"]
-        return round(self.cash + pos_value, 2)
+                pos_val += pos["cost"]
+        return round(self.cash + pos_val, 2)
+
+    def win_rate(self):
+        total = self.wins + self.losses
+        return round(self.wins / total * 100, 1) if total else 0.0
+
+    def roi(self):
+        return round(self.total_pnl / CONFIG["paper_budget"] * 100, 2)
 
     def status(self):
         return (f"Cash: ${self.cash:.2f} | P&L: ${self.total_pnl:+.2f} | "
                 f"Daily: ${self.daily_pnl:+.2f} | Open: {len(self.open_positions)} | "
-                f"Win rate: {self.win_rate():.0f}% | ROI: {self.roi():+.1f}%")
+                f"W/L: {self.wins}/{self.losses} | ROI: {self.roi():+.1f}%")
 
     def to_dict(self):
         return {
@@ -742,11 +640,13 @@ class Wallet:
             "total_pnl":      round(self.total_pnl, 4),
             "daily_pnl":      round(self.daily_pnl, 4),
             "trades_today":   self.trades_today,
+            "wins":           self.wins,
+            "losses":         self.losses,
             "last_date":      self.last_date,
             "open_positions": self.open_positions,
             "trade_history":  self.trade_history[-500:],
             "wallet_history": self.wallet_history[-500:],
-            "total_fees":     round(self.total_fees, 4),  # v4.2
+            "total_fees":     round(self.total_fees, 4),
         }
 
     def load_dict(self, d):
@@ -754,16 +654,18 @@ class Wallet:
         self.total_pnl      = d.get("total_pnl", 0.0)
         self.daily_pnl      = d.get("daily_pnl", 0.0)
         self.trades_today   = d.get("trades_today", 0)
+        self.wins           = d.get("wins", 0)
+        self.losses         = d.get("losses", 0)
         self.last_date      = d.get("last_date", datetime.now(ET).date().isoformat())
         self.open_positions = d.get("open_positions", {})
         self.trade_history  = d.get("trade_history", [])
         self.wallet_history = d.get("wallet_history", [])
-        self.total_fees     = d.get("total_fees", 0.0)  # v4.2
+        self.total_fees     = d.get("total_fees", 0.0)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MODULE 5: PENDING MANAGER
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# MODULE 6 — PENDING MANAGER
+# ══════════════════════════════════════════════════════════════
 class PendingManager:
 
     def load(self):
@@ -778,7 +680,7 @@ class PendingManager:
             with open(CONFIG["pending_file"], "w") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
-            log.warning(f"Pending save failed: {e}")
+            log.warning("Pending save failed: %s", e)
 
     def add(self, trade):
         data = self.load()
@@ -793,12 +695,12 @@ class PendingManager:
             "status": "PENDING",
         })
         self.save(data)
-        log.info(f"  [PENDING] {trade['ticker']} {trade['direction']} — {trade['ai_confidence']:.0%}")
+        log.info("  [PENDING] %s | conf %.0f%%", trade["ticker"], trade["confidence"] * 100)
 
     def get_approved(self):
         data     = self.load()
         approved = [p for p in data.get("pending", []) if p.get("status") == "APPROVED"]
-        approved += [p for p in data.get("approved", []) if p.get("status") == "APPROVED"]
+        approved += data.get("approved", [])
         data["approved"] = []
         data["pending"]  = [p for p in data.get("pending", []) if p.get("status") != "APPROVED"]
         self.save(data)
@@ -814,7 +716,7 @@ class PendingManager:
         ]
         removed = before - len(data["pending"])
         if removed:
-            log.info(f"  [PENDING] {removed} expired")
+            log.info("  [PENDING] %d expired", removed)
             self.save(data)
         return data["pending"]
 
@@ -822,9 +724,9 @@ class PendingManager:
         return len(self.load().get("pending", []))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MODULE 6: STATE
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# MODULE 7 — STATE
+# ══════════════════════════════════════════════════════════════
 class State:
     @staticmethod
     def save(wallet):
@@ -832,7 +734,7 @@ class State:
             with open(CONFIG["state_file"], "w") as f:
                 json.dump(wallet.to_dict(), f, indent=2)
         except Exception as e:
-            log.warning(f"State save failed: {e}")
+            log.warning("State save failed: %s", e)
 
     @staticmethod
     def load():
@@ -843,35 +745,26 @@ class State:
             return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 # MAIN BOT
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 class JacobBot:
 
     def __init__(self):
-        self.market        = MarketData()
-        self.scorer        = SignalScorer()
-        self.rules         = RulesEngine()
-        self.regime_engine = MarketRegime(self.market)
+        self.market         = MarketData()
+        self.scorer         = SignalScorer()
+        self.rules          = RulesEngine()
+        self.regime_engine  = MarketRegime(self.market)
+        self.wallet         = Wallet()
+        self.pending        = PendingManager()
+        self.scan_count     = 0
+        self.rules_evals    = 0
         self.current_regime = "neutral"
         self.regime_spy5    = 0.0
         self.regime_qqq5    = 0.0
-        self.wallet   = Wallet()
-        self.pending  = PendingManager()
-        self.scan_count  = 0
-        self.rules_evals = 0
-        self.next_scan_at = None
+        self.next_scan_at   = None
         self._load_state()
-
-        # CSV log
-        try:
-            with open(CONFIG["csv_file"], "x", newline="") as f:
-                csv.writer(f).writerow([
-                    "timestamp","ticker","type","direction","entry_price",
-                    "strike","expiry","cost","ai_confidence","ai_reasoning","pnl","status"
-                ])
-        except FileExistsError:
-            pass
+        self._init_csv()
 
     def _load_state(self):
         d = State.load()
@@ -879,242 +772,152 @@ class JacobBot:
             log.info("[INIT] Fresh start — $%.2f", CONFIG["paper_budget"])
             return
         self.wallet.load_dict(d)
-        log.info("[INIT] Loaded | cash=$%.2f | total_pnl=$%+.2f | open=%d",
+        log.info("[INIT] Loaded | cash=$%.2f | pnl=$%+.2f | open=%d",
                  self.wallet.cash, self.wallet.total_pnl, len(self.wallet.open_positions))
 
-    def _pos_id(self, ticker, trade_type):
-        return f"{ticker}_{trade_type}_{int(time.time())}"
+    def _init_csv(self):
+        try:
+            with open(CONFIG["csv_file"], "x", newline="") as f:
+                csv.writer(f).writerow([
+                    "timestamp", "ticker", "direction", "entry_price",
+                    "cost", "confidence", "reasoning", "exit_reason", "pnl", "mode",
+                ])
+        except FileExistsError:
+            pass
 
     def _log_csv(self, trade, pnl=None):
         try:
             with open(CONFIG["csv_file"], "a", newline="") as f:
                 csv.writer(f).writerow([
                     datetime.now(ET).isoformat(),
-                    trade.get("ticker",""), trade.get("type","stock"),
-                    trade.get("direction","LONG"),
-                    trade.get("entry_price", trade.get("price",0)),
-                    trade.get("strike",""), trade.get("expiry",""),
-                    trade.get("cost",0), trade.get("ai_confidence",0),
-                    str(trade.get("ai_reasoning",""))[:100],
+                    trade.get("ticker", ""), "LONG",
+                    trade.get("entry_price", 0),
+                    trade.get("cost", 0),
+                    trade.get("confidence", 0),
+                    str(trade.get("reasoning", ""))[:120],
+                    trade.get("exit_reason", "") if pnl is not None else "",
                     pnl if pnl is not None else "",
                     "PAPER" if CONFIG["dry_run"] else "LIVE",
                 ])
         except Exception as e:
-            log.debug(f"CSV log failed: {e}")
+            log.debug("CSV log failed: %s", e)
+
+    def _pos_id(self, ticker):
+        return f"{ticker}_{int(time.time())}"
 
     def _place_trade(self, trade, source="AUTO", premarket=False):
-        """Place a trade. Blocked before 9:30am ET (premarket=True)."""
         if premarket:
-            log.info(f"  [PRE-MARKET] {trade['ticker']} queued — will place at open")
-            # Add to pending instead
-            trade["pos_id"] = self._pos_id(trade["ticker"], trade.get("type","stock"))
+            trade["pos_id"] = self._pos_id(trade["ticker"])
             self.pending.add(trade)
+            log.info("  [PRE-MARKET] %s queued — will place at open", trade["ticker"])
             return False
 
-        direction = trade.get("direction","LONG")
-        ok, reason = self.wallet.can_trade(trade["ticker"], direction)
+        ok, reason = self.wallet.can_trade(trade["ticker"])
         if not ok:
-            log.info(f"  Blocked: {reason}")
+            log.info("  [BLOCKED] %s: %s", trade["ticker"], reason)
             return False
 
-        trade["pos_id"]    = self._pos_id(trade["ticker"], trade.get("type","stock"))
+        trade["pos_id"]    = self._pos_id(trade["ticker"])
         trade["opened_at"] = datetime.now(ET).isoformat()
         trade["source"]    = source
         trade["status"]    = "OPEN"
-
         self.wallet.open(trade)
         self._log_csv(trade)
-        log.info("  [%s/%s] %s %s $%.2f | %s | conf %.0f%%",
+        log.info("  [%s/%s] LONG %s $%.2f @ $%.4f | conf %.0f%%",
                  "PAPER" if CONFIG["dry_run"] else "LIVE", source,
-                 trade["ticker"], direction, trade["cost"],
-                 trade.get("type","stock"), trade.get("ai_confidence",0)*100)
+                 trade["ticker"], trade["cost"], trade["entry_price"],
+                 trade.get("confidence", 0) * 100)
         return True
 
     def _get_live_prices(self):
-        """Fetch current prices for all open stock positions."""
         prices = {}
         for pos in self.wallet.open_positions.values():
-            if pos.get("type") == "option":
-                continue
-            ticker = pos.get("ticker","").replace("_OPT","")
+            ticker = pos.get("ticker", "")
             if ticker and ticker not in prices:
                 p = self.market.get_live_price(ticker)
                 if p:
                     prices[ticker] = p
         return prices
 
-    def _check_stop_losses(self, live_prices):
+    def _check_exits(self, live_prices, scan_quotes):
         """
-        v3 stop logic (per position, in priority order):
-          1. Hard stop loss      — position down >8% from entry
-          2. Quick cut           — down >4% within first 24h (fast losers out early)
-          3. Trailing stop       — armed at +3%, fires at -2% from peak
-          4. Standard close      — position expired (handled in _settle_positions)
-        Also updates peak_price on winning positions each scan.
+        Signal-based exits (checked every scan):
+          1. Take-profit: live price >= entry * (1 + tp_pct)
+          2. RSI overbought: daily RSI > rsi_exit
+          3. Hard stop loss: live price <= entry * (1 - sl_pct)
+          4. Quick cut: down >5% in first 24h
+          5. Trailing stop: armed at +2.5%, fires at -1.5% from peak
+          6. Max hold: age >= max_hold_days
         """
         now = datetime.now(ET)
         for pos_id in list(self.wallet.open_positions.keys()):
-            pos = self.wallet.open_positions.get(pos_id)
-            if not pos or pos.get("type") == "option":
+            pos    = self.wallet.open_positions.get(pos_id)
+            if not pos:
                 continue
-            ticker    = pos.get("ticker", "").replace("_OPT", "")
-            direction = pos.get("direction", "LONG")
-            entry     = pos.get("entry_price", 0)
-            live      = live_prices.get(ticker)
+            ticker = pos.get("ticker", "")
+            entry  = pos.get("entry_price", 0)
+            live   = live_prices.get(ticker)
             if not live or not entry:
                 continue
 
-            move = (live - entry) / entry
-            gain = move if direction == "LONG" else -move  # positive = winning
+            gain = (live - entry) / entry
+            cost = pos["cost"]
+            pnl  = round(cost * gain, 4)
 
-            # Update peak price for trailing stop
+            # Update peak for trailing stop
             peak = pos.get("peak_price", entry)
-            if direction == "LONG":
-                new_peak = max(peak, live)
-            else:
-                new_peak = min(peak, live) if peak != entry else live
-            pos["peak_price"] = new_peak
+            if live > peak:
+                pos["peak_price"] = peak = live
 
-            # Age of position in hours
+            # Age in hours
             try:
-                age_hrs = (now - datetime.fromisoformat(pos.get("opened_at","")).astimezone(ET)).total_seconds() / 3600
+                age_hrs = (now - datetime.fromisoformat(
+                    pos.get("opened_at", "")).astimezone(ET)
+                ).total_seconds() / 3600
             except:
                 age_hrs = 999
 
-            stop_reason = None
-            pnl         = round(pos["cost"] * gain, 4)
+            exit_reason = None
 
-            # 1. Hard stop loss
-            if gain <= -CONFIG["stop_loss_pct"]:
-                stop_reason = f"STOP LOSS {gain*100:.1f}%"
+            # 1. Take-profit
+            if gain >= CONFIG["take_profit_pct"]:
+                exit_reason = f"TP +{gain*100:.1f}%"
 
-            # 2. Quick cut — down >4% in first 24h
-            elif gain <= -CONFIG["quick_cut_pct"] and age_hrs < 24:
-                stop_reason = f"QUICK CUT {gain*100:.1f}% <24h"
+            # 2. RSI overbought (from scan quote if available)
+            elif ticker in scan_quotes:
+                q_rsi = scan_quotes[ticker].get("rsi", 50)
+                if q_rsi > CONFIG["rsi_exit"] and gain > 0:
+                    exit_reason = f"RSI_OB {q_rsi:.0f}"
 
-            # 3. Trailing stop — only arm if ever up >3%
-            elif gain > 0:
-                peak_gain = (new_peak - entry) / entry if direction == "LONG" else (entry - new_peak) / entry
+            # 3. Hard stop
+            if not exit_reason and gain <= -CONFIG["stop_loss_pct"]:
+                exit_reason = f"STOP {gain*100:.1f}%"
+
+            # 4. Quick cut — down >5% in first 24h
+            elif not exit_reason and gain <= -CONFIG["quick_cut_pct"] and age_hrs < 24:
+                exit_reason = f"QUICK_CUT {gain*100:.1f}% @{age_hrs:.0f}h"
+
+            # 5. Trailing stop
+            elif not exit_reason and gain > 0:
+                peak_gain = (peak - entry) / entry
                 if peak_gain >= CONFIG["trail_arm_pct"]:
-                    # How much has it given back from peak?
-                    if direction == "LONG":
-                        pullback = (new_peak - live) / new_peak
-                    else:
-                        pullback = (live - new_peak) / new_peak
+                    pullback = (peak - live) / peak
                     if pullback >= CONFIG["trail_fire_pct"]:
-                        stop_reason = f"TRAIL STOP peak={peak_gain*100:.1f}% pullback={pullback*100:.1f}%"
+                        exit_reason = f"TRAIL peak={peak_gain*100:.1f}% pb={pullback*100:.1f}%"
 
-            if stop_reason:
-                settled = self.wallet.close(pos_id, pnl)
+            # 6. Max hold safety net
+            elif not exit_reason and age_hrs >= CONFIG["max_hold_days"] * 24:
+                exit_reason = f"MAX_HOLD {age_hrs/24:.1f}d"
+
+            if exit_reason:
+                settled = self.wallet.close(pos_id, pnl, exit_reason)
                 if settled:
                     State.save(self.wallet)
-                    log.warning("  [%s] %s %s | P&L: $%+.2f | Cash: $%.2f",
-                                stop_reason, ticker, direction, pnl, self.wallet.cash)
+                    log.info("  [EXIT] %s %s | P&L: $%+.2f | cash=$%.2f",
+                             ticker, exit_reason, pnl, self.wallet.cash)
                     self._log_csv(pos, pnl=pnl)
 
-    def _settle_positions(self, live_prices):
-        """
-        Settle positions past their hold period using REAL current price.
-        No random simulation — actual P&L based on where the stock is now.
-        Options use simplified settlement (premium collected/lost).
-        """
-        for pos_id in list(self.wallet.open_positions.keys()):
-            pos      = self.wallet.open_positions.get(pos_id)
-            if not pos:
-                continue
-            opened   = pos.get("opened_at","")
-            pos_type = pos.get("type","stock")
-            hold_days = CONFIG["options_hold_days"] if pos_type == "option" else CONFIG["stock_hold_days"]
-            try:
-                age_hrs = (datetime.now(ET) - datetime.fromisoformat(opened).astimezone(ET)).total_seconds() / 3600
-                if age_hrs < hold_days * 24:
-                    continue
-            except:
-                continue
-
-            ticker    = pos.get("ticker","").replace("_OPT","")
-            direction = pos.get("direction","LONG")
-            entry     = pos.get("entry_price",0)
-            cost      = pos.get("cost",0)
-
-            if pos_type == "option":
-                # v4: Realistic options settlement using theta decay + intrinsic value.
-                # Uses strike, expiry, DTE stored on the position at entry.
-                strategy   = direction  # "CSP" or "CALL"
-                live_stock = live_prices.get(ticker) or self.market.get_live_price(ticker)
-                strike     = pos.get("strike", 0)
-
-                if not live_stock or not strike:
-                    # No price data — confidence-weighted fallback
-                    conf = pos.get("ai_confidence", 0.60)
-                    won  = random.random() < conf
-                    pnl  = round(cost * 0.5 if won else -cost * 0.5, 4)
-                else:
-                    # Theta ratio: how much of the option's life has elapsed
-                    try:
-                        opened_dt    = datetime.fromisoformat(pos.get("opened_at","")).astimezone(ET)
-                        elapsed_days = max(1, (datetime.now(ET) - opened_dt).days)
-                        original_dte = max(pos.get("dte", 14), 1)
-                        theta_ratio  = min(elapsed_days / original_dte, 1.0)
-                    except:
-                        theta_ratio = 0.5
-
-                    # IV scaling — higher IV means more extrinsic value in play
-                    iv_scale = min(max(pos.get("iv", 30) / 30.0, 0.5), 2.0)
-
-                    if strategy == "CSP":
-                        # Short put: we SOLD the put, collecting premium.
-                        # Win: stock stays above strike → keep theta-decayed premium.
-                        # Loss: stock falls below strike → assignment = buy at strike.
-                        if live_stock >= strike:
-                            # OTM: keep portion of premium proportional to theta elapsed
-                            # (theta decay is faster near expiry, simplified as linear here)
-                            pnl = round(cost * theta_ratio * 0.88, 4)
-                        else:
-                            # ITM: net loss = (strike - stock) offset by premium collected
-                            itm_pct    = (strike - live_stock) / strike
-                            raw_loss   = itm_pct * iv_scale         # leverage to ITM depth
-                            premium_offset = pos.get("premium_pct", 1.5) / 100  # premium as % of strike
-                            net_loss   = max(0.0, raw_loss - premium_offset)     # premium softens blow
-                            pnl        = round(-cost * min(net_loss * 3.0, 1.2), 4)
-
-                    elif strategy == "CALL":
-                        # Long call: we BOUGHT the call, paying premium.
-                        # Win: stock rises above strike → intrinsic value + remaining time value.
-                        # Loss: stock stays below → theta erodes premium to zero.
-                        if live_stock > strike:
-                            # ITM: intrinsic value × delta (approx) + remaining time value
-                            intrinsic   = (live_stock - strike) / strike
-                            # Delta ≈ 0.5 ATM, higher deeper ITM (capped at 0.85)
-                            moneyness   = (live_stock - strike) / (strike * max(pos.get("iv", 30) / 100, 0.1))
-                            delta       = min(0.5 + moneyness * 0.3, 0.85)
-                            time_value  = max(0, (1 - theta_ratio) * 0.4)  # erodes linearly
-                            pnl         = round(cost * (intrinsic * delta + time_value), 4)
-                        else:
-                            # OTM: theta eats the premium — total loss at expiry
-                            pnl = round(-cost * theta_ratio * 0.90, 4)
-                    else:
-                        pnl = 0.0
-            else:
-                # Stock: use real current price
-                live = live_prices.get(ticker) or self.market.get_live_price(ticker)
-                if live and entry:
-                    move = (live - entry) / entry
-                    pnl  = round(cost * (move if direction == "LONG" else -move), 4)
-                else:
-                    # No price available — skip, try next scan
-                    log.debug(f"  [SETTLE] No price for {ticker} — skipping")
-                    continue
-
-            settled = self.wallet.close(pos_id, pnl)
-            if settled:
-                State.save(self.wallet)
-                sign = "+" if pnl >= 0 else ""
-                log.info("  [SETTLED] %s %s | P&L: %s$%.2f | Cash: $%.2f",
-                         ticker, direction, sign, pnl, self.wallet.cash)
-                self._log_csv(pos, pnl=pnl)
-
-    def _write_dashboard(self, mood, scan_results, pending_bets, live_prices):
+    def _write_dashboard(self, mood, scan_results, pending_bets, live_prices, regime, spy5, qqq5):
         try:
             portfolio_val = self.wallet.portfolio_value(live_prices)
             self.wallet.wallet_history.append({
@@ -1127,45 +930,48 @@ class JacobBot:
             open_list = []
             for pos_id, pos in self.wallet.open_positions.items():
                 enriched = {**pos, "pos_id": pos_id}
-                ticker   = pos.get("ticker","").replace("_OPT","")
+                ticker   = pos.get("ticker", "")
                 live     = live_prices.get(ticker)
-                if live:
-                    enriched["live_price"] = round(live, 2)
-                    entry = pos.get("entry_price", 0)
-                    if entry and pos.get("type","stock") != "option":
-                        diff     = live - entry
-                        diff_pct = diff / entry * 100 if entry else 0
-                        enriched["live_diff"]     = round(diff, 2)
-                        enriched["live_diff_pct"] = round(diff_pct, 2)
+                entry    = pos.get("entry_price", 0)
+                if live and entry:
+                    enriched["live_price"]    = round(live, 2)
+                    enriched["live_diff"]     = round(live - entry, 2)
+                    enriched["live_diff_pct"] = round((live - entry) / entry * 100, 2)
+                    enriched["tp_price"]      = round(entry * (1 + CONFIG["take_profit_pct"]), 4)
+                    enriched["sl_price"]      = round(entry * (1 - CONFIG["stop_loss_pct"]), 4)
                 open_list.append(enriched)
 
             with open(CONFIG["dashboard_file"], "w") as f:
                 json.dump({
+                    "version":        "v5",
                     "lastScan":       datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
                     "mode":           "PAPER" if CONFIG["dry_run"] else "LIVE",
                     "mood":           mood,
                     "quote":          random.choice(QUOTES.get(mood, QUOTES["watching"])),
-                    "art":            random.choice(ART.get(mood, ART["watching"])),
                     "wallet":         round(self.wallet.cash, 2),
                     "portfolioValue": portfolio_val,
                     "openValue":      round(portfolio_val - self.wallet.cash, 2),
                     "startingBudget": CONFIG["paper_budget"],
                     "totalPnl":       round(self.wallet.total_pnl, 4),
                     "dailyPnl":       round(self.wallet.daily_pnl, 4),
+                    "wins":           self.wallet.wins,
+                    "losses":         self.wallet.losses,
                     "winRate":        self.wallet.win_rate(),
                     "roi":            self.wallet.roi(),
                     "tradesTotal":    len(self.wallet.trade_history),
-                    "totalFees":      round(self.wallet.total_fees, 4),  # v4.2
+                    "totalFees":      round(self.wallet.total_fees, 4),
                     "openCount":      len(self.wallet.open_positions),
                     "scanCount":      self.scan_count,
                     "rulesEvals":     self.rules_evals,
-                    "engineMode":     "rules",
-                    "regime":         getattr(self, "current_regime", "neutral"),
-                    "regimeSpy5":     round(getattr(self, "regime_spy5", 0), 2),
-                    "regimeQqq5":     round(getattr(self, "regime_qqq5", 0), 2),
-                    "aiCostEstimate": 0,
+                    "regime":         regime,
+                    "regimeSpy5":     round(spy5, 2),
+                    "regimeQqq5":     round(qqq5, 2),
                     "pendingCount":   len(pending_bets),
                     "nextScanAt":     self.next_scan_at,
+                    "tpPct":          CONFIG["take_profit_pct"] * 100,
+                    "slPct":          CONFIG["stop_loss_pct"] * 100,
+                    "rsiEntry":       CONFIG["rsi_entry"],
+                    "rsiExit":        CONFIG["rsi_exit"],
                     "scanResults":    scan_results[:20],
                     "openPositions":  open_list,
                     "recentTrades":   self.wallet.trade_history[-20:],
@@ -1173,149 +979,143 @@ class JacobBot:
                     "walletHistory":  self.wallet.wallet_history[-500:],
                 }, f, indent=2)
         except Exception as e:
-            log.warning(f"Dashboard write failed: {e}")
+            log.warning("Dashboard write failed: %s", e)
 
     def run_once(self, premarket=False):
         self.scan_count += 1
-        self.wallet.reset_daily_if_needed()
+        self.wallet.reset_daily()
 
-        log.info("=" * 60)
-        log.info("  JACOB v4 #%d | %s%s | %s",
+        log.info("=" * 64)
+        log.info("  JACOB v5 #%d | %s%s | %s",
                  self.scan_count,
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  " [PRE-MARKET]" if premarket else "",
                  datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"))
         log.info("  %s", self.wallet.status())
-        log.info("=" * 60)
+        log.info("=" * 64)
 
-        # ── Step 1: Get live prices for open positions ──
-        live_prices = self._get_live_prices()
-
-        # ── Step 2: Settle old positions (uses real prices) ──
-        self._settle_positions(live_prices)
-
-        # ── Step 3: Stop loss check ──
-        live_prices = self._get_live_prices()  # refresh after settlements
-        self._check_stop_losses(live_prices)
-
-        # ── Step 3b: Market regime ──
+        # ── 1. Market regime ───────────────────────────────────────
         regime, spy5, qqq5 = self.regime_engine.get()
         self.current_regime = regime
         self.regime_spy5    = spy5
         self.regime_qqq5    = qqq5
         high_vol = self.regime_engine.high_vol_day
 
-        # ── Step 4: Process approved pending ──
+        # ── 2. Live prices + signal-based exits ───────────────────
+        live_prices = self._get_live_prices()
+        scan_quotes = {}  # built up during ticker scan below
+
+        # Run exits with whatever live prices we have first
+        self._check_exits(live_prices, scan_quotes)
+        live_prices = self._get_live_prices()  # refresh after exits
+
+        # ── 3. Process approved pending ───────────────────────────
         for trade in self.pending.get_approved():
-            log.info(f"  [HUMAN APPROVED] {trade['ticker']} {trade.get('direction','?')}")
+            log.info("  [HUMAN APPROVED] %s", trade["ticker"])
             self._place_trade(trade, source="HUMAN", premarket=premarket)
 
-        # ── Step 5: Expire stale pending ──
+        # ── 4. Expire stale pending ───────────────────────────────
         current_pending = self.pending.expire_old()
         pending_tickers = {p.get("ticker") for p in current_pending}
 
-        # ── Step 6: Scan watchlist ──
+        # ── 5. Scan watchlist ─────────────────────────────────────
         scan_results  = []
         trades_placed = 0
         pending_added = 0
 
         for ticker in CONFIG["watchlist"]:
-            log.info(f"  Scanning {ticker}...")
-            quote  = self.market.get_quote(ticker)
+            log.info("  Scanning %s...", ticker)
+            quote = self.market.get_quote(ticker)
+            if not quote:
+                log.info("  %s: no data — skip", ticker)
+                scan_results.append({"ticker": ticker, "action": "skip",
+                                     "skip_reason": "No data"})
+                continue
+
+            live_prices[ticker] = quote["price"]
+            scan_quotes[ticker] = quote
             signal = self.scorer.score(quote)
-            live_prices[ticker] = quote["price"]  # collect prices as we scan
 
             result = {
                 "ticker":       ticker,
                 "price":        quote["price"],
                 "change_pct":   quote["change_pct"],
                 "rsi":          quote["rsi"],
+                "ma50":         quote.get("ma50"),
+                "above_ma50":   quote.get("above_ma50", False),
                 "momentum_5d":  quote["momentum_5d"],
                 "volume_ratio": quote["volume_ratio"],
-                "direction":    signal["direction"],
+                "direction":    "LONG",
                 "score":        signal["score"],
                 "signals":      signal["signals"],
-                "ai_confidence":0.0,
-                "ai_reasoning": "",
+                "confidence":   0.0,
+                "reasoning":    "",
                 "action":       "skip",
             }
 
+            # Gate 1: MA50
+            if not quote.get("above_ma50", False):
+                result["skip_reason"] = f"Below MA50 (${quote.get('ma50',0):.2f})"
+                scan_results.append(result)
+                time.sleep(0.3)
+                continue
+
+            # Gate 2: Score
             if signal["score"] < CONFIG["score_threshold"]:
                 result["skip_reason"] = f"Score {signal['score']} < {CONFIG['score_threshold']}"
                 scan_results.append(result)
+                time.sleep(0.3)
                 continue
 
-            # v3/v4: Regime gate
-            sig_dir = signal["direction"]
-            if regime == "bear" and sig_dir == "LONG":
+            # Gate 3: Bear regime — no new longs
+            if regime == "bear":
                 result["action"]      = "skip"
-                result["skip_reason"] = f"BEAR market — longs blocked (SPY 5d={spy5:+.1f}%)"
+                result["skip_reason"] = f"BEAR regime — no new longs (SPY 5d={spy5:+.1f}%)"
                 scan_results.append(result)
-                continue
-            if regime == "bull" and sig_dir == "SHORT":
-                result["action"]      = "skip"
-                result["skip_reason"] = f"BULL market — shorts blocked (SPY 5d={spy5:+.1f}%)"
-                scan_results.append(result)
+                time.sleep(0.3)
                 continue
 
-            ok, reason = self.wallet.can_trade(ticker, signal["direction"])
+            # Gate 4: Wallet capacity
+            ok, reason = self.wallet.can_trade(ticker)
             if not ok:
                 result["action"]      = "blocked"
                 result["skip_reason"] = reason
                 scan_results.append(result)
+                time.sleep(0.3)
                 continue
 
-            # v4.1: Sector concentration guard
-            _sector = self.rules.PROFILES.get(ticker, {}).get("sector", "unknown")
-            _sector_count = sum(
-                1 for _p in self.wallet.open_positions.values()
-                if self.rules.PROFILES.get(
-                    _p.get("ticker","").replace("_OPT",""), {}
-                ).get("sector","") == _sector
+            # Gate 5: Sector concentration
+            sector = self.rules.PROFILES.get(ticker, {}).get("sector", "unknown")
+            sector_count = sum(
+                1 for p in self.wallet.open_positions.values()
+                if self.rules.PROFILES.get(p.get("ticker", ""), {}).get("sector") == sector
             )
-            if _sector_count >= CONFIG["max_per_sector"]:
+            if sector_count >= CONFIG["max_per_sector"]:
                 result["action"]      = "skip"
-                result["skip_reason"] = f"Sector cap: {_sector_count}/{CONFIG["max_per_sector"]} {_sector} positions"
+                result["skip_reason"] = f"Sector cap: {sector_count}/{CONFIG['max_per_sector']} {sector}"
                 scan_results.append(result)
+                time.sleep(0.3)
                 continue
 
-            confirmed, confidence, reasoning = self.rules.analyse_stock(quote, signal)
+            # Rules engine analysis
+            confirmed, confidence, reasoning = self.rules.analyse(quote, signal, regime)
             self.rules_evals += 1
+            result["confidence"] = round(confidence, 2)
+            result["reasoning"]  = reasoning
 
-            # v4: Regime confidence adjustment — regime tail/headwinds
-            if regime == "bear" and sig_dir == "SHORT":
-                confidence = min(1.0, confidence + 0.07)
-                reasoning += " | Bear regime: short tailwind"
-            elif regime == "bull" and sig_dir == "LONG":
-                confidence = min(1.0, confidence + 0.05)
-                reasoning += " | Bull regime: long tailwind"
-            elif regime == "neutral" and sig_dir == "SHORT":
-                # Shorting into neutral tape: slight penalty — needs strong signal
-                confidence = max(0.0, confidence - 0.04)
-
-            result["ai_confidence"] = round(confidence, 2)
-            result["ai_reasoning"]  = reasoning
-
-            # v3: adjust size by regime and volatility
-            size = self.wallet.position_size()
-            if regime == "bull":
-                size = min(size * 1.2, CONFIG["max_position_size_usd"])
-            elif regime == "bear":
-                size = size * 0.8
-            if high_vol:
-                size = size * 0.7   # reduce on high-vol days
-            size = round(max(CONFIG["min_position_size_usd"], size), 2)
+            size = self.wallet.position_size(regime, high_vol)
             trade = {
-                "ticker":        ticker,
-                "type":          "stock",
-                "direction":     signal["direction"],
-                "price":         quote["price"],
-                "entry_price":   quote["price"],
-                "cost":          size,
-                "ai_confidence": round(confidence, 2),
-                "ai_reasoning":  reasoning,
-                "score":         signal["score"],
-                "signals":       signal["signals"],
+                "ticker":       ticker,
+                "direction":    "LONG",
+                "price":        quote["price"],
+                "entry_price":  quote["price"],
+                "cost":         size,
+                "confidence":   round(confidence, 2),
+                "reasoning":    reasoning,
+                "score":        signal["score"],
+                "signals":      signal["signals"],
+                "ma50":         quote.get("ma50"),
+                "rsi_entry":    quote["rsi"],
             }
 
             if confirmed and confidence >= CONFIG["auto_trade_confidence"]:
@@ -1324,144 +1124,94 @@ class JacobBot:
                 if placed:
                     trades_placed += 1
             elif confidence >= CONFIG["pending_confidence"] and ticker not in pending_tickers:
-                trade["pos_id"] = self._pos_id(ticker, "stock")
+                trade["pos_id"] = self._pos_id(ticker)
                 self.pending.add(trade)
                 pending_tickers.add(ticker)
                 result["action"] = "pending"
-                pending_added += 1
+                pending_added   += 1
             else:
                 result["action"]      = "skip"
                 result["skip_reason"] = f"Low confidence ({confidence:.0%})"
 
-            # Options scan
-            if (CONFIG["options_enabled"] and
-                    signal["score"] >= CONFIG["options_score_min"] and
-                    confidence >= CONFIG["options_conf_min"]):
-                self._scan_options(ticker, quote, signal, confidence,
-                                   scan_results, pending_tickers, premarket)
-
             scan_results.append(result)
             time.sleep(0.4)
 
-        # ── Step 7: Save state & dashboard ──
+        # ── 6. Re-check exits with updated scan quotes ────────────
+        self._check_exits(live_prices, scan_quotes)
+        live_prices = self._get_live_prices()
+
+        # ── 7. Save + dashboard ───────────────────────────────────
         State.save(self.wallet)
         current_pending = self.pending.load().get("pending", [])
 
-        if trades_placed > 0:  mood = "hunting"
-        elif pending_added > 0: mood = "pending"
-        elif any(r["score"] >= 55 for r in scan_results): mood = "watching"
-        else: mood = "sleeping"
+        if trades_placed > 0:
+            mood = "hunting"
+        elif any(t["exit_reason"].startswith("TP") or t["exit_reason"].startswith("RSI_OB")
+                 for t in self.wallet.trade_history[-trades_placed - 3:] if "exit_reason" in t):
+            mood = "exiting"
+        elif pending_added > 0:
+            mood = "pending"
+        elif regime == "bear":
+            mood = "sleeping"
+        elif any(r["score"] >= 58 for r in scan_results):
+            mood = "watching"
+        else:
+            mood = "sleeping"
 
         log.info("\nScan done | tickers=%d | trades=%d | pending=%d | %s\n",
                  len(scan_results), trades_placed, pending_added, self.wallet.status())
 
-        self._write_dashboard(mood, scan_results, current_pending, live_prices)
+        self._write_dashboard(mood, scan_results, current_pending,
+                              live_prices, regime, spy5, qqq5)
 
-    def _scan_options(self, ticker, quote, signal, stock_conf,
-                      scan_results, pending_tickers, premarket):
-        opts = self.market.get_options_chain(ticker)
-        if not opts:
-            return
-        best = opts[0]
-        if best["premium_pct"] < CONFIG["csp_min_premium_pct"]:
-            return
-
-        confirmed, confidence, reasoning = self.rules.analyse_option(best, quote, signal)
-        self.rules_evals += 1
-
-        size    = max(CONFIG["min_position_size_usd"],
-                      min(self.wallet.position_size() * 0.5, 25.0))
-        opt_key = f"{ticker}_OPT"
-        trade   = {
-            "ticker":        opt_key,
-            "type":          "option",
-            "direction":     best["strategy"],
-            "price":         quote["price"],
-            "entry_price":   best["mid"],
-            "strike":        best["strike"],
-            "expiry":        best["expiry"],
-            "dte":           best["dte"],
-            "iv":            best["iv"],
-            "premium_pct":   best["premium_pct"],
-            "cost":          round(size, 2),
-            "ai_confidence": round(confidence, 2),
-            "ai_reasoning":  reasoning,
-        }
-
-        opt_result = {
-            "ticker":       f"{ticker} OPT",
-            "price":        quote["price"],
-            "change_pct":   quote["change_pct"],
-            "rsi":          quote["rsi"],
-            "direction":    best["strategy"],
-            "score":        signal["score"],
-            "signals":      [f"{best['strategy']}: ${best['strike']} {best['expiry']} | "
-                             f"{best['premium_pct']:.2f}% prem | IV {best['iv']:.0f}%"],
-            "ai_confidence":round(confidence, 2),
-            "ai_reasoning": reasoning,
-            "action":       "skip",
-        }
-
-        ok, reason = self.wallet.can_trade(opt_key, best["strategy"])
-        if not ok:
-            opt_result["action"] = "blocked"
-            scan_results.append(opt_result)
-            return
-
-        if confirmed and confidence >= CONFIG["auto_trade_confidence"]:
-            placed = self._place_trade(trade, source="AUTO", premarket=premarket)
-            opt_result["action"] = "trade" if placed else "blocked"
-        elif confidence >= CONFIG["pending_confidence"] and opt_key not in pending_tickers:
-            trade["pos_id"] = self._pos_id(opt_key, "option")
-            self.pending.add(trade)
-            pending_tickers.add(opt_key)
-            opt_result["action"] = "pending"
-
-        scan_results.append(opt_result)
-
-    # ── Market hours helpers ──────────────────────────────────────────────────
-
+    # ── Market hours ─────────────────────────────────────────────────────────
     def _market_open(self):
         now = datetime.now(ET)
-        if now.weekday() >= 5: return False
-        return now.replace(hour=9,minute=30,second=0,microsecond=0) <= now < \
-               now.replace(hour=16,minute=0, second=0,microsecond=0)
+        if now.weekday() >= 5:
+            return False
+        open_  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+        close_ = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+        return open_ <= now < close_
 
     def _in_premarket(self):
         now = datetime.now(ET)
-        if now.weekday() >= 5: return False
-        return now.replace(hour=9,minute=0,second=0,microsecond=0) <= now < \
-               now.replace(hour=9,minute=30,second=0,microsecond=0)
+        if now.weekday() >= 5:
+            return False
+        return now.replace(hour=9, minute=0, second=0, microsecond=0) <= now < \
+               now.replace(hour=9, minute=30, second=0, microsecond=0)
 
     def _secs_until_premarket(self):
-        now = datetime.now(ET)
-        candidate = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        if now >= candidate:
-            candidate += timedelta(days=1)
-        while candidate.weekday() >= 5:
-            candidate += timedelta(days=1)
-        return max(0, int((candidate - now).total_seconds()))
+        now  = datetime.now(ET)
+        next_ = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        if now >= next_:
+            next_ += timedelta(days=1)
+        while next_.weekday() >= 5:
+            next_ += timedelta(days=1)
+        return max(0, int((next_ - now).total_seconds()))
 
     def run_loop(self):
-        log.info("Jacob v4.2 starting | %s | $%.0f budget | %d tickers | rules engine",
+        log.info("Jacob v5 starting | %s | $%.0f | %d tickers | MA50+RSI | long-only",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], len(CONFIG["watchlist"]))
-        log.info("Scan interval: %ds | Stop loss: %.0f%% | Daily loss cap: $%.0f",
-                 CONFIG["scan_interval_sec"], CONFIG["stop_loss_pct"]*100, DAILY_LOSS_CAP)
+        log.info("Entry: RSI<%d above MA50 | Exit: RSI>%d or +%.1f%% TP | SL: %.0f%%",
+                 CONFIG["rsi_entry"], CONFIG["rsi_exit"],
+                 CONFIG["take_profit_pct"] * 100, CONFIG["stop_loss_pct"] * 100)
 
-        trigger_path = os.path.join(os.path.dirname(CONFIG["state_file"]), "jacob_trigger.json")
+        trigger_path = "jacob_trigger.json"
         interval     = CONFIG["scan_interval_sec"]
 
         while True:
             try:
-                now = datetime.now(ET)
                 if self._market_open():
                     self.run_once(premarket=False)
-                    self.next_scan_at = (datetime.now(ET) + timedelta(seconds=interval)).isoformat()
+                    self.next_scan_at = (
+                        datetime.now(ET) + timedelta(seconds=interval)
+                    ).isoformat()
                     log.info("Next scan in %ds...\n", interval)
                     elapsed = 0
                     while elapsed < interval:
-                        time.sleep(10); elapsed += 10
+                        time.sleep(10)
+                        elapsed += 10
                         if os.path.exists(trigger_path):
                             try: os.remove(trigger_path)
                             except: pass
@@ -1478,11 +1228,14 @@ class JacobBot:
                 else:
                     secs = self._secs_until_premarket()
                     wake = (datetime.now(ET) + timedelta(seconds=secs)).strftime("%I:%M %p ET")
-                    log.info("Market closed — sleeping until %s (%dm)\n", wake, secs//60)
-                    self.next_scan_at = (datetime.now(ET) + timedelta(seconds=secs)).isoformat()
+                    log.info("Market closed — sleeping until %s (%dm)\n", wake, secs // 60)
+                    self.next_scan_at = (
+                        datetime.now(ET) + timedelta(seconds=secs)
+                    ).isoformat()
                     elapsed = 0
                     while elapsed < secs:
-                        time.sleep(60); elapsed += 60
+                        time.sleep(60)
+                        elapsed += 60
                         if os.path.exists(trigger_path):
                             try: os.remove(trigger_path)
                             except: pass
