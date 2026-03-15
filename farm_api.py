@@ -30,7 +30,7 @@ def valid_session(req):
 WORK_DIR = "/home/ubuntu"
 
 BOTS = {
-    "jacob":     {"script": "polymarket_bot.py",  "screen": "polymarket", "state": ["positions.json", "trades.csv", "pnl_history.json", "live_data.json"]},
+    "jacob":     {"script": "jacob_bot.py",  "screen": "jacob", "state": ["jacob_state.json", "jacob_trades.csv", "jacob_data.json"]},
     "seraphina": {"script": "seraphina_bot.py",   "screen": "seraphina",  "state": ["seraphina_state.json", "seraphina_trades.csv", "seraphina_data.json"]},
     "loachy":    {"script": "loachy_bot.py",      "screen": "loachy",     "state": ["loachy_state.json", "loachy_trades.csv", "loachy_data.json", "loachy_pending.json"]},
 }
