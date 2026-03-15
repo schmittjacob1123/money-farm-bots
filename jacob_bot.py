@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         JACOB'S STOCK & OPTIONS ENGINE  v2.0                ║
+║         JACOB'S STOCK & OPTIONS ENGINE  v4.1                ║
 ║  Strategy: Momentum + mean reversion scanner                 ║
 ║  Options:  CSP / Long Calls via rules engine                 ║
 ║  Human-in-the-loop for borderline trades                     ║
@@ -48,7 +48,7 @@ CONFIG = {
     # Risk
     "paper_budget":          1000.0,
     "max_position_size_pct": 0.10,   # 10% of wallet per trade
-    "max_position_size_usd": 50.0,   # hard cap $50
+    "max_position_size_usd": 80.0,   # v4.1: raised to 8% of $1000 budget
     "min_position_size_usd": 5.0,
     "max_open_positions":    8,
     "daily_loss_cap_pct":    0.05,   # 5% of STARTING budget = $25 fixed cap
@@ -78,6 +78,20 @@ CONFIG = {
 
     # Timing — used by run_loop
     "scan_interval_sec":  300,       # 5 min during market hours
+
+    # v3: Regime detection thresholds (SPY+QQQ 5d momentum)
+    "bear_threshold_pct":    -2.0,   # both below → BEAR (block longs)
+    "bull_threshold_pct":     1.5,   # both above → BULL (boost longs)
+
+    # v3: Trailing stop
+    "trail_arm_pct":   0.03,   # arm when up +3% from entry
+    "trail_fire_pct":  0.02,   # fire if drops -2% from peak
+
+    # v3: Quick cut for fast losers
+    "quick_cut_pct":   0.04,   # cut if down >4% within first 24h
+
+    # v4.1: Sector concentration
+    "max_per_sector":  2,       # max open positions per sector (tech/finance/etc)
     "premarket_wake_min": 30,        # wake 30 min before open
 
     # Pending
@@ -1148,7 +1162,7 @@ class JacobBot:
         self.wallet.reset_daily_if_needed()
 
         log.info("=" * 60)
-        log.info("  JACOB v2 #%d | %s%s | %s",
+        log.info("  JACOB v4 #%d | %s%s | %s",
                  self.scan_count,
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  " [PRE-MARKET]" if premarket else "",
@@ -1230,6 +1244,20 @@ class JacobBot:
             if not ok:
                 result["action"]      = "blocked"
                 result["skip_reason"] = reason
+                scan_results.append(result)
+                continue
+
+            # v4.1: Sector concentration guard
+            _sector = self.rules.PROFILES.get(ticker, {}).get("sector", "unknown")
+            _sector_count = sum(
+                1 for _p in self.wallet.open_positions.values()
+                if self.rules.PROFILES.get(
+                    _p.get("ticker","").replace("_OPT",""), {}
+                ).get("sector","") == _sector
+            )
+            if _sector_count >= CONFIG["max_per_sector"]:
+                result["action"]      = "skip"
+                result["skip_reason"] = f"Sector cap: {_sector_count}/{CONFIG["max_per_sector"]} {_sector} positions"
                 scan_results.append(result)
                 continue
 
