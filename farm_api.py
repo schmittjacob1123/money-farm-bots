@@ -8,7 +8,7 @@ RUN:    screen -S farmapi -> python3 farm_api.py -> Ctrl+A D
 
 import subprocess, os, json, time, secrets, hashlib
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 from flask import Flask, jsonify, request, make_response, Response
 from flask_cors import CORS
 
