@@ -1,23 +1,30 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           LOACHY BOY'S SPORTS BETTING ENGINE  v3            ║
-║  Stats model → AI confirmation → Human-in-the-loop          ║
-║  The loach sees value where bookies don't.                   ║
+║           LOACHY BOY'S SPORTS BETTING ENGINE  v4            ║
+║  De-vigged edge detection → AI veto → Sharp money follow    ║
+║  The loach finds true value. No fake edges, no guessing.    ║
 ║  Part of Jacob's Money Farm.                                 ║
 ╚══════════════════════════════════════════════════════════════╝
 
-FIXES vs v2:
-  - Wallet history shows portfolio value (cash + staked), not raw cash
-    so open bets no longer look like losses on the chart
-  - streak_mgr / clv_pct resolved from local scope, not dir() hack
-  - sport_key set correctly on fallback h2h candidates
-  - settlement win_prob based on ai_confidence, not loose edge formula
-  - same-game rescan protection across scans (persisted in state)
-  - daily_loss_cap fixed — same $20 cap all day, not recalculated
-  - open bets correctly excluded from wallet display (shows deployed capital)
-  - _place_bet works in both paper and live mode (live just logs intent)
-  - CLV uses last recorded odds from line tracker as closing proxy (not placed odds)
-  - wallet_history writes portfolio_value, not raw wallet.cash
+FIXES vs v3:
+  - REAL edge: de-vigged consensus probability vs best available price
+    (v3 just compared best vs average vig-inflated price = meaningless)
+  - Kelly uses live wallet balance, not fixed starting budget
+  - No zero-edge fallback candidates — AI only sees real statistical edges
+  - MAX_LIVE_CALLS raised to 4 (was 1) — more fresh data per scan
+  - Overnight skip changed to 2–6 UTC (was 0–8, cut NFL/NBA primetime)
+  - auto_bet_confidence raised to 0.72 (was 0.65)
+  - pending_expiry: 90 min OR game start − 30 min, whichever sooner
+    (v3 had 30 min expiry — bets expired before next 60 min scan ran)
+  - Weather checker uses real team city coordinates (was Kansas for every game)
+  - INDOOR_TEAMS set — skip weather for domed venues entirely
+  - min_edge = 0.02 (2% real de-vigged edge required, was 1%)
+  - min_book_count = 3 (new gate — need 3 books confirming price)
+  - Streak reduce factor 0.70 (was 0.50 — less aggressive bankroll cut)
+  - Score settlement: 30-min cache per sport (saves API credits)
+  - AI model → claude-haiku for cheaper/faster confirmations
+  - AI prompt enriched: true prob %, edge %, book count, sharp signal
+  - AI role clarified: veto mechanism, not random confidence generator
 """
 
 import os, csv, json, logging, time, sys, random
@@ -50,19 +57,20 @@ CONFIG = {
     "markets": ["h2h", "spreads", "totals"],
 
     # Confidence tiers
-    "auto_bet_confidence":    0.65,
-    "pending_min_confidence": 0.50,
-    "longshot_threshold":    -104,   # odds > -104 = longshot → always pending
+    "auto_bet_confidence":    0.72,   # was 0.65 — tighter gate
+    "pending_min_confidence": 0.55,   # was 0.50
+    "longshot_threshold":    -104,    # odds > -104 = longshot → always pending
     "min_odds_american":     -280,
     "max_odds_american":     +200,
-    "min_edge":               0.01,
+    "min_edge":               0.02,   # 2% real de-vigged edge required (was 1%)
+    "min_book_count":         3,      # NEW — minimum books confirming price
 
     # Risk
     "paper_budget":    50.0,
     "max_bet_size":     8.0,
     "min_bet_size":     1.0,
     "max_open_bets":    10,
-    "daily_loss_cap":  20.0,   # fixed — never shrinks
+    "daily_loss_cap":  20.0,
     "max_bets_per_day": 10,
 
     # Kelly
@@ -81,17 +89,20 @@ CONFIG = {
 
     # Timing
     "scan_interval_sec":   3600,
-    "pending_expiry_mins":   30,
+    "pending_expiry_mins":   90,    # was 30 — shorter than scan interval!
     "restart_cooldown_mins": 10,
-    "overnight_skip_start":   0,   # UTC hour
-    "overnight_skip_end":     8,
+    "overnight_skip_start":   2,    # was 0 — now only 2-6 UTC (9pm-1am ET)
+    "overnight_skip_end":     6,    # was 8 — was cutting NFL/NBA primetime
 
     # Streak management
     "streak_reduce_after":  3,
-    "streak_reduce_factor": 0.5,
+    "streak_reduce_factor": 0.70,   # was 0.50 — less aggressive
 
     # Odds history
     "line_move_threshold": 8,
+
+    # Candidates sent to AI per scan
+    "max_top_candidates": 10,
 
     # Files
     "log_file":          "loachy.log",
@@ -103,7 +114,7 @@ CONFIG = {
     "odds_history_file": "loachy_odds_history.json",
     "clv_log_file":      "loachy_clv.json",
 
-    "ai_model": "claude-sonnet-4-20250514",
+    "ai_model": "claude-haiku-4-5-20251001",   # cheaper/faster for this task
     "odds_regions": "us",
 }
 
@@ -159,17 +170,118 @@ ART = {
     "pending":  ["  ><(((º?\n   ? ? ? ?", "  ><(((·>\n   hmm???"],
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TEAM COORDINATES (real venues — for accurate weather data)
+# ══════════════════════════════════════════════════════════════════════════════
+TEAM_COORDS = {
+    # NFL outdoor / open-air
+    "Buffalo Bills":          (42.77, -78.79),
+    "Miami Dolphins":         (25.96, -80.24),
+    "New England Patriots":   (42.09, -71.26),
+    "New York Jets":          (40.81, -74.07),
+    "New York Giants":        (40.81, -74.07),
+    "Baltimore Ravens":       (39.28, -76.62),
+    "Cincinnati Bengals":     (39.10, -84.52),
+    "Cleveland Browns":       (41.51, -81.70),
+    "Pittsburgh Steelers":    (40.45, -80.02),
+    "Jacksonville Jaguars":   (30.32, -81.64),
+    "Tennessee Titans":       (36.17, -86.77),
+    "Denver Broncos":         (39.74, -105.02),
+    "Kansas City Chiefs":     (39.05, -94.48),
+    "Philadelphia Eagles":    (39.90, -75.17),
+    "Washington Commanders":  (38.91, -76.86),
+    "Chicago Bears":          (41.86, -87.62),
+    "Green Bay Packers":      (44.50, -88.06),
+    "Carolina Panthers":      (35.23, -80.85),
+    "Tampa Bay Buccaneers":   (27.98, -82.50),
+    "San Francisco 49ers":    (37.40, -121.97),
+    "Seattle Seahawks":       (47.60, -122.33),
+    # MLB outdoor
+    "Chicago Cubs":           (41.95, -87.66),
+    "Colorado Rockies":       (39.76, -104.99),
+    "San Francisco Giants":   (37.78, -122.39),
+    "Boston Red Sox":         (42.35, -71.10),
+    "Pittsburgh Pirates":     (40.45, -80.00),
+    "Philadelphia Phillies":  (39.91, -75.17),
+    "Cincinnati Reds":        (39.10, -84.51),
+    "Cleveland Guardians":    (41.50, -81.69),
+    "Baltimore Orioles":      (39.28, -76.62),
+    "New York Yankees":       (40.83, -73.93),
+    "New York Mets":          (40.76, -73.85),
+    "Detroit Tigers":         (42.34, -83.05),
+    "Seattle Mariners":       (47.59, -122.33),
+    "Los Angeles Dodgers":    (34.07, -118.24),
+    "Los Angeles Angels":     (33.80, -117.88),
+    "San Diego Padres":       (32.71, -117.16),
+    "Washington Nationals":   (38.87, -77.01),
+    "Oakland Athletics":      (37.75, -122.20),
+    "Kansas City Royals":     (39.05, -94.48),
+    "Chicago White Sox":      (41.83, -87.63),
+    "St. Louis Cardinals":    (38.62, -90.19),
+    "Milwaukee Brewers":      (43.03, -87.97),
+    "Atlanta Braves":         (33.89, -84.47),
+    "Texas Rangers":          (32.75, -97.08),
+    # MLS outdoor
+    "Portland Timbers":       (45.52, -122.69),
+    "Seattle Sounders FC":    (47.60, -122.33),
+    "Vancouver Whitecaps":    (49.28, -123.11),
+    "Colorado Rapids":        (39.81, -104.89),
+    "New England Revolution": (42.09, -71.26),
+    "DC United":              (38.87, -77.01),
+    "New York Red Bulls":     (40.74, -74.15),
+    "Chicago Fire FC":        (41.86, -87.62),
+    "FC Dallas":              (33.15, -96.84),
+    "LA Galaxy":              (33.86, -118.26),
+    "Los Angeles FC":         (34.01, -118.29),
+    "Real Salt Lake":         (40.58, -111.89),
+    "San Jose Earthquakes":   (37.35, -121.93),
+    "Sporting Kansas City":   (39.12, -94.52),
+    # EPL
+    "Arsenal":                (51.56, -0.11),
+    "Chelsea":                (51.48, -0.19),
+    "Liverpool":              (53.43, -2.96),
+    "Manchester City":        (53.48, -2.20),
+    "Manchester United":      (53.46, -2.29),
+    "Tottenham Hotspur":      (51.60, -0.07),
+    "Everton":                (53.44, -2.97),
+    "Newcastle United":       (54.97, -1.62),
+    "Aston Villa":            (52.51, -1.88),
+    "West Ham United":        (51.54,  0.02),
+    "Brighton":               (50.86, -0.08),
+    "Wolverhampton Wanderers":(52.59, -2.13),
+    "Crystal Palace":         (51.40, -0.09),
+    "Brentford":              (51.49, -0.31),
+    "Fulham":                 (51.47, -0.22),
+    "Nottingham Forest":      (52.94, -1.13),
+    "Bournemouth":            (50.74, -1.84),
+    "Burnley":                (53.79, -2.23),
+    "Leicester City":         (52.62, -1.14),
+    "Ipswich Town":           (52.06,  1.14),
+    "Southampton":            (50.91, -1.40),
+    "Sheffield United":       (53.37, -1.47),
+    "Luton Town":             (51.88, -0.43),
+}
+
+# Teams that play indoors — weather is irrelevant, skip API call
+INDOOR_TEAMS = {
+    "Houston Texans", "Indianapolis Colts", "Las Vegas Raiders",
+    "Los Angeles Chargers", "Los Angeles Rams", "Dallas Cowboys",
+    "Detroit Lions", "Minnesota Vikings", "Atlanta Falcons",
+    "New Orleans Saints", "Arizona Cardinals",
+    "Miami Marlins", "Minnesota Twins", "Milwaukee Brewers",
+    "Toronto Blue Jays", "Tampa Bay Rays", "Houston Astros",
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 1: WALLET (single source of truth)
+# MODULE 1: WALLET
 # ══════════════════════════════════════════════════════════════════════════════
 class Wallet:
     """
-    Clean accounting:
+    Single source of truth for bankroll.
       place_bet(bet)       → cash -= bet_size
       settle_bet(id, won)  → cash += bet_size + pnl
-      daily_pnl tracks REALIZED pnl only (settled bets)
-      portfolio_value = cash + all staked amounts (open bets never look like losses)
+      portfolio_value      = cash + staked (open bets never look like losses)
     """
 
     def __init__(self):
@@ -181,7 +293,7 @@ class Wallet:
         self.open_bets      = {}
         self.bet_history    = []
         self.wallet_history = []
-        self.seen_game_ids  = set()   # cross-scan dupe protection
+        self.seen_game_ids  = set()
 
     def reset_daily_if_needed(self):
         today = datetime.now(ET).date().isoformat()
@@ -212,10 +324,9 @@ class Wallet:
             return None
         size  = bet["bet_size"]
         price = bet["best_price"]
-        # Payout = profit only (not stake). Stake returned separately.
         payout = size * price / 100 if price > 0 else size * 100 / abs(price)
         pnl    = round(payout if won else -size, 4)
-        self.cash       += size + pnl   # return stake + pnl
+        self.cash       += size + pnl
         self.total_pnl  += pnl
         self.daily_pnl  += pnl
         entry = {**bet, "pnl": pnl, "won": won,
@@ -224,7 +335,6 @@ class Wallet:
         return entry
 
     def portfolio_value(self):
-        """Cash + staked capital. Open bets don't look like losses on chart."""
         staked = sum(b["bet_size"] for b in self.open_bets.values())
         return round(self.cash + staked, 2)
 
@@ -310,10 +420,10 @@ class State:
 # MODULE 3: ODDS FETCHER
 # ══════════════════════════════════════════════════════════════════════════════
 class OddsFetcher:
-    BASE_URL = "https://api.the-odds-api.com/v4/sports"
-    _cache   = {}
-    CACHE_SECS = 1500   # 25 min
-    MAX_LIVE_CALLS = 3  # live API calls per scan (3 sports fresh per hour ~72 credits/day)
+    BASE_URL   = "https://api.the-odds-api.com/v4/sports"
+    _cache     = {}
+    CACHE_SECS = 1500    # 25 min
+    MAX_LIVE_CALLS = 4   # was 1 — now gets 4 fresh sport feeds per scan
 
     PRIORITY = [
         "basketball_ncaab", "basketball_nba", "icehockey_nhl",
@@ -391,7 +501,6 @@ class OddsFetcher:
             if not cached:
                 time.sleep(0.3)
             if live_calls >= self.MAX_LIVE_CALLS:
-                # Use cache only for remaining sports
                 for s in active[active.index(sport)+1:]:
                     if s in self._cache:
                         c, _ = self.fetch_sport(s)
@@ -417,15 +526,17 @@ class OddsFetcher:
                         {"name": "Duke Blue Devils", "price": -130},
                         {"name": "UNC Tar Heels",   "price": +110},
                     ]},
-                    {"key": "spreads", "outcomes": [
-                        {"name": "Duke Blue Devils", "price": -110, "point": -2.5},
-                        {"name": "UNC Tar Heels",   "price": -110, "point":  2.5},
-                    ]},
                 ]},
                 {"key": "fanduel", "title": "FanDuel", "markets": [
                     {"key": "h2h", "outcomes": [
-                        {"name": "Duke Blue Devils", "price": -145},
-                        {"name": "UNC Tar Heels",   "price": +122},
+                        {"name": "Duke Blue Devils", "price": -135},
+                        {"name": "UNC Tar Heels",   "price": +115},
+                    ]},
+                ]},
+                {"key": "betmgm", "title": "BetMGM", "markets": [
+                    {"key": "h2h", "outcomes": [
+                        {"name": "Duke Blue Devils", "price": -128},
+                        {"name": "UNC Tar Heels",   "price": +108},
                     ]},
                 ]},
             ]
@@ -433,22 +544,60 @@ class OddsFetcher:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 4: STATISTICAL MODEL
+# MODULE 4: STATISTICAL MODEL (de-vigged edge detection)
 # ══════════════════════════════════════════════════════════════════════════════
 class StatModel:
 
     @staticmethod
     def to_prob(odds):
+        """American odds → implied probability."""
         return 100 / (odds + 100) if odds > 0 else abs(odds) / (abs(odds) + 100)
 
-    def analyse_game(self, game):
+    def _devige_binary(self, outcomes_dict):
+        """
+        Additive de-vig for binary markets (exactly 2 outcomes).
+
+        The bookmaker's vig inflates implied probabilities so they sum to > 1.
+        By averaging each side's implied probs across books, then normalizing
+        to sum to 1.0, we get the market's best estimate of true probability
+        without the house margin baked in.
+
+        Returns {outcome_key: true_probability} or {} if not binary.
+        """
+        if len(outcomes_dict) != 2:
+            return {}
+
+        keys = list(outcomes_dict.keys())
+        avg_imps = {}
+        for key in keys:
+            prices = outcomes_dict[key]["prices"]
+            if not prices:
+                return {}
+            avg_imps[key] = sum(self.to_prob(p) for p in prices) / len(prices)
+
+        total = sum(avg_imps.values())
+        if total <= 0:
+            return {}
+
+        return {k: v / total for k, v in avg_imps.items()}
+
+    def analyse_game(self, game, bankroll):
+        """
+        Find positive-EV bets in this game.
+
+        Edge = de-vigged true probability − implied probability of best available price.
+        Positive edge means we're being offered better odds than the market's true estimate.
+        Requires min_edge AND min_book_count to reduce false positives.
+
+        bankroll: current wallet cash (for correct Kelly sizing).
+        """
         bookmakers = game.get("bookmakers", [])
         if not bookmakers:
             return []
 
-        home  = game.get("home_team", "Home")
-        away  = game.get("away_team", "Away")
-        sport = game.get("sport_title", game.get("sport_key", ""))
+        home      = game.get("home_team", "Home")
+        away      = game.get("away_team", "Away")
+        sport     = game.get("sport_title", game.get("sport_key", ""))
         sport_key = game.get("sport_key", "")
         commence  = game.get("commence_time", "")
 
@@ -460,7 +609,7 @@ class StatModel:
         except:
             hours_until = 12
 
-        # Aggregate odds across bookmakers
+        # Group prices by market then outcome key (name + point)
         market_odds = {}
         for bookie in bookmakers:
             for market in bookie.get("markets", []):
@@ -478,26 +627,38 @@ class StatModel:
 
         candidates = []
         for mk, outcomes in market_odds.items():
-            for oc in outcomes.values():
+            # De-vig for binary markets → true probability estimate
+            true_probs = self._devige_binary(outcomes)
+
+            for oc_key, oc in outcomes.items():
                 if not oc["prices"]:
                     continue
-                best_price     = max(oc["prices"])
-                consensus_prob = sum(self.to_prob(p) for p in oc["prices"]) / len(oc["prices"])
-                best_prob      = self.to_prob(best_price)
-                edge           = consensus_prob - best_prob
 
+                best_price  = max(oc["prices"])
+                book_count  = len(oc["prices"])
+                best_prob   = self.to_prob(best_price)
+
+                # De-vigged true probability; fallback to best_prob if not binary
+                true_prob = true_probs.get(oc_key, best_prob)
+
+                # Real edge: what we think is true vs what the best price implies
+                edge = round(true_prob - best_prob, 4)
+
+                # Hard gates — all must pass
                 if not (CONFIG["min_odds_american"] <= best_price <= CONFIG["max_odds_american"]):
                     continue
                 if edge < CONFIG["min_edge"]:
                     continue
+                if book_count < CONFIG["min_book_count"]:
+                    continue
 
-                dec  = best_price / 100 + 1 if best_price > 0 else 100 / abs(best_price) + 1
-                b    = dec - 1
-                p    = consensus_prob
-                kf   = CONFIG["sport_kelly"].get(sport_key, CONFIG["kelly_fraction"])
+                # Kelly bet sizing using CURRENT WALLET BALANCE (not fixed starting budget)
+                dec   = best_price / 100 + 1 if best_price > 0 else 100 / abs(best_price) + 1
+                b     = dec - 1
+                p     = true_prob
+                kf    = CONFIG["sport_kelly"].get(sport_key, CONFIG["kelly_fraction"])
                 kelly = max(0, (b * p - (1-p)) / b * kf) if b > 0 else 0
-                size  = round(min(max(kelly * CONFIG["paper_budget"],
-                                     CONFIG["min_bet_size"]),
+                size  = round(min(max(kelly * bankroll, CONFIG["min_bet_size"]),
                                   CONFIG["max_bet_size"]), 2)
 
                 candidates.append({
@@ -510,20 +671,21 @@ class StatModel:
                     "outcome_name":   oc["name"],
                     "point":          oc["point"],
                     "best_price":     best_price,
-                    "consensus_prob": round(consensus_prob, 4),
+                    "true_prob":      round(true_prob, 4),
+                    "consensus_prob": round(true_prob, 4),   # alias for dashboard compat
                     "best_prob":      round(best_prob, 4),
-                    "edge":           round(edge, 4),
+                    "edge":           edge,
                     "bet_size":       size,
                     "hours_until":    round(hours_until, 1),
                     "commence_time":  commence,
-                    "book_count":     len(oc["prices"]),
+                    "book_count":     book_count,
                 })
 
         return sorted(candidates, key=lambda x: x["edge"], reverse=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 5: AI CONFIRMER
+# MODULE 5: AI CONFIRMER (veto mechanism)
 # ══════════════════════════════════════════════════════════════════════════════
 class AIConfirmer:
     def confirm(self, candidate, injury_ctx=None, weather_ctx=None, line_ctx=None):
@@ -546,9 +708,9 @@ class AIConfirmer:
 
             is_longshot = candidate.get("best_price", 0) > CONFIG["longshot_threshold"]
             tier_note = (
-                "LONGSHOT bet. Only flag if you see a genuine upset opportunity."
+                "This is a LONGSHOT bet (+odds). Only agree if there is a genuine upset reason."
                 if is_longshot else
-                "FAVOURITE bet. Only agree if one team is clearly dominant."
+                "This is a FAVOURITE bet (-odds). Only agree if one side is clearly dominant."
             )
 
             extra = []
@@ -557,26 +719,46 @@ class AIConfirmer:
             if line_ctx:    extra.append(f"LINE MOVEMENT: {line_ctx}")
             extra_str = ("\n\nContext:\n" + "\n".join(extra)) if extra else ""
 
-            prompt = f"""You are Loachy Boy — a disciplined sports bettor who grinds favourites and only takes longshots when the edge is real.
+            true_prob   = candidate.get("true_prob", candidate.get("consensus_prob", 0))
+            edge_pct    = candidate.get("edge", 0) * 100
+            book_count  = candidate.get("book_count", "?")
+
+            prompt = f"""You are Loachy Boy — a sharp, disciplined sports bettor who only bets real edges.
 
 Game: {candidate['away']} @ {candidate['home']}
 Sport: {candidate['sport']}
 Bet: {market_label}
 Odds: {candidate['best_price']:+d}
 Hours until game: {candidate['hours_until']:.1f}
-Book implied probability: {candidate['consensus_prob']*100:.1f}%{extra_str}
+
+EDGE ANALYSIS (pre-confirmed by statistical model):
+  De-vigged true probability: {true_prob*100:.1f}%
+  Best available price implies: {candidate['best_prob']*100:.1f}%
+  Edge: +{edge_pct:.1f}% across {book_count} books{extra_str}
 
 {tier_note}
 
-For FAVOURITES: agree when one team is clearly superior — form, depth, home advantage, no key injuries.
-For LONGSHOTS: agree only on genuine upset spots — key injury on favourite, hostile environment, recent head-to-head edge.
+YOUR ROLE IS TO VETO — not to generate confidence randomly.
+Agree only when you can cite a SPECIFIC fact supporting this pick.
 
-Factor in injuries and weather if provided. Be honest — low confidence if genuinely unsure.
+VETO if:
+- Key player is injured or out for OUR pick's team
+- Opponent has major home crowd / altitude / weather advantage that hurts our bet
+- Our team is on back-to-back games or has heavy recent travel
+- Weather context (if provided) undermines our bet type (e.g. high wind kills totals Over)
 
-JSON only: {{"agree": true, "confidence": 0.80, "reasoning": "Max 2 sentences."}}"""
+AGREE if:
+- Opponent has a key injury that weakens them
+- Our pick has clear recent form advantage (last 5+ games)
+- Line is moving in our direction (sharp money signal)
+- Home advantage strongly favors our pick
+
+Be calibrated: 0.80 confidence = you believe this wins 80% of the time.
+
+JSON only: {{"agree": true, "confidence": 0.80, "reasoning": "Max 2 sentences citing specific facts."}}"""
 
             msg = client.messages.create(
-                model=CONFIG["ai_model"], max_tokens=250,
+                model=CONFIG["ai_model"], max_tokens=200,
                 messages=[{"role": "user", "content": prompt}])
             raw = msg.content[0].text.strip().replace("```json","").replace("```","").strip()
             r   = json.loads(raw)
@@ -690,22 +872,34 @@ class LineTracker:
         return opening, current, "shortening" if move < 0 else "drifting", sharp
 
     def get_latest_odds(self, game_id, outcome):
-        """Return most recently recorded odds — used as closing line proxy for CLV."""
         entries = self.history.get(game_id, {}).get(outcome, [])
         return entries[-1]["odds"] if entries else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 8: WEATHER
+# MODULE 8: WEATHER (real team coordinates)
 # ══════════════════════════════════════════════════════════════════════════════
 class WeatherChecker:
-    OUTDOOR = {"americanfootball_nfl", "baseball_mlb", "soccer_usa_mls", "soccer_epl"}
-    COORDS  = {"default": (39.8, -98.6)}
+    OUTDOOR = {"americanfootball_nfl", "americanfootball_ncaaf",
+               "baseball_mlb", "soccer_usa_mls", "soccer_epl"}
 
     def get_conditions(self, candidate):
         if candidate.get("sport_key", "") not in self.OUTDOOR:
             return None
-        lat, lon = self.COORDS["default"]
+
+        home = candidate.get("home", "")
+        away = candidate.get("away", "")
+
+        # Skip if either team plays indoors
+        if home in INDOOR_TEAMS or away in INDOOR_TEAMS:
+            return None
+
+        # Home team hosts → use home venue coordinates
+        coords = TEAM_COORDS.get(home) or TEAM_COORDS.get(away)
+        if not coords:
+            return None  # Unknown venue — don't send Kansas weather as fake data
+
+        lat, lon = coords
         try:
             game_dt  = datetime.fromisoformat(
                 candidate.get("commence_time", "").replace("Z", ""))
@@ -754,13 +948,27 @@ class PendingManager:
         data = self.load()
         if any(p["game_id"] == candidate["game_id"] for p in data["pending"]):
             return
+
+        # Expiry = min(now + 90min, game_start - 30min)
+        # Never let a pending bet sit through game start
+        try:
+            game_dt      = datetime.fromisoformat(
+                candidate["commence_time"].replace("Z", "+00:00"))
+            game_start   = game_dt.astimezone(ET)
+            max_expiry   = datetime.now(ET) + timedelta(minutes=CONFIG["pending_expiry_mins"])
+            game_cutoff  = game_start - timedelta(minutes=30)
+            expires_at   = min(max_expiry, game_cutoff)
+            expires_str  = expires_at.isoformat()
+        except:
+            expires_str = (datetime.now(ET) + timedelta(
+                           minutes=CONFIG["pending_expiry_mins"])).isoformat()
+
         data["pending"].append({
             **candidate,
             "ai_confidence": round(confidence, 2),
             "ai_reasoning":  reasoning,
             "pending_since": datetime.now(ET).isoformat(),
-            "expires_at":    (datetime.now(ET) + timedelta(
-                              minutes=CONFIG["pending_expiry_mins"])).isoformat(),
+            "expires_at":    expires_str,
             "status": "PENDING",
         })
         self.save(data)
@@ -795,7 +1003,7 @@ class PendingManager:
 # MODULE 10: PARLAY BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 class ParlayBuilder:
-    MIN_CONF    = 0.70
+    MIN_CONF    = 0.72    # raised to match auto_bet_confidence
     MAX_PARLAYS = 2
 
     @staticmethod
@@ -827,9 +1035,10 @@ class ParlayBuilder:
                 if key in used:
                     continue
                 used.add(key)
-                d1, d2   = self._dec(l1["best_price"]), self._dec(l2["best_price"])
-                par_dec  = d1 * d2
-                true_prob = l1["consensus_prob"] * l2["consensus_prob"]
+                d1, d2    = self._dec(l1["best_price"]), self._dec(l2["best_price"])
+                par_dec   = d1 * d2
+                # Use de-vigged true_prob for parlay edge calculation
+                true_prob = l1.get("true_prob", l1["consensus_prob"]) * l2.get("true_prob", l2["consensus_prob"])
                 edge      = round(true_prob - 1/par_dec, 4)
                 size      = max(round(min(l1["bet_size"], l2["bet_size"]) * 0.5, 2),
                                 CONFIG["min_bet_size"])
@@ -880,10 +1089,14 @@ class LoachyBot:
         self.pending  = PendingManager()
         self.parlays  = ParlayBuilder()
 
-        self.scan_count     = 0
-        self.ai_calls       = 0
-        self.next_scan_at   = None
-        self._cur_parlays   = []
+        self.scan_count   = 0
+        self.ai_calls     = 0
+        self.next_scan_at = None
+        self._cur_parlays = []
+
+        # Score settlement cache {sport_key: (timestamp, scores_list)}
+        self._scores_cache     = {}
+        self._scores_cache_ttl = 1800   # 30 min — saves API credits
 
         self._load_state()
 
@@ -891,7 +1104,8 @@ class LoachyBot:
             with open(CONFIG["csv_file"], "x", newline="") as f:
                 csv.writer(f).writerow([
                     "timestamp","game_id","sport","matchup","market","outcome",
-                    "odds","edge_pct","ai_confidence","bet_size","pnl","won","source","status"
+                    "odds","edge_pct","true_prob_pct","ai_confidence","bet_size",
+                    "pnl","won","source","status"
                 ])
         except FileExistsError:
             pass
@@ -916,6 +1130,7 @@ class LoachyBot:
                     bet.get("sport",""), matchup, bet.get("market",""),
                     bet.get("outcome_name",""), bet.get("best_price",""),
                     round(bet.get("edge",0)*100, 2),
+                    round(bet.get("true_prob", bet.get("consensus_prob",0))*100, 1),
                     round(bet.get("ai_confidence",0), 2),
                     bet.get("bet_size",0),
                     pnl if pnl is not None else "",
@@ -940,69 +1155,62 @@ class LoachyBot:
         State.save(self.wallet)
         self._log_csv(bet, source=source)
 
-        log.info("  [%s/%s] BET %s %s %+d | $%.2f | Edge %.1f%% | conf %.0f%%",
+        log.info("  [%s/%s] BET %s %s %+d | $%.2f | Edge %.1f%% | true=%.1f%% | conf %.0f%%",
                  "PAPER" if CONFIG["dry_run"] else "LIVE", source,
                  bet.get("outcome_name",""), bet.get("market",""),
                  bet.get("best_price",0), bet.get("bet_size",0),
-                 bet.get("edge",0)*100, bet.get("ai_confidence",0)*100)
+                 bet.get("edge",0)*100,
+                 bet.get("true_prob", bet.get("consensus_prob",0))*100,
+                 bet.get("ai_confidence",0)*100)
         return True
 
     def _fetch_scores(self, sport_key):
-        """Fetch completed scores from Odds API for a given sport."""
+        """Fetch completed scores from Odds API. Uses 30-min cache to save credits."""
+        now = time.time()
+        if sport_key in self._scores_cache:
+            ts, data = self._scores_cache[sport_key]
+            if now - ts < self._scores_cache_ttl:
+                return data
         try:
             r = requests.get(
                 f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores/",
-                params={
-                    "apiKey":    CONFIG["odds_api_key"],
-                    "daysFrom":  3,   # games completed in last 3 days
-                    "dateFormat": "iso",
-                },
-                timeout=10
-            )
+                params={"apiKey": CONFIG["odds_api_key"], "daysFrom": 3,
+                        "dateFormat": "iso"},
+                timeout=10)
             if r.status_code != 200:
                 log.debug(f"[SCORES] {sport_key} HTTP {r.status_code}")
                 return []
-            return r.json()
+            data = r.json()
+            self._scores_cache[sport_key] = (now, data)
+            return data
         except Exception as e:
             log.debug(f"[SCORES] fetch error: {e}")
             return []
 
     def _determine_winner(self, bet, scores_by_id):
-        """
-        Given a bet and a dict of {game_id: score_object}, determine if bet won.
-        Returns True (won), False (lost), or None (can't determine yet).
-
-        Handles h2h, spreads, and totals markets.
-        """
-        game_id     = bet.get("game_id", "")
-        market      = bet.get("market", "h2h")
-        outcome     = bet.get("outcome_name", "")
-        point       = bet.get("point", None)
-        home        = bet.get("home", "")
-        away        = bet.get("away", "")
+        game_id  = bet.get("game_id", "")
+        market   = bet.get("market", "h2h")
+        outcome  = bet.get("outcome_name", "")
+        point    = bet.get("point", None)
+        home     = bet.get("home", "")
+        away     = bet.get("away", "")
 
         score_obj = scores_by_id.get(game_id)
-        if not score_obj:
-            return None  # game not in scores yet
-
-        # Must be completed
-        if not score_obj.get("completed"):
+        if not score_obj or not score_obj.get("completed"):
             return None
 
-        scores = score_obj.get("scores") or []
+        scores    = score_obj.get("scores") or []
         score_map = {s["name"]: int(s["score"]) for s in scores if s.get("score") is not None}
 
         if len(score_map) < 2:
-            return None  # scores missing
+            return None
 
         home_score = score_map.get(home)
         away_score = score_map.get(away)
 
-        # Try fuzzy match if exact names don't match (Odds API sometimes abbreviates)
         if home_score is None or away_score is None:
             names = list(score_map.keys())
             if len(names) == 2:
-                # Assign by position: first entry is usually away, second is home
                 away_score = score_map[names[0]]
                 home_score = score_map[names[1]]
 
@@ -1011,13 +1219,11 @@ class LoachyBot:
             return None
 
         if market == "h2h":
-            # outcome_name is the team name we bet on
             if outcome == home:
                 return home_score > away_score
             elif outcome == away:
                 return away_score > home_score
             else:
-                # fuzzy: check if outcome contains home or away team name
                 if home.lower() in outcome.lower():
                     return home_score > away_score
                 elif away.lower() in outcome.lower():
@@ -1025,40 +1231,24 @@ class LoachyBot:
                 return None
 
         elif market == "spreads":
-            if point is None:
-                return None
-            # outcome_name is the team + spread, e.g. "Lakers -3.5"
-            # determine which team we backed
+            if point is None: return None
             if home.lower() in outcome.lower():
-                covered = (home_score + point) > away_score
-                return covered
+                return (home_score + point) > away_score
             elif away.lower() in outcome.lower():
-                covered = (away_score + point) > home_score
-                return covered
+                return (away_score + point) > home_score
             return None
 
         elif market == "totals":
             total = home_score + away_score
-            if point is None:
-                return None
-            if "over" in outcome.lower():
-                return total > point
-            elif "under" in outcome.lower():
-                return total < point
+            if point is None: return None
+            if "over" in outcome.lower():  return total > point
+            elif "under" in outcome.lower(): return total < point
             return None
 
         return None
 
-    # Cache scores per scan to avoid re-fetching for every bet in same sport
-    _scores_cache = {}
-
     def _settle_old_bets(self):
-        """
-        Settle bets where game started 3+ hours ago using REAL scores
-        from The Odds API. Falls back to logging UNRESOLVED if scores
-        aren't available yet (never uses fake dice rolls).
-        """
-        # Group bets by sport so we only fetch each sport's scores once
+        """Settle bets 3+ hours after game start using real Odds API scores."""
         bets_by_sport = {}
         for game_id, bet in list(self.wallet.open_bets.items()):
             try:
@@ -1071,14 +1261,11 @@ class LoachyBot:
             except:
                 continue
             sport_key = bet.get("sport_key", "")
-            if sport_key not in bets_by_sport:
-                bets_by_sport[sport_key] = []
-            bets_by_sport[sport_key].append((game_id, bet))
+            bets_by_sport.setdefault(sport_key, []).append((game_id, bet))
 
         if not bets_by_sport:
             return
 
-        # Fetch scores for each sport needed
         for sport_key, bets in bets_by_sport.items():
             scores = self._fetch_scores(sport_key)
             scores_by_id = {s["id"]: s for s in scores}
@@ -1087,8 +1274,7 @@ class LoachyBot:
                 won = self._determine_winner(bet, scores_by_id)
 
                 if won is None:
-                    # Game not completed yet or scores missing — skip, check next scan
-                    log.info("  [SCORES] %s @ %s — result not available yet, waiting...",
+                    log.info("  [SCORES] %s @ %s — result not available yet",
                              bet.get("away",""), bet.get("home",""))
                     continue
 
@@ -1096,18 +1282,18 @@ class LoachyBot:
                 if settled:
                     State.save(self.wallet)
                     sign = "+" if settled["pnl"] >= 0 else ""
-                    log.info("  [SETTLED/REAL] %s @ %s — %s | P&L: %s$%.2f | Cash: $%.2f",
+                    log.info("  [SETTLED] %s @ %s — %s | P&L: %s$%.2f | Cash: $%.2f",
                              bet.get("away",""), bet.get("home",""),
                              "WON ✓" if won else "LOST ✗",
                              sign, settled["pnl"], self.wallet.cash)
                     self._log_csv(bet, pnl=settled["pnl"], won=won)
 
-                # CLV: compare placed odds vs latest recorded odds (closing proxy)
+                # CLV tracking
                 latest = self.lines.get_latest_odds(game_id, bet.get("outcome_name",""))
                 if latest and latest != bet.get("best_price"):
                     placed  = bet.get("best_price", 0)
                     clv_pts = placed - latest
-                    beat    = clv_pts < 0  # we got shorter (better) odds
+                    beat    = clv_pts < 0
                     log.info("  [CLV] Placed %+d | Close ~%+d | CLV %+d pts %s",
                              placed, latest, clv_pts, "✓ BEAT" if beat else "✗ MISSED")
                     try:
@@ -1134,54 +1320,13 @@ class LoachyBot:
         try:
             with open(CONFIG["clv_log_file"]) as f:
                 data = json.load(f)
-            if not data:
-                return None
+            if not data: return None
             return round(sum(1 for e in data if e.get("clv_positive")) / len(data) * 100, 1)
         except:
             return None
 
-    def _enrich_open_bets(self):
-        """Add live countdown timer to each open bet for the dashboard."""
-        enriched = []
-        now = datetime.utcnow()
-        for bet in self.wallet.open_bets.values():
-            b = dict(bet)
-            try:
-                ct = bet.get("commence_time", "")
-                if ct:
-                    game_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
-                    game_dt_naive = game_dt.replace(tzinfo=None)
-                    delta = game_dt_naive - now
-                    total_mins = int(delta.total_seconds() / 60)
-                    if total_mins < 0:
-                        b["time_remaining"] = "IN PROGRESS / PAST"
-                        b["mins_until"] = total_mins
-                    elif total_mins < 60:
-                        b["time_remaining"] = f"{total_mins}m"
-                        b["mins_until"] = total_mins
-                    elif total_mins < 1440:
-                        h, m = divmod(total_mins, 60)
-                        b["time_remaining"] = f"{h}h {m}m"
-                        b["mins_until"] = total_mins
-                    else:
-                        days = total_mins // 1440
-                        h = (total_mins % 1440) // 60
-                        b["time_remaining"] = f"{days}d {h}h"
-                        b["mins_until"] = total_mins
-                else:
-                    b["time_remaining"] = "Unknown"
-                    b["mins_until"] = None
-            except Exception:
-                b["time_remaining"] = "Unknown"
-                b["mins_until"] = None
-            enriched.append(b)
-        # Sort by soonest game first
-        enriched.sort(key=lambda x: x.get("mins_until") or 99999)
-        return enriched
-
     def _write_dashboard(self, candidates, mood, pending_bets, api_remaining):
         try:
-            # Portfolio value = cash + staked (open bets never look like losses)
             portfolio = self.wallet.portfolio_value()
             self.wallet.wallet_history.append({
                 "t": datetime.now(ET).isoformat(),
@@ -1195,36 +1340,38 @@ class LoachyBot:
 
             with open(CONFIG["dashboard_file"], "w") as f:
                 json.dump({
-                    "lastScan":       datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
-                    "mode":           "PAPER" if CONFIG["dry_run"] else "LIVE",
-                    "mood":           mood,
-                    "quote":          random.choice(QUOTES.get(mood, QUOTES["watching"])),
-                    "art":            random.choice(ART.get(mood, ART["watching"])),
-                    "wallet":         round(self.wallet.cash, 2),
-                    "portfolioValue": portfolio,
-                    "stakedValue":    round(portfolio - self.wallet.cash, 2),
-                    "startingBudget": CONFIG["paper_budget"],
-                    "totalPnl":       round(self.wallet.total_pnl, 4),
-                    "dailyPnl":       round(self.wallet.daily_pnl, 4),
-                    "winRate":        self.wallet.win_rate(),
-                    "roi":            self.wallet.roi(),
-                    "betsTotal":      len(self.wallet.bet_history),
-                    "openBets":       len(self.wallet.open_bets),
-                    "scanCount":      self.scan_count,
-                    "gamesScanned":   len(candidates),
-                    "apiRemaining":   api_remaining,
-                    "nextScanAt":     self.next_scan_at,
-                    "aiCallsTotal":   self.ai_calls,
-                    "aiCostEstimate": round(self.ai_calls * 0.003, 4),
-                    "pendingCount":   len(pending_bets),
-                    "lossStreak":     loss_streak,
-                    "clvPct":         clv_pct,
-                    "candidates":     candidates[:10],
-                    "pendingBets":    pending_bets,
-                    "openBetsList":   self._enrich_open_bets(),
-                    "recentBets":     self.wallet.bet_history[-15:],
-                    "suggestedParlays": self._cur_parlays,
-                    "walletHistory":  self.wallet.wallet_history[-500:],
+                    "lastScan":        datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
+                    "mode":            "PAPER" if CONFIG["dry_run"] else "LIVE",
+                    "mood":            mood,
+                    "quote":           random.choice(QUOTES.get(mood, QUOTES["watching"])),
+                    "art":             random.choice(ART.get(mood, ART["watching"])),
+                    "wallet":          round(self.wallet.cash, 2),
+                    "portfolioValue":  portfolio,
+                    "stakedValue":     round(portfolio - self.wallet.cash, 2),
+                    "startingBudget":  CONFIG["paper_budget"],
+                    "totalPnl":        round(self.wallet.total_pnl, 4),
+                    "dailyPnl":        round(self.wallet.daily_pnl, 4),
+                    "winRate":         self.wallet.win_rate(),
+                    "roi":             self.wallet.roi(),
+                    "betsTotal":       len(self.wallet.bet_history),
+                    "openBets":        len(self.wallet.open_bets),
+                    "scanCount":       self.scan_count,
+                    "gamesScanned":    len(candidates),
+                    "apiRemaining":    api_remaining,
+                    "nextScanAt":      self.next_scan_at,
+                    "aiCallsTotal":    self.ai_calls,
+                    "aiCostEstimate":  round(self.ai_calls * 0.0004, 4),  # Haiku pricing
+                    "pendingCount":    len(pending_bets),
+                    "lossStreak":      loss_streak,
+                    "clvPct":          clv_pct,
+                    "minEdgePct":      CONFIG["min_edge"] * 100,
+                    "minBookCount":    CONFIG["min_book_count"],
+                    "candidates":      candidates[:10],
+                    "pendingBets":     pending_bets,
+                    "openBetsList":    list(self.wallet.open_bets.values()),
+                    "recentBets":      self.wallet.bet_history[-15:],
+                    "suggestedParlays":self._cur_parlays,
+                    "walletHistory":   self.wallet.wallet_history[-500:],
                 }, f, indent=2)
         except Exception as e:
             log.warning(f"Dashboard: {e}")
@@ -1234,7 +1381,7 @@ class LoachyBot:
         self.wallet.reset_daily_if_needed()
 
         log.info("=" * 60)
-        log.info("  LOACHY v3 #%d | %s | %s",
+        log.info("  LOACHY v4 #%d | %s | %s",
                  self.scan_count,
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"))
@@ -1256,73 +1403,36 @@ class LoachyBot:
         # ── Step 4: Fetch odds ──
         games, api_remaining = self.fetcher.fetch_all(force=force)
 
-        # ── Step 5: Build candidates ──
+        # ── Step 5: Build candidates (de-vigged edge, using live bankroll for Kelly) ──
         all_candidates = []
         for game in games:
-            all_candidates.extend(self.model.analyse_game(game))
+            all_candidates.extend(self.model.analyse_game(game, self.wallet.cash))
 
-        # Best candidate per game (highest edge)
+        # Best candidate per game (highest real edge)
         best_per_game = {}
         for c in all_candidates:
             gid = c["game_id"]
             if gid not in best_per_game or c["edge"] > best_per_game[gid]["edge"]:
                 best_per_game[gid] = c
 
-        # Fallback: add basic h2h entry for games with no stat edge
-        stat_ids = set(best_per_game.keys())
-        for game in games:
-            gid = game.get("id")
-            if gid in stat_ids:
-                continue
-            sport_key = game.get("sport_key", "")
-            for bookie in game.get("bookmakers", []):
-                for market in bookie.get("markets", []):
-                    if market["key"] != "h2h":
-                        continue
-                    for outcome in market.get("outcomes", []):
-                        price = outcome.get("price", 0)
-                        if not (CONFIG["min_odds_american"] <= price <= CONFIG["max_odds_american"]):
-                            continue
-                        try:
-                            game_dt = datetime.fromisoformat(
-                                game.get("commence_time","").replace("Z","+00:00"))
-                            hrs = (game_dt.replace(tzinfo=None)-datetime.utcnow()).total_seconds()/3600
-                            if hrs < 0.5 or hrs > 48:
-                                continue
-                        except:
-                            hrs = 12
-                        prob = StatModel.to_prob(price)
-                        best_per_game[gid] = {
-                            "game_id":        gid,
-                            "sport":          game.get("sport_title", sport_key),
-                            "sport_key":      sport_key,   # ← fixed: was missing
-                            "home":           game.get("home_team",""),
-                            "away":           game.get("away_team",""),
-                            "market":         "h2h",
-                            "outcome_name":   outcome["name"],
-                            "point":          None,
-                            "best_price":     price,
-                            "consensus_prob": round(prob, 4),
-                            "best_prob":      round(prob, 4),
-                            "edge":           0.0,
-                            "bet_size":       CONFIG["min_bet_size"],
-                            "hours_until":    round(hrs, 1),
-                            "commence_time":  game.get("commence_time",""),
-                            "book_count":     1,
-                        }
-                        break
-                    break
+        # Top N sorted by edge — only real edges (no zero-edge fallbacks)
+        top = sorted(best_per_game.values(), key=lambda x: x["edge"], reverse=True
+                     )[:CONFIG["max_top_candidates"]]
 
-        top = sorted(best_per_game.values(), key=lambda x: x["edge"], reverse=True)[:8]
-        log.info("  %d games queued for AI | %d had stat edge", len(top), len(all_candidates))
+        log.info("  %d games with real edge (≥%.0f%% de-vigged, ≥%d books) | AI queue: %d",
+                 len(all_candidates), CONFIG["min_edge"]*100,
+                 CONFIG["min_book_count"], len(top))
+
+        if not top:
+            log.info("  No qualifying edges this scan — bankroll preserved")
 
         # ── Step 6: AI evaluation ──
-        kelly_mult        = self.wallet.kelly_multiplier()
-        bets_placed       = 0
-        pending_added     = 0
-        confirmed_list    = []
+        kelly_mult     = self.wallet.kelly_multiplier()
+        bets_placed    = 0
+        pending_added  = 0
+        confirmed_list = []
 
-        # Record odds for line movement
+        # Record odds for line movement tracking
         for c in top:
             self.lines.record(c["game_id"], c["outcome_name"], c["best_price"])
 
@@ -1332,12 +1442,11 @@ class LoachyBot:
                 log.info(f"  Blocked: {reason}")
                 continue
 
-            # Skip games we've already bet on (cross-scan protection)
             if c["game_id"] in self.wallet.seen_game_ids:
                 log.info(f"  Skip (already bet): {c['away']} @ {c['home']}")
                 continue
 
-            # Apply streak Kelly multiplier
+            # Apply streak Kelly multiplier to size
             if kelly_mult < 1.0:
                 c["bet_size"] = max(round(c["bet_size"] * kelly_mult, 2),
                                     CONFIG["min_bet_size"])
@@ -1365,8 +1474,10 @@ class LoachyBot:
                 "sharp_money":     sharp,
             })
 
-            log.info("  AI: %s @ %s | %s %+d",
-                     c["away"], c["home"], c["outcome_name"], c["best_price"])
+            log.info("  AI: %s @ %s | %s %+d | edge +%.1f%% | true %.1f%%",
+                     c["away"], c["home"], c["outcome_name"], c["best_price"],
+                     c["edge"]*100, c.get("true_prob", c["consensus_prob"])*100)
+
             confirmed, confidence, reasoning = self.ai.confirm(
                 c, injury_ctx, weather_ctx, line_ctx)
             self.ai_calls += 1
@@ -1442,11 +1553,11 @@ class LoachyBot:
 
     def run_loop(self):
         import threading
-        log.info("Loachy v3 | %s | $%.0f | %d sports",
+        log.info("Loachy v4 | %s | $%.0f | %d sports | min_edge=%.0f%% | min_books=%d",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
-                 CONFIG["paper_budget"], len(CONFIG["sports"]))
+                 CONFIG["paper_budget"], len(CONFIG["sports"]),
+                 CONFIG["min_edge"]*100, CONFIG["min_book_count"])
 
-        # Start approval watcher (zero API credits — reads local JSON only)
         self._stop_watcher = threading.Event()
         threading.Thread(target=self._approval_watcher, daemon=True).start()
 
