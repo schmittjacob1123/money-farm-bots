@@ -1,0 +1,19 @@
+# Secrets — never commit these
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime data (lives on the server, not in repo)
+*.log
+*.csv
+*_state.json
+*_data.json
+*_pending.json
+*_history.json
+loachy_clv.json
+loachy_sports_config.json
+*.bak
