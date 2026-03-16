@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Seraphina v9 — Trend + RSI</title>
+  <title>Seraphina v10.1 — Grid + RSI</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -180,8 +180,8 @@
  -"-"-</pre>
     </div>
     <div>
-      <div class="brand-title">Seraphina v9</div>
-      <div class="brand-sub">Trend + RSI · MA50 · Funding · Paper Mode</div>
+      <div class="brand-title">Seraphina v10.1</div>
+      <div class="brand-sub">Grid + RSI · 15s Scan · MA50 · Funding · Paper Mode</div>
     </div>
   </div>
   <div class="header-right">
@@ -235,7 +235,7 @@
     <div class="stat" style="animation-delay:.18s">
       <div class="stat-label">Open Pos.</div>
       <div class="stat-value" id="s-open">0</div>
-      <div class="stat-sub">of 4 max</div>
+      <div class="stat-sub">of 3/coin · 12 max</div>
     </div>
     <div class="stat" style="animation-delay:.21s">
       <div class="stat-label">Trades</div>
@@ -245,7 +245,7 @@
     <div class="stat" style="animation-delay:.24s">
       <div class="stat-label">Scan #</div>
       <div class="stat-value" id="s-scan">0</div>
-      <div class="stat-sub">60s — next in <span id="s-countdown">60</span>s</div>
+      <div class="stat-sub">15s spot · next in <span id="s-countdown">15</span>s</div>
     </div>
     <div class="stat fund-stat" style="animation-delay:.27s">
       <div class="stat-label">Funding Inc.</div>
@@ -282,6 +282,18 @@
     <div class="empty-msg">Waiting for first scan...</div>
   </div>
 
+  <!-- ── GRID STATUS ── -->
+  <div class="positions-wrap">
+    <div class="section-hdr">
+      <div class="section-title">Grid Levels</div>
+      <div class="section-line"></div>
+      <div class="section-badge" id="grid-badge" style="color:var(--muted);border-color:var(--border)">loading...</div>
+    </div>
+    <div id="grid-status" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin-bottom:24px">
+      <div class="empty-msg">Waiting for first scan...</div>
+    </div>
+  </div>
+
   <!-- ── OPEN POSITIONS ── -->
   <div class="positions-wrap">
     <div class="section-hdr">
@@ -311,7 +323,7 @@
       <div class="section-line"></div>
     </div>
     <div class="log-inner" id="log-inner">
-      <div class="empty-msg">No trades yet — waiting for RSI signals...</div>
+      <div class="empty-msg">No trades yet — grid will trigger entries on crossings...</div>
     </div>
   </div>
 
@@ -493,13 +505,14 @@ function renderSignals(signals, openCoins, rsiCfg) {
       </div>
       <div class="rsi-track">
         <div class="rsi-fill" style="width:${rsiW};background:${rsiCol}"></div>
-        <div class="rsi-marker" style="left:${rsiCfg.buy}%"></div>
-        <div class="rsi-marker" style="left:${rsiCfg.sell}%"></div>
+        <div class="rsi-marker" style="left:${rsiCfg.boost||40}%;background:rgba(251,191,36,.5)"></div>
+        <div class="rsi-marker" style="left:${rsiCfg.sellMin||65}%"></div>
+        <div class="rsi-marker" style="left:${rsiCfg.buyMax||70}%;background:rgba(52,211,153,.5)"></div>
       </div>
       <div class="rsi-zones">
-        <span style="color:#f87171">OS ${rsiCfg.buy}</span>
-        <span>neutral</span>
-        <span style="color:#34d399">OB ${rsiCfg.sell}</span>
+        <span style="color:#fbbf24">Boost ${rsiCfg.boost||40}</span>
+        <span style="color:rgba(255,255,255,.3)">grid active</span>
+        <span style="color:#34d399">Skip ${rsiCfg.buyMax||70}</span>
       </div>
       <div class="sig-actions">${badges}</div>
     </div>`;
@@ -530,7 +543,7 @@ function renderPositions(positions, tpPct, slPct) {
       <div class="pos-top">
         <div>
           <div class="pos-coin">${p.coin}</div>
-          <div class="pos-meta">${fmtUsd(p.sizeUsd)} deployed · ${toETFull(p.entryTime)}</div>
+          <div class="pos-meta">${fmtUsd(p.sizeUsd)} deployed · ${p.gridLevel!=null?'grid L'+p.gridLevel+' · ':''}${toETFull(p.entryTime)}</div>
         </div>
         <div class="pos-pnl">
           <div class="pos-pnl-val" style="color:${pnlCol}">${fmtPnl(pnl)}</div>
@@ -566,6 +579,47 @@ function renderPositions(positions, tpPct, slPct) {
       <div style="margin-top:8px">${trailHtml}</div>
     </div>`;
   }).join('');
+}
+
+// ── render grids ─────────────────────────────────────────────
+function renderGrids(grids, signals) {
+  const wrap  = document.getElementById('grid-status');
+  const badge = document.getElementById('grid-badge');
+  const coins = ['BTC','ETH','SOL','DOGE'];
+  if (!grids || !Object.keys(grids).length) {
+    wrap.innerHTML = '<div class="empty-msg">No grid data yet — waiting for first scan...</div>';
+    badge.textContent = 'no data';
+    return;
+  }
+  let totalLevels = 0;
+  wrap.innerHTML = coins.map(coin => {
+    const g = grids[coin];
+    if (!g || !g.levels) return '';
+    const price = signals[coin]?.price || 0;
+    totalLevels += g.levels.length;
+    const levelsHtml = g.levels.map((lvl, i) => {
+      const dist = price ? ((price - lvl) / lvl * 100).toFixed(2) : null;
+      const above = price && price > lvl;
+      const near  = dist && Math.abs(dist) < 0.5;
+      const col   = near ? '#fbbf24' : above ? '#34d399' : '#f87171';
+      const tag   = near ? ' ◄ near' : '';
+      return `<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 6px;border-radius:4px;margin:2px 0;background:${near?'rgba(251,191,36,.08)':'rgba(255,255,255,.02)'}">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted)">L${i}</span>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:${col}">${fmtPrice(coin, lvl)}${tag}</span>
+        ${dist!=null?`<span style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted)">${dist>0?'+':''}${dist}%</span>`:''}
+      </div>`;
+    }).join('');
+    return `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="font-size:14px;font-weight:800;color:var(--cat)">${coin}</span>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted)">${g.levels.length} levels · anchor ${fmtPrice(coin, g.anchor)}</span>
+      </div>
+      ${levelsHtml}
+    </div>`;
+  }).filter(Boolean).join('');
+  badge.textContent = `${Object.keys(grids).length} coins · ${totalLevels} levels`;
+  badge.style.color = 'var(--blue)';
+  badge.style.borderColor = 'rgba(129,140,248,.3)';
 }
 
 // ── render funding ───────────────────────────────────────────
@@ -604,7 +658,7 @@ function renderFunding(fundingRates) {
 function renderLog(trades) {
   const el = document.getElementById('log-inner');
   if (!trades||!trades.length) {
-    el.innerHTML = '<div class="empty-msg">No trades yet — waiting for RSI signals...</div>'; return;
+    el.innerHTML = '<div class="empty-msg">No trades yet — grid will trigger entries on crossings...</div>'; return;
   }
   el.innerHTML = [...trades].reverse().map(t => {
     const pnl = t.pnl || 0;
@@ -703,7 +757,10 @@ function loadData() {
 
       // signals
       const openCoins = (d.positions||[]).map(p=>p.coin);
-      renderSignals(d.signals||{}, openCoins, d.rsiConfig||{buy:35,sell:65});
+      renderSignals(d.signals||{}, openCoins, d.rsiConfig||{buyMax:70,sellMin:65,boost:40});
+
+      // grids
+      renderGrids(d.grids||{}, d.signals||{});
 
       // positions
       renderPositions(d.positions||[], d.tpPct??2.5, d.slPct??4.0);
@@ -718,17 +775,17 @@ function loadData() {
 }
 
 // ── countdown ────────────────────────────────────────────────
-let _cd = 60;
+let _cd = 15;
 setInterval(() => {
-  _cd = _cd <= 1 ? 60 : _cd - 1;
+  _cd = _cd <= 1 ? 15 : _cd - 1;
   const el = document.getElementById('s-countdown');
   if (el) el.textContent = _cd;
 }, 1000);
 const _origLoad = loadData;
-loadData = function() { _cd = 60; return _origLoad(); };
+loadData = function() { _cd = 15; return _origLoad(); };
 
 loadData();
-setInterval(loadData, 60000);
+setInterval(loadData, 15000);
 </script>
 <script src="farm_music.js"></script>
 </body>
