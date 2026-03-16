@@ -1,15 +1,29 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║       SERAPHINA v9 — HYBRID TREND + RSI + FUNDING BOT       ║
+║      SERAPHINA v10 — GRID + RSI/MA HYBRID                   ║
 ║  Strategy:                                                   ║
-║    1. 50-period MA trend filter (1h Kraken candles)          ║
-║    2. RSI(14) entry: buy RSI<35 in uptrend                   ║
-║    3. Exit: RSI>65, take-profit 2.5%, or trailing stop       ║
-║    4. Funding rate overlay: simulate income on longs         ║
-║    5. Maker-tier fees: 0.16% (vs 0.26% taker)               ║
-║    6. 60-second scans — fewer, higher-conviction trades      ║
+║    1. Grid trading: buys every 1% price dip through a level  ║
+║    2. RSI gate: skip grid buys if RSI > 70 (overbought)      ║
+║    3. RSI boost: larger size when RSI < 40 (oversold dip)    ║
+║    4. MA50 trend: reduce size in downtrend                   ║
+║    5. Exits: TP 2.5%, SL 4%, trailing stop, RSI>65 sell     ║
+║    6. Funding rate income on open positions                  ║
+║    7. Maker-tier fees 0.16%                                  ║
 ╚══════════════════════════════════════════════════════════════╝
+
+CHANGES v10 vs v9:
+  - Grid trading restored: buys triggered by price crossing grid
+    levels (every 1%), not just RSI<35. This generates consistent
+    daily activity from normal crypto volatility.
+  - RSI now a FILTER not the sole trigger:
+      RSI > 70  → skip grid buy (overbought protection)
+      RSI 40-70 → buy normally on grid cross
+      RSI < 40  → buy with 1.3x size boost (oversold dip)
+  - Multiple positions per coin supported (up to 3)
+  - MA50 downtrend → halve position size (trend awareness)
+  - All v9 safety features kept: circuit breaker, daily loss cap,
+    cash floor, trailing stop, TP, SL, funding income
 """
 import os, json, logging, time, sys, random
 from datetime import datetime
@@ -28,43 +42,53 @@ CONFIG = {
     "paper_budget":         1000.0,
     "coins":                ["BTC", "ETH", "SOL", "DOGE"],
 
-    # — indicators —
-    "ma_period":            50,     # 50-bar MA on 1h candles
+    # — grid —
+    "grid_levels":          8,      # levels above and below center
+    "grid_spacing_pct":     0.010,  # 1% between levels
+    "grid_drift_pct":       0.04,   # rebuild grid if price drifts >4% from center
+
+    # — indicators (1h candles) —
+    "ma_period":            50,
     "rsi_period":           14,
-    "rsi_buy":              35,     # oversold → buy signal
-    "rsi_sell":             65,     # overbought → sell signal
-    "candle_interval":      60,     # 60 min = 1h candles
-    "candle_count":         75,     # fetch 75 bars (50+14+buffer)
+    "candle_interval":      60,     # 60 min = 1h
+    "candle_count":         75,
+
+    # — RSI gates —
+    "rsi_buy_max":          70,     # skip grid buy if RSI above this
+    "rsi_boost_threshold":  40,     # boost size if RSI below this (oversold)
+    "rsi_boost_mult":       1.3,    # size multiplier on oversold dip
+    "rsi_sell_min":         65,     # close profitable positions if RSI above this
 
     # — trade management —
-    "take_profit_pct":      0.025,  # 2.5% TP
+    "take_profit_pct":      0.025,  # 2.5% TP per position
     "stop_loss_pct":        0.040,  # 4% hard stop
     "trail_activate_pct":   0.015,  # trailing stop arms at +1.5%
     "trail_stop_pct":       0.010,  # trails 1.0% below peak
 
     # — sizing —
-    "trade_size_pct":       0.20,   # 20% of portfolio per trade
-    "trade_size_min":       5.0,
-    "trade_size_max":       250.0,
+    "trade_size_pct":       0.08,   # 8% of portfolio per grid trade
+    "trade_size_min":       1.0,
+    "trade_size_max":       100.0,
+    "downtrend_size_mult":  0.5,    # halve size when below MA50
     "loss_streak_halve":    3,      # halve size after N consecutive losses
-    "max_open_per_coin":    1,
-    "max_open_total":       4,
+    "max_open_per_coin":    3,      # grid allows stacking positions per coin
+    "max_open_total":       12,
 
     # — fees (maker tier) —
-    "trading_fee_pct":      0.0016, # 0.16% maker (vs 0.26% taker)
-    "spread_pct":           0.0005, # 0.05% bid/ask
+    "trading_fee_pct":      0.0016,
+    "spread_pct":           0.0005,
 
     # — funding rate —
-    "funding_threshold":    0.0003, # 0.03%/8h (~13% APY) — collect above this
-    "funding_interval_h":   8,      # Binance pays funding every 8h
+    "funding_threshold":    0.0003,
+    "funding_interval_h":   8,
 
     # — risk —
     "daily_loss_cap":       30.0,
     "drawdown_pause_pct":   0.15,
     "drawdown_resume_pct":  0.08,
-    "cash_floor_pct":       0.20,
+    "cash_floor_pct":       0.15,
 
-    # — files —
+    # — misc —
     "scan_interval_sec":    60,
     "log_file":             "seraphina.log",
     "state_file":           "seraphina_state.json",
@@ -94,29 +118,29 @@ if sys.platform == "win32":
 # ══════════════════════════════════════════════════════════════
 QUOTES = {
     "hunting":  [
-        "RSI oversold. Trend confirmed. Deploying capital.",
-        "The signal is clean. Entering now.",
-        "Buy the dip — but only when the trend agrees.",
-        "Oversold in an uptrend is free money. Position open.",
+        "Grid level crossed. Deploying capital.",
+        "Price dipped through a level — bought the pullback.",
+        "Buy the dip. Sell the rip. Repeat.",
+        "Volatility is free money when you're positioned right.",
     ],
     "watching": [
-        "Waiting for RSI to reach oversold territory.",
+        "Grids are set. Waiting for the next crossing.",
+        "RSI is high — holding off on new buys.",
         "Trend is bullish but RSI isn't there yet. Patience.",
-        "I don't chase. I wait for the setup.",
-        "The market will come to me.",
+        "Positions open. Watching for TP or RSI exit.",
     ],
     "sleeping": [
-        "Bearish trend on all coins. Standing aside.",
-        "No setups today. Preserving capital is also a trade.",
-        "When the trend is down, the best trade is no trade.",
-        "Funding rates are low too. Just watching.",
+        "Overbought on all coins. Grid buys paused.",
+        "No crossings yet. The grid is patient.",
+        "Low volatility. My levels are still there.",
     ],
     "exiting": [
-        "RSI overbought. Taking profit. Discipline.",
-        "Target hit. Booking gains and resetting.",
-        "Sold into strength. Waiting for the next setup.",
+        "Target hit. Booking gains.",
+        "RSI overbought — closing profitable positions.",
+        "Sold into strength. Resetting grid.",
     ],
 }
+
 
 # ══════════════════════════════════════════════════════════════
 # MODULE 1 — CANDLE + INDICATOR FETCHER
@@ -131,7 +155,6 @@ class CandleFetcher:
     }
 
     def fetch(self, coin):
-        """Returns list of candle dicts, or None on failure."""
         pair = self.SYMBOLS.get(coin)
         if not pair:
             return None
@@ -178,8 +201,7 @@ class CandleFetcher:
             avg_l = (avg_l * (period - 1) + losses[i]) / period
         if avg_l == 0:
             return 100.0
-        rs = avg_g / avg_l
-        return round(100.0 - 100.0 / (1.0 + rs), 2)
+        return round(100.0 - 100.0 / (1.0 + avg_g / avg_l), 2)
 
     @staticmethod
     def calc_ma(closes, period=50):
@@ -189,28 +211,18 @@ class CandleFetcher:
 
 
 # ══════════════════════════════════════════════════════════════
-# MODULE 2 — FUNDING RATE FETCHER (Binance public API)
+# MODULE 2 — FUNDING RATE FETCHER
 # ══════════════════════════════════════════════════════════════
 class FundingFetcher:
     BINANCE_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
-    SYMBOLS = {
-        "BTC":  "BTCUSDT",
-        "ETH":  "ETHUSDT",
-        "SOL":  "SOLUSDT",
-        "DOGE": "DOGEUSDT",
-    }
+    SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "DOGE": "DOGEUSDT"}
 
     def fetch(self, coin):
-        """Returns {rate, next_funding_time, mark_price} or None."""
         symbol = self.SYMBOLS.get(coin)
         if not symbol:
             return None
         try:
-            r = requests.get(
-                self.BINANCE_URL,
-                params={"symbol": symbol},
-                timeout=8,
-            )
+            r = requests.get(self.BINANCE_URL, params={"symbol": symbol}, timeout=8)
             r.raise_for_status()
             d = r.json()
             return {
@@ -224,10 +236,71 @@ class FundingFetcher:
 
 
 # ══════════════════════════════════════════════════════════════
-# MODULE 3 — POSITION
+# MODULE 3 — GRID
+# ══════════════════════════════════════════════════════════════
+class Grid:
+    def __init__(self, coin, center):
+        self.coin       = coin
+        self.center     = center
+        self.created_at = datetime.now(ET).isoformat()
+        self.levels     = self._build(center)
+        self.occupied   = set()   # set of level indices that have an open position
+        log.info("  [GRID/%s] Built | center=$%.4f | %d levels | spacing=%.1f%%",
+                 coin, center, len(self.levels), CONFIG["grid_spacing_pct"] * 100)
+
+    def _build(self, center):
+        n  = CONFIG["grid_levels"]
+        sp = CONFIG["grid_spacing_pct"]
+        dec = 2 if center >= 10 else 4 if center >= 0.1 else 6
+        return sorted(set(
+            round(center * (1 + i * sp), dec)
+            for i in range(-n, n + 1)
+        ))
+
+    def drifted(self, price):
+        return abs(price - self.center) / self.center > CONFIG["grid_drift_pct"]
+
+    def find_buy_crossings(self, prev, curr):
+        """Return level indices crossed downward (buy signals)."""
+        lo, hi = min(prev, curr), max(prev, curr)
+        return [
+            i for i, lvl in enumerate(self.levels)
+            if lo <= lvl <= hi and curr < prev and i not in self.occupied
+        ]
+
+    def find_sell_crossings(self, prev, curr):
+        """Return level indices crossed upward that have open positions below."""
+        lo, hi = min(prev, curr), max(prev, curr)
+        return [
+            i for i, lvl in enumerate(self.levels)
+            if lo <= lvl <= hi and curr > prev
+        ]
+
+    def to_dict(self):
+        return {
+            "coin":       self.coin,
+            "center":     self.center,
+            "created_at": self.created_at,
+            "levels":     self.levels,
+            "occupied":   list(self.occupied),
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        g = cls.__new__(cls)
+        g.coin       = d["coin"]
+        g.center     = d["center"]
+        g.created_at = d.get("created_at", "")
+        g.levels     = d["levels"]
+        g.occupied   = set(d.get("occupied", []))
+        return g
+
+
+# ══════════════════════════════════════════════════════════════
+# MODULE 4 — POSITION
 # ══════════════════════════════════════════════════════════════
 class Position:
-    def __init__(self, coin, entry_price, size_usd):
+    def __init__(self, coin, entry_price, size_usd, grid_level_idx=None):
         self.coin            = coin
         self.entry_price     = entry_price
         self.size_usd        = size_usd
@@ -237,19 +310,16 @@ class Position:
         self.sl_price        = round(entry_price * (1 - CONFIG["stop_loss_pct"]),   6)
         self.trailing_active = False
         self.trailing_stop   = None
+        self.grid_level_idx  = grid_level_idx  # which grid level opened this
 
     def update(self, price):
         if price > self.peak_price:
             self.peak_price = price
-        gain = (self.peak_price - self.entry_price) / self.entry_price
-        if gain >= CONFIG["trail_activate_pct"]:
+        if (self.peak_price - self.entry_price) / self.entry_price >= CONFIG["trail_activate_pct"]:
             self.trailing_active = True
-            self.trailing_stop   = round(
-                self.peak_price * (1 - CONFIG["trail_stop_pct"]), 6
-            )
+            self.trailing_stop   = round(self.peak_price * (1 - CONFIG["trail_stop_pct"]), 6)
 
     def check_exit(self, price):
-        """Returns (should_exit: bool, reason: str | None)."""
         self.update(price)
         if price >= self.tp_price:
             return True, "TP"
@@ -276,6 +346,7 @@ class Position:
             "sl_price":        self.sl_price,
             "trailing_active": self.trailing_active,
             "trailing_stop":   self.trailing_stop,
+            "grid_level_idx":  self.grid_level_idx,
         }
 
     @classmethod
@@ -290,11 +361,12 @@ class Position:
         p.sl_price        = d["sl_price"]
         p.trailing_active = d.get("trailing_active", False)
         p.trailing_stop   = d.get("trailing_stop", None)
+        p.grid_level_idx  = d.get("grid_level_idx", None)
         return p
 
 
 # ══════════════════════════════════════════════════════════════
-# MODULE 4 — WALLET
+# MODULE 5 — WALLET
 # ══════════════════════════════════════════════════════════════
 class Wallet:
     def __init__(self):
@@ -343,18 +415,13 @@ class Wallet:
         self.daily_pnl  = round(self.daily_pnl + net_pnl, 4)
         self.total_fees = round(self.total_fees + fee, 4)
         if net_pnl > 0:
-            self.wins        += 1
-            self.win_streak  += 1
-            self.loss_streak  = 0
+            self.wins += 1; self.win_streak += 1; self.loss_streak = 0
         else:
-            self.losses      += 1
-            self.loss_streak += 1
-            self.win_streak   = 0
+            self.losses += 1; self.loss_streak += 1; self.win_streak = 0
         self.trade_log.append({
             "ts": datetime.now(ET).isoformat(), "coin": coin,
             "action": "SELL", "price": price, "size": position.size_usd,
-            "fee": fee, "pnl": net_pnl, "cash": round(self.cash, 2),
-            "reason": reason,
+            "fee": fee, "pnl": net_pnl, "cash": round(self.cash, 2), "reason": reason,
         })
         return net_pnl
 
@@ -389,11 +456,17 @@ class Wallet:
         total = self.wins + self.losses
         return round(self.wins / total * 100, 1) if total else 0.0
 
-    def trade_size(self, portfolio):
+    def trade_size(self, portfolio, rsi=None, above_ma=True):
         raw = portfolio * CONFIG["trade_size_pct"]
+        # halve in downtrend
+        if not above_ma:
+            raw *= CONFIG["downtrend_size_mult"]
+        # boost on oversold RSI
+        if rsi is not None and rsi < CONFIG["rsi_boost_threshold"]:
+            raw *= CONFIG["rsi_boost_mult"]
+        # halve on loss streak
         if self.loss_streak >= CONFIG["loss_streak_halve"]:
             raw *= 0.5
-            log.info("  [SIZE] Loss streak %d — halving to $%.2f", self.loss_streak, raw)
         return round(max(CONFIG["trade_size_min"], min(CONFIG["trade_size_max"], raw)), 2)
 
     def to_dict(self):
@@ -432,17 +505,19 @@ class Wallet:
 
 
 # ══════════════════════════════════════════════════════════════
-# MODULE 5 — MAIN BOT
+# MODULE 6 — MAIN BOT
 # ══════════════════════════════════════════════════════════════
 class SeraphinaBot:
     def __init__(self):
         self.candles        = CandleFetcher()
         self.funding_api    = FundingFetcher()
         self.wallet         = Wallet()
-        self.positions      = {}   # coin -> Position
-        self.signals        = {}   # coin -> signal dict (last scan)
-        self.funding_rates  = {}   # coin -> {rate, next_funding_time, ...}
-        self._last_funding  = {}   # coin -> ISO timestamp of last payment
+        self.positions      = []        # List[Position]
+        self.grids          = {}        # coin -> Grid
+        self.prev_prices    = {}        # coin -> last price
+        self.signals        = {}        # coin -> signal dict
+        self.funding_rates  = {}
+        self._last_funding  = {}
         self.scan_count     = 0
         self._daily_history = []
         self._load_state()
@@ -454,22 +529,26 @@ class SeraphinaBot:
             with open(CONFIG["state_file"]) as f:
                 d = json.load(f)
             self.wallet.load_dict(d.get("wallet", {}))
-            for coin, pd in d.get("positions", {}).items():
-                self.positions[coin] = Position.from_dict(pd)
+            for pd in d.get("positions", []):
+                self.positions.append(Position.from_dict(pd))
+            for coin, gd in d.get("grids", {}).items():
+                self.grids[coin] = Grid.from_dict(gd)
             self._last_funding = d.get("last_funding", {})
-            log.info("[INIT] Loaded | cash=$%.2f | pnl=$%+.2f | positions=%d",
-                     self.wallet.cash, self.wallet.total_pnl, len(self.positions))
+            log.info("[INIT] Loaded | cash=$%.2f | pnl=$%+.2f | positions=%d | grids=%d",
+                     self.wallet.cash, self.wallet.total_pnl,
+                     len(self.positions), len(self.grids))
         except FileNotFoundError:
             log.info("[INIT] No state — fresh start at $%.2f", CONFIG["paper_budget"])
         except Exception as e:
-            log.warning("[INIT] State load failed: %s", e)
+            log.warning("[INIT] State load failed: %s — fresh start", e)
 
     def _save_state(self):
         try:
             with open(CONFIG["state_file"], "w") as f:
                 json.dump({
                     "wallet":       self.wallet.to_dict(),
-                    "positions":    {c: p.to_dict() for c, p in self.positions.items()},
+                    "positions":    [p.to_dict() for p in self.positions],
+                    "grids":        {c: g.to_dict() for c, g in self.grids.items()},
                     "last_funding": self._last_funding,
                 }, f, indent=2)
         except Exception as e:
@@ -498,13 +577,15 @@ class SeraphinaBot:
     # ── helpers ──────────────────────────────────────────────
     def _portfolio_value(self, prices):
         pos_val = sum(
-            pos.size_usd * (prices.get(pos.coin, pos.entry_price) / pos.entry_price)
-            for pos in self.positions.values()
+            p.size_usd * (prices.get(p.coin, p.entry_price) / p.entry_price)
+            for p in self.positions
         )
         return round(self.wallet.cash + pos_val, 2)
 
+    def _open_for_coin(self, coin):
+        return [p for p in self.positions if p.coin == coin]
+
     def _analyze(self, coin):
-        """Fetch 1h candles, compute MA50 + RSI14, return signal dict or None."""
         candles = self.candles.fetch(coin)
         if not candles or len(candles) < CONFIG["ma_period"] + CONFIG["rsi_period"]:
             return None
@@ -514,45 +595,37 @@ class SeraphinaBot:
         rsi    = CandleFetcher.calc_rsi(closes, CONFIG["rsi_period"])
         if ma50 is None or rsi is None:
             return None
-        above_ma       = price > ma50
-        trend          = "bullish" if above_ma else "bearish"
-        trend_strength = round((price - ma50) / ma50 * 100, 2)
-        buy_signal     = rsi < CONFIG["rsi_buy"] and above_ma
-        sell_signal    = rsi > CONFIG["rsi_sell"]
+        above_ma = price > ma50
         return {
             "coin":           coin,
             "price":          price,
             "ma50":           ma50,
             "rsi":            rsi,
-            "trend":          trend,
-            "trend_strength": trend_strength,
+            "trend":          "bullish" if above_ma else "bearish",
+            "trend_strength": round((price - ma50) / ma50 * 100, 2),
             "above_ma":       above_ma,
-            "buy_signal":     buy_signal,
-            "sell_signal":    sell_signal,
             "high_24h":       max(c["high"]   for c in candles[-24:]),
             "low_24h":        min(c["low"]    for c in candles[-24:]),
             "volume_24h":     sum(c["volume"] for c in candles[-24:]),
         }
 
-    def _collect_funding(self, coin, position):
-        """Credit funding income if 8h have elapsed and rate > threshold."""
-        rate_data = self.funding_rates.get(coin)
+    def _collect_funding(self, pos):
+        rate_data = self.funding_rates.get(pos.coin)
         if not rate_data:
             return
         rate = rate_data.get("rate", 0)
         if rate < CONFIG["funding_threshold"]:
             return
-        last = self._last_funding.get(coin)
+        last = self._last_funding.get(pos.coin)
         now  = datetime.now(ET)
         if last:
             hours = (now - datetime.fromisoformat(last)).total_seconds() / 3600
             if hours < CONFIG["funding_interval_h"]:
                 return
-        income = round(position.size_usd * rate, 4)
-        self.wallet.add_funding(coin, income, rate)
-        self._last_funding[coin] = now.isoformat()
-        log.info("  [FUNDING/%s] +$%.4f (%.4f%%/8h ≈ %.1f%% APY)",
-                 coin, income, rate * 100, rate * 3 * 365 * 100)
+        income = round(pos.size_usd * rate, 4)
+        self.wallet.add_funding(pos.coin, income, rate)
+        self._last_funding[pos.coin] = now.isoformat()
+        log.info("  [FUNDING/%s] +$%.4f (%.4f%%/8h)", pos.coin, income, rate * 100)
 
     # ── dashboard ────────────────────────────────────────────
     def _write_dashboard(self, prices, all_signals, trades_this_scan, portfolio):
@@ -561,10 +634,10 @@ class SeraphinaBot:
             roi = round(pnl / CONFIG["paper_budget"] * 100, 2)
 
             positions_out = []
-            for coin, pos in self.positions.items():
-                price = prices.get(coin, pos.entry_price)
+            for pos in self.positions:
+                price = prices.get(pos.coin, pos.entry_price)
                 positions_out.append({
-                    "coin":           coin,
+                    "coin":           pos.coin,
                     "entryPrice":     pos.entry_price,
                     "currentPrice":   price,
                     "sizeUsd":        pos.size_usd,
@@ -576,6 +649,7 @@ class SeraphinaBot:
                     "trailingStop":   pos.trailing_stop,
                     "unrealizedPnl":  pos.unrealized_pnl(price),
                     "unrealizedPct":  pos.unrealized_pct(price),
+                    "gridLevel":      pos.grid_level_idx,
                 })
 
             signals_out = {}
@@ -587,12 +661,24 @@ class SeraphinaBot:
                     "trend":         sig["trend"],
                     "trendStrength": sig["trend_strength"],
                     "aboveMa":       sig["above_ma"],
-                    "buySignal":     sig["buy_signal"],
-                    "sellSignal":    sig["sell_signal"],
+                    "buySignal":     sig["rsi"] < CONFIG["rsi_buy_max"] if sig.get("rsi") else False,
+                    "sellSignal":    sig["rsi"] > CONFIG["rsi_sell_min"] if sig.get("rsi") else False,
                     "high24h":       sig["high_24h"],
                     "low24h":        sig["low_24h"],
                     "volume24h":     sig["volume_24h"],
                 }
+
+            grids_out = []
+            for coin, g in self.grids.items():
+                price = prices.get(coin)
+                coin_positions = self._open_for_coin(coin)
+                grids_out.append({
+                    "coin":       coin,
+                    "center":     g.center,
+                    "levels":     g.levels,
+                    "openCount":  len(coin_positions),
+                    "spacing":    f"{CONFIG['grid_spacing_pct']*100:.1f}%",
+                })
 
             funding_out = {}
             for coin, fd in self.funding_rates.items():
@@ -600,13 +686,11 @@ class SeraphinaBot:
                 funding_out[coin] = {
                     "rate":    rate,
                     "apy":     round(rate * 3 * 365 * 100, 2),
-                    "nextTs":  fd.get("next_funding_time", 0),
                     "notable": rate >= CONFIG["funding_threshold"],
                 }
 
             if trades_this_scan > 0 and any(
-                t["action"] == "SELL"
-                for t in self.wallet.trade_log[-max(trades_this_scan, 1):]
+                t["action"] == "SELL" for t in self.wallet.trade_log[-max(trades_this_scan, 1):]
             ):
                 mood = "exiting"
             elif trades_this_scan > 0:
@@ -619,7 +703,7 @@ class SeraphinaBot:
 
             with open(CONFIG["dashboard_file"], "w") as f:
                 json.dump({
-                    "version":           "v9",
+                    "version":           "v10",
                     "lastScan":          datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
                     "mode":              "PAPER" if CONFIG["dry_run"] else "LIVE",
                     "mood":              mood,
@@ -649,11 +733,16 @@ class SeraphinaBot:
                         (self.wallet.peak_portfolio - portfolio) / self.wallet.peak_portfolio * 100, 2
                     ) if self.wallet.peak_portfolio > 0 else 0,
                     "cashFloorPct":      CONFIG["cash_floor_pct"] * 100,
-                    "rsiConfig":         {"buy": CONFIG["rsi_buy"], "sell": CONFIG["rsi_sell"]},
+                    "rsiConfig":         {
+                        "buyMax":  CONFIG["rsi_buy_max"],
+                        "sellMin": CONFIG["rsi_sell_min"],
+                        "boost":   CONFIG["rsi_boost_threshold"],
+                    },
                     "tpPct":             CONFIG["take_profit_pct"] * 100,
                     "slPct":             CONFIG["stop_loss_pct"] * 100,
                     "positions":         positions_out,
                     "signals":           signals_out,
+                    "grids":             grids_out,
                     "fundingRates":      funding_out,
                     "recentTrades":      self.wallet.trade_log[-30:],
                     "walletHistory":     self.wallet.wallet_history[-500:],
@@ -669,7 +758,7 @@ class SeraphinaBot:
         self.wallet.reset_daily()
 
         log.info("=" * 64)
-        log.info("  SERAPHINA v9 #%d | %s | cash=$%.2f | pnl=$%+.2f | open=%d",
+        log.info("  SERAPHINA v10 #%d | %s | cash=$%.2f | pnl=$%+.2f | open=%d",
                  self.scan_count,
                  datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
                  self.wallet.cash, self.wallet.total_pnl, len(self.positions))
@@ -683,9 +772,9 @@ class SeraphinaBot:
             if sig:
                 all_signals[coin] = sig
                 prices[coin]      = sig["price"]
-                log.info("  %s $%.4f | MA50=$%.4f | RSI=%.1f | %s | BUY=%s SELL=%s",
+                log.info("  %s $%.4f | MA50=$%.4f | RSI=%.1f | %s",
                          coin, sig["price"], sig["ma50"], sig["rsi"],
-                         sig["trend"].upper(), sig["buy_signal"], sig["sell_signal"])
+                         sig["trend"].upper())
             else:
                 log.warning("  %s: candle/analysis failed", coin)
         self.signals = all_signals
@@ -695,71 +784,113 @@ class SeraphinaBot:
             fd = self.funding_api.fetch(coin)
             if fd:
                 self.funding_rates[coin] = fd
-                log.info("  FUNDING %s: %.4f%%/8h (≈%.1f%% APY)",
-                         coin, fd["rate"] * 100, fd["rate"] * 3 * 365 * 100)
 
         # ── 3. Portfolio + circuit breaker ─────────────────────
         portfolio = self._portfolio_value(prices)
         self.wallet.update_peak(portfolio)
 
-        # ── 4. Check exits ─────────────────────────────────────
+        # ── 4. Init / rebuild grids ────────────────────────────
+        for coin, price in prices.items():
+            if coin not in self.grids:
+                self.grids[coin] = Grid(coin, price)
+                self.prev_prices[coin] = price * 0.9999
+            elif self.grids[coin].drifted(price):
+                log.info("  [GRID/%s] Drifted >%.0f%% from center — rebuilding",
+                         coin, CONFIG["grid_drift_pct"] * 100)
+                # Keep occupied set in sync with open positions
+                self.grids[coin] = Grid(coin, price)
+                self.prev_prices[coin] = price * 0.9999
+            # Sync occupied set from actual open positions
+            self.grids[coin].occupied = {
+                p.grid_level_idx for p in self.positions
+                if p.coin == coin and p.grid_level_idx is not None
+            }
+
         trades_this_scan = 0
-        for coin in list(self.positions.keys()):
-            pos   = self.positions[coin]
-            price = prices.get(coin)
+
+        # ── 5. Check exits (TP / SL / trail / RSI overbought) ──
+        for pos in list(self.positions):
+            price = prices.get(pos.coin)
             if not price:
                 continue
             should_exit, reason = pos.check_exit(price)
-            sig = all_signals.get(coin)
-            if sig and sig["sell_signal"] and not should_exit:
-                should_exit, reason = True, "RSI_OB"
+            # RSI overbought sell — only close if profitable
+            if not should_exit:
+                sig = all_signals.get(pos.coin)
+                if sig and sig["rsi"] > CONFIG["rsi_sell_min"] and pos.unrealized_pnl(price) > 0:
+                    should_exit, reason = True, "RSI_OB"
             if should_exit:
-                pnl = self.wallet.sell(coin, price, pos, reason or "")
-                del self.positions[coin]
+                pnl = self.wallet.sell(pos.coin, price, pos, reason or "")
+                self.positions.remove(pos)
                 trades_this_scan += 1
                 log.info("  [EXIT/%s] %s | $%.4f | pnl=$%+.4f | cash=$%.2f",
-                         coin, reason, price, pnl, self.wallet.cash)
+                         pos.coin, reason, price, pnl, self.wallet.cash)
 
-        # ── 5. Collect funding for open positions ──────────────
-        for coin, pos in list(self.positions.items()):
-            self._collect_funding(coin, pos)
+        # ── 6. Collect funding ─────────────────────────────────
+        for pos in list(self.positions):
+            self._collect_funding(pos)
 
-        # ── 6. Check entries ───────────────────────────────────
-        for coin, sig in all_signals.items():
-            if not sig["buy_signal"]:
+        # ── 7. Grid crossings → entries ────────────────────────
+        for coin, price in prices.items():
+            if coin not in self.grids:
                 continue
-            if coin in self.positions:
-                log.info("  [ENTRY/%s] Already open — skip", coin)
+            g    = self.grids[coin]
+            prev = self.prev_prices.get(coin, price)
+            sig  = all_signals.get(coin, {})
+            rsi      = sig.get("rsi")
+            above_ma = sig.get("above_ma", True)
+
+            if prev == price:
+                self.prev_prices[coin] = price
                 continue
+
+            # Check RSI gate first — skip all buys if overbought
+            if rsi is not None and rsi > CONFIG["rsi_buy_max"]:
+                log.info("  [GRID/%s] RSI=%.1f > %.0f — skipping buys this scan",
+                         coin, rsi, CONFIG["rsi_buy_max"])
+                self.prev_prices[coin] = price
+                continue
+
+            # Safety checks
             if self.wallet.circuit_breaker_active:
-                log.info("  [ENTRY/%s] Circuit breaker — skip", coin)
+                self.prev_prices[coin] = price
                 continue
             if self.wallet.daily_loss_hit():
-                log.info("  [ENTRY/%s] Daily loss cap — skip", coin)
+                self.prev_prices[coin] = price
                 continue
-            if len(self.positions) >= CONFIG["max_open_total"]:
-                log.info("  [ENTRY/%s] Max positions — skip", coin)
-                continue
-            floor = portfolio * CONFIG["cash_floor_pct"]
-            if self.wallet.cash < floor:
-                log.info("  [ENTRY/%s] Cash floor $%.2f — skip", coin, floor)
-                continue
-            size = self.wallet.trade_size(portfolio)
-            if size > self.wallet.cash:
-                log.info("  [ENTRY/%s] Not enough cash — skip", coin)
-                continue
-            self.wallet.buy(coin, sig["price"], size)
-            self.positions[coin] = Position(coin, sig["price"], size)
-            trades_this_scan += 1
-            log.info("  [ENTRY/%s] BUY $%.4f | RSI=%.1f | MA50=$%.4f | size=$%.2f | cash=$%.2f",
-                     coin, sig["price"], sig["rsi"], sig["ma50"], size, self.wallet.cash)
 
-        # ── 7. Save + dashboard ────────────────────────────────
+            buy_idxs = g.find_buy_crossings(prev, price)
+            for idx in buy_idxs:
+                coin_open = self._open_for_coin(coin)
+                if len(coin_open) >= CONFIG["max_open_per_coin"]:
+                    log.info("  [GRID/%s] Max per coin (%d) — skip", coin, CONFIG["max_open_per_coin"])
+                    break
+                if len(self.positions) >= CONFIG["max_open_total"]:
+                    log.info("  [GRID] Max total (%d) — skip", CONFIG["max_open_total"])
+                    break
+                floor = portfolio * CONFIG["cash_floor_pct"]
+                if self.wallet.cash < floor:
+                    log.info("  [GRID/%s] Cash floor $%.2f — skip", coin, floor)
+                    break
+                size = self.wallet.trade_size(portfolio, rsi=rsi, above_ma=above_ma)
+                if size > self.wallet.cash:
+                    break
+                lvl = g.levels[idx]
+                self.wallet.buy(coin, lvl, size)
+                pos = Position(coin, lvl, size, grid_level_idx=idx)
+                self.positions.append(pos)
+                g.occupied.add(idx)
+                trades_this_scan += 1
+                log.info("  [GRID/%s] BUY level $%.4f | RSI=%.1f | %s | size=$%.2f | cash=$%.2f",
+                         coin, lvl, rsi if rsi else 0,
+                         "UPTREND" if above_ma else "downtrend",
+                         size, self.wallet.cash)
+
+            self.prev_prices[coin] = price
+
+        # ── 8. Save + dashboard ────────────────────────────────
         portfolio = self._portfolio_value(prices)
-        self.wallet.wallet_history.append({
-            "t": datetime.now(ET).isoformat(),
-            "v": portfolio,
-        })
+        self.wallet.wallet_history.append({"t": datetime.now(ET).isoformat(), "v": portfolio})
         if len(self.wallet.wallet_history) > 500:
             self.wallet.wallet_history = self.wallet.wallet_history[-500:]
         self._save_state()
@@ -771,13 +902,13 @@ class SeraphinaBot:
 
     # ── loop ─────────────────────────────────────────────────
     def run_loop(self):
-        log.info("Seraphina v9 starting | mode=%s | budget=$%.0f | coins=%s",
+        log.info("Seraphina v10 starting | mode=%s | budget=$%.0f | coins=%s",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], ", ".join(CONFIG["coins"]))
-        log.info("Strategy: MA%d trend filter + RSI(%d) buy<%.0f sell>%.0f + %.1f%% TP | maker fees",
-                 CONFIG["ma_period"], CONFIG["rsi_period"],
-                 CONFIG["rsi_buy"], CONFIG["rsi_sell"],
-                 CONFIG["take_profit_pct"] * 100)
+        log.info("Grid %.1f%% spacing | RSI buy<%.0f sell>%.0f | boost<%.0f | MA50 trend | maker fees",
+                 CONFIG["grid_spacing_pct"] * 100,
+                 CONFIG["rsi_buy_max"], CONFIG["rsi_sell_min"],
+                 CONFIG["rsi_boost_threshold"])
         while True:
             try:
                 self.run_once()
