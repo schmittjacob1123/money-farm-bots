@@ -906,7 +906,7 @@ class SeraphinaBot:
         self.wallet.reset_daily()
 
         log.info("=" * 64)
-        log.info("  SERAPHINA v10 #%d | %s | cash=$%.2f | pnl=$%+.2f | open=%d",
+        log.info("  SERAPHINA v11 #%d | %s | cash=$%.2f | pnl=$%+.2f | open=%d",
                  self.scan_count,
                  datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
                  self.wallet.cash, self.wallet.total_pnl, len(self.positions))
