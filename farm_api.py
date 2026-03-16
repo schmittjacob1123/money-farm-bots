@@ -6,12 +6,8 @@ SETUP:  pip install flask flask-cors
 RUN:    screen -S farmapi -> python3 farm_api.py -> Ctrl+A D
 """
 
-import subprocess, os, json, time, secrets, hashlib
-from dotenv import load_dotenv
-load_dotenv(override=True)
-from twilio.request_validator import RequestValidator as TwilioValidator
-_twilio_validator = TwilioValidator(os.getenv("TWILIO_AUTH_TOKEN", ""))
-from flask import Flask, jsonify, request, make_response, Response
+import subprocess, os, json, time, secrets, hashlib, base64
+from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -21,6 +17,21 @@ CORS(app, supports_credentials=True)
 FARM_PASSWORD = os.environ.get("FARM_PASSWORD", "kickrocks!")
 SESSION_SECRET = "d4f2861dc96539bb657aef8e80e37e590eb214de23308c69a85c5deefefe0ea6"
 SESSIONS = set()  # in-memory valid tokens
+
+# ── API TOKEN AUTH (for Claude / programmatic access) ──
+# Set FARM_API_TOKEN in .env to a long random string.
+# Pass as ?token=YOUR_TOKEN on /debug and /apply-update.
+FARM_API_TOKEN = os.environ.get("FARM_API_TOKEN", "")
+
+def valid_api_token(req):
+    """Check ?token= query param against FARM_API_TOKEN env var."""
+    if not FARM_API_TOKEN:
+        return False  # token not configured — deny all
+    return req.args.get("token", "") == FARM_API_TOKEN
+
+def authorized(req):
+    """Accept either a valid browser session OR a valid API token."""
+    return valid_session(req) or valid_api_token(req)
 
 def make_token():
     return secrets.token_hex(32)
@@ -33,7 +44,7 @@ WORK_DIR = "/home/ubuntu"
 
 BOTS = {
     "jacob":     {"script": "jacob_bot.py",  "screen": "jacob", "state": ["jacob_state.json", "jacob_trades.csv", "jacob_data.json"]},
-    "seraphina": {"script": "seraphina_bot.py",   "screen": "seraphina",  "state": ["seraphina_state.json", "seraphina_trades.csv", "seraphina_data.json", "seraphina_daily.json"]},
+    "seraphina": {"script": "seraphina_bot.py",   "screen": "seraphina",  "state": ["seraphina_state.json", "seraphina_trades.csv", "seraphina_data.json"]},
     "loachy":    {"script": "loachy_bot.py",      "screen": "loachy",     "state": ["loachy_state.json", "loachy_trades.csv", "loachy_data.json", "loachy_pending.json"]},
 }
 
@@ -51,11 +62,7 @@ CSV_HEADERS = {
     "loachy_trades.csv":    "timestamp,sport,game,bet,odds,size,result,pnl,source\n",
 }
 
-DELETE_ON_RESET = [
-    "seraphina_state.json", "seraphina_data.json", "seraphina_daily.json",
-    "jacob_state.json",     "jacob_data.json",
-    "loachy_data.json",     "live_data.json",
-]
+DELETE_ON_RESET = ["live_data.json", "seraphina_data.json", "loachy_data.json"]
 
 
 def get_screen_pid(screen_name):
@@ -73,6 +80,24 @@ def get_screen_pid(screen_name):
 
 def is_running(screen_name):
     return get_screen_pid(screen_name) is not None
+
+
+def kill_all_screens(screen_name):
+    """Kill every screen session matching this name (prevents duplicate instances)."""
+    try:
+        result = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
+        killed = 0
+        for line in result.stdout.splitlines():
+            if f".{screen_name}" in line:
+                pid = line.strip().split(".")[0].strip()
+                if pid.isdigit():
+                    subprocess.run(["screen", "-X", "-S", f"{pid}.{screen_name}", "quit"],
+                                   capture_output=True)
+                    killed += 1
+        return killed
+    except Exception as e:
+        print(f"kill_all_screens error: {e}")
+        return 0
 
 
 @app.route("/status", methods=["GET"])
@@ -108,8 +133,8 @@ def stop_bot(botname):
     if get_screen_pid(cfg["screen"]) is None:
         return jsonify({"ok": True, "message": f"{botname} already stopped"})
     try:
-        subprocess.run(["screen", "-X", "-S", cfg["screen"], "quit"], capture_output=True)
-        return jsonify({"ok": True, "message": f"{botname} stopped"})
+        killed = kill_all_screens(cfg["screen"])
+        return jsonify({"ok": True, "message": f"{botname} stopped ({killed} instance(s) killed)"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -121,7 +146,7 @@ def reset_bot(botname):
     cfg = BOTS[botname]
 
     if is_running(cfg["screen"]):
-        subprocess.run(["screen", "-X", "-S", cfg["screen"], "quit"], capture_output=True)
+        kill_all_screens(cfg["screen"])
         time.sleep(1)
 
     errors = []
@@ -145,15 +170,7 @@ def reset_bot(botname):
 
     if errors:
         return jsonify({"ok": False, "error": "Some files failed: " + ", ".join(errors)})
-
-    # Auto-restart bot after reset
-    try:
-        restart_cmd = f"cd {WORK_DIR} && env $(cat {WORK_DIR}/.env | xargs) python3 {WORK_DIR}/{cfg['script']}"
-        subprocess.Popen(["screen", "-dmS", cfg["screen"], "bash", "-c", restart_cmd])
-    except Exception as restart_err:
-        return jsonify({"ok": True, "message": f"{botname} reset to $1,000 (restart failed: {restart_err})"})
-
-    return jsonify({"ok": True, "message": f"{botname} reset to $1,000 and restarted"})
+    return jsonify({"ok": True, "message": f"{botname} reset to fresh $50 simulation"})
 
 
 @app.route("/sports-config", methods=["GET", "POST"])
@@ -224,6 +241,58 @@ def pending_approve():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/set-odds-key", methods=["POST"])
+def set_odds_key():
+    """Update ODDS_API_KEY in .env and restart Loachy. Requires browser session."""
+    if not valid_session(request):
+        return jsonify({"ok": False, "error": "Not authenticated"}), 401
+    try:
+        body    = request.get_json() or {}
+        new_key = body.get("key", "").strip()
+        restart = body.get("restart", True)
+
+        if not new_key:
+            return jsonify({"ok": False, "error": "key is required"}), 400
+
+        env_path = os.path.join(WORK_DIR, ".env")
+        try:
+            with open(env_path) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            lines = []
+
+        found, new_lines = False, []
+        for line in lines:
+            if line.startswith("ODDS_API_KEY="):
+                new_lines.append(f"ODDS_API_KEY={new_key}\n")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"ODDS_API_KEY={new_key}\n")
+
+        with open(env_path, "w") as f:
+            f.writelines(new_lines)
+
+        restarted = False
+        if restart:
+            cfg = BOTS["loachy"]
+            kill_all_screens(cfg["screen"])
+            time.sleep(1)
+            subprocess.Popen(
+                ["screen", "-dmS", cfg["screen"], "python3",
+                 os.path.join(WORK_DIR, cfg["script"])],
+                cwd=WORK_DIR
+            )
+            restarted = True
+            print(f"[SET-ODDS-KEY] Key updated + Loachy restarted")
+
+        return jsonify({"ok": True, "restarted": restarted,
+                        "message": "ODDS_API_KEY updated" + (" · Loachy restarted" if restarted else "")})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/auth/login", methods=["POST"])
 def login():
     body = request.get_json() or {}
@@ -252,205 +321,151 @@ def auth_check():
 
 
 
-FARM_API_TOKEN = os.environ.get("FARM_API_TOKEN", "")
+@app.route("/debug", methods=["GET"])
+def debug():
+    """
+    Returns a full snapshot of all bot data in one JSON blob.
+    Claude can web_fetch this URL directly — no more copy-pasting logs.
+    Auth: browser session cookie OR ?token=FARM_API_TOKEN
+    """
+    if not authorized(request):
+        return jsonify({"ok": False, "error": "Not authenticated"}), 401
 
-# Whitelist of files Claude is allowed to read remotely
-READABLE_FILES = [
-    "seraphina_bot.py", "jacob_bot.py", "loachy_bot.py",
-    "farm_api.py", "farm_deploy.py", "farm_alerts.py", "farm_gist.py",
-    "seraphina_dashboard.html", "jacob_dashboard.html", "loachy_dashboard.html",
-    "index.html", "login.html",
-    "seraphina_data.json", "seraphina_state.json", "seraphina_daily.json",
-    "loachy_data.json", "loachy_state.json", "loachy_pending.json",
-    "jacob_data.json",
-]
+    def read_file(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except:
+            return None
 
-def valid_api_token(req):
-    token = req.args.get("token") or req.headers.get("X-API-Token")
-    return FARM_API_TOKEN and token == FARM_API_TOKEN
+    def read_log(path, lines=80):
+        try:
+            with open(path) as f:
+                return f.readlines()[-lines:]
+        except:
+            return []
 
-
-@app.route("/farm-data", methods=["GET"])
-def farm_data():
-    """Live farm status for Claude — token protected."""
-    if not valid_api_token(request):
-        return jsonify({"error": "unauthorized"}), 401
+    # Screen status
+    screens = {}
     try:
-        screens = subprocess.run(["screen", "-ls"], capture_output=True, text=True).stdout.strip()
-
-        def read_json(fname):
-            try:
-                with open(os.path.join(WORK_DIR, fname)) as f:
-                    return json.load(f)
-            except:
-                return None
-
-        return jsonify({
-            "seraphina_data": read_json("seraphina_data.json"),
-            "jacob_data":     read_json("jacob_data.json"),
-            "loachy_data":    read_json("loachy_data.json"),
-            "loachy_state":   read_json("loachy_state.json"),
-            "loachy_pending": read_json("loachy_pending.json"),
-            "screens":        screens,
-            "updated_at":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/file", methods=["GET"])
-def read_file():
-    """Return contents of a whitelisted file — token protected."""
-    if not valid_api_token(request):
-        return jsonify({"error": "unauthorized"}), 401
-    name = request.args.get("name", "")
-    if name not in READABLE_FILES:
-        return jsonify({"error": f"file not in whitelist: {name}"}), 403
-    fpath = os.path.join(WORK_DIR, name)
-    try:
-        with open(fpath) as f:
-            content = f.read()
-        return jsonify({"name": name, "content": content, "size": len(content)})
-    except FileNotFoundError:
-        return jsonify({"error": f"{name} not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-
-# ══════════════════════════════════════════════════════════════
-# SMS WEBHOOK — two-way reply handler (Twilio -> POST here)
-# Configure Twilio webhook URL to:
-#   https://jacobsmoneyfarm.duckdns.org/api/sms/webhook
-# ══════════════════════════════════════════════════════════════
-
-import logging
-_sms_log = logging.getLogger("sms_webhook")
-
-def _sms_send(message):
-    """Send an SMS reply via Twilio."""
-    sid   = os.environ.get("TWILIO_SID", "")
-    token = os.environ.get("TWILIO_AUTH_TOKEN", "")
-    frm   = os.environ.get("TWILIO_FROM", "")
-    to    = os.environ.get("ALERT_TO", "")
-    if not all([sid, token, frm, to]):
-        _sms_log.warning(f"[SMS] Creds missing — would have sent: {message[:60]}")
-        return
-    try:
-        from twilio.rest import Client
-        Client(sid, token).messages.create(body=message, from_=frm, to=to)
-        _sms_log.info(f"[SMS] Reply sent: {message[:60]}")
-    except Exception as e:
-        _sms_log.error(f"[SMS] Reply failed: {e}")
-
-
-def _approve_reject_pending(action):
-    """Approve or reject the last alerted Loachy pending bet."""
-    fpath_alerted = os.path.join(WORK_DIR, "last_alerted_bet.json")
-    fpath_pending = os.path.join(WORK_DIR, "loachy_pending.json")
-    try:
-        with open(fpath_alerted) as f:
-            game_id = json.load(f).get("game_id", "")
-        if not game_id:
-            return "No pending bet on record."
-
-        with open(fpath_pending) as f:
-            data = json.load(f)
-
-        bet = next((p for p in data.get("pending", []) if p["game_id"] == game_id), None)
-        if not bet:
-            return "Bet already actioned or expired."
-
-        data["pending"] = [p for p in data["pending"] if p["game_id"] != game_id]
-        key = "approved" if action == "approve" else "rejected"
-        bet["status"] = action.upper()
-        data.setdefault(key, []).append(bet)
-
-        with open(fpath_pending, "w") as f:
-            json.dump(data, f, indent=2)
-
-        matchup = f"{bet.get('away','?')} @ {bet.get('home','?')}"
-        odds    = bet.get("best_price", "?")
-        return f"Bet {action.upper()}: {matchup} {odds}"
-    except Exception as e:
-        return f"Error: {e}"
-
-
-def _handle_pause(bot_name):
-    if bot_name not in BOTS:
-        return f"Unknown bot: {bot_name}. Try SERAPHINA or JACOB."
-    cfg = BOTS[bot_name]
-    try:
-        subprocess.run(["screen", "-X", "-S", cfg["screen"], "quit"], capture_output=True)
-        return f"{bot_name.upper()} paused. Reply RESUME {bot_name.upper()} to restart."
-    except Exception as e:
-        return f"Failed to pause {bot_name}: {e}"
-
-
-def _handle_resume(bot_name):
-    if bot_name not in BOTS:
-        return f"Unknown bot: {bot_name}. Try SERAPHINA or JACOB."
-    cfg = BOTS[bot_name]
-    try:
-        cmd = f"cd {WORK_DIR} && env $(cat {WORK_DIR}/.env | xargs) python3 {WORK_DIR}/{cfg['script']}"
-        subprocess.Popen(["screen", "-dmS", cfg["screen"], "bash", "-c", cmd])
-        return f"{bot_name.upper()} restarted. Check dashboard to confirm."
-    except Exception as e:
-        return f"Failed to resume {bot_name}: {e}"
-
-
-def _handle_status():
-    lines = ["Farm Status:"]
-    for name, cfg in BOTS.items():
-        status = "RUNNING" if is_running(cfg["screen"]) else "DOWN"
-        lines.append(f"  {name}: {status}")
-    try:
-        import json as _j
-        sera = _j.load(open(os.path.join(WORK_DIR, "seraphina_data.json")))
-        jac  = _j.load(open(os.path.join(WORK_DIR, "jacob_data.json")))
-        lines.append(f"Sera: ${sera.get('portfolioValue',0):.2f} | {sera.get('dailyPnl',0):+.2f} today")
-        lines.append(f"Jacob: ${jac.get('portfolioValue',0):.2f} | {jac.get('dailyPnl',0):+.2f} today")
+        result = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line or "Socket" in line or "There" in line:
+                continue
+            screens[line] = True
     except:
         pass
-    return "\n".join(lines)
+
+    bots_debug = {}
+    for name, cfg in BOTS.items():
+        log_file   = os.path.join(WORK_DIR, f"{cfg['screen']}.log")
+        state_file = os.path.join(WORK_DIR, cfg["state"][0])
+        data_file  = os.path.join(WORK_DIR, cfg["state"][2] if len(cfg["state"]) > 2 else "")
+
+        bots_debug[name] = {
+            "running":   is_running(cfg["screen"]),
+            "log_tail":  read_log(log_file, lines=80),
+            "state":     read_file(state_file),
+            "dashboard": read_file(data_file) if data_file else None,
+        }
+
+    loachy_pending = read_file(os.path.join(WORK_DIR, "loachy_pending.json"))
+
+    return jsonify({
+        "ok":             True,
+        "timestamp":      __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        "screens":        list(screens.keys()),
+        "bots":           bots_debug,
+        "loachy_pending": loachy_pending,
+    })
 
 
-@app.route("/sms/webhook", methods=["POST"])
-def sms_webhook():
-    """Twilio webhook — handles two-way SMS replies from Jacob."""
-    # Validate Twilio signature — reject forged requests
-    sig      = request.headers.get("X-Twilio-Signature", "")
-    url      = request.url
-    params   = request.form.to_dict()
-    if not _twilio_validator.validate(url, params, sig):
-        _sms_log.warning("[SMS] Invalid Twilio signature — rejected")
-        return Response("Forbidden", status=403)
-    body = (request.form.get("Body") or "").strip().upper()
-    _sms_log.info(f"[SMS] Incoming reply: {body!r}")
+# ── ALLOWED FILES FOR apply-update (whitelist for safety) ──
+UPDATABLE_FILES = {
+    "seraphina_bot.py",
+    "jacob_bot.py",
+    "loachy_bot.py",
+    "farm_api.py",
+    "farm_alerts.py",
+    "seraphina_dashboard.html",
+    "jacob_dashboard.html",
+    "loachy_dashboard.html",
+    "index.html",
+    "login.html",
+}
 
-    reply = None
+@app.route("/apply-update", methods=["POST"])
+def apply_update():
+    """
+    Accepts a file upload from Claude (or any authorized caller).
+    Body: { "filename": "seraphina_bot.py", "content_b64": "<base64>" }
+    Auth: ?token=FARM_API_TOKEN
 
-    if body == "APPROVE":
-        reply = _approve_reject_pending("approve")
-    elif body == "REJECT":
-        reply = _approve_reject_pending("reject")
-    elif body.startswith("PAUSE "):
-        bot = body[6:].strip().lower()
-        reply = _handle_pause(bot)
-    elif body.startswith("RESUME "):
-        bot = body[7:].strip().lower()
-        reply = _handle_resume(bot)
-    elif body == "STATUS":
-        reply = _handle_status()
-    else:
-        reply = "Commands: APPROVE, REJECT, PAUSE [BOT], RESUME [BOT], STATUS"
+    After upload, optionally restarts the affected bot:
+    Body can also include: { "restart": true }
 
-    if reply:
-        _sms_send(reply)
+    This is how Claude deploys updates without needing SCP.
+    """
+    if not valid_api_token(request):
+        return jsonify({"ok": False, "error": "Invalid or missing token"}), 401
 
-    # Return empty TwiML so Twilio doesn't send a default reply
-    return Response('<?xml version="1.0"?><Response></Response>', mimetype="application/xml")
+    try:
+        body     = request.get_json()
+        filename = body.get("filename", "").strip()
+        b64      = body.get("content_b64", "")
+        restart  = body.get("restart", False)
+
+        if not filename:
+            return jsonify({"ok": False, "error": "filename required"}), 400
+        if filename not in UPDATABLE_FILES:
+            return jsonify({"ok": False, "error": f"{filename} not in allowed file list"}), 403
+        if not b64:
+            return jsonify({"ok": False, "error": "content_b64 required"}), 400
+
+        # Decode and write
+        content  = base64.b64decode(b64)
+        fpath    = os.path.join(WORK_DIR, filename)
+
+        # Backup old file first
+        backup = fpath + ".bak"
+        if os.path.exists(fpath):
+            os.replace(fpath, backup)
+
+        with open(fpath, "wb") as f:
+            f.write(content)
+
+        log_msg = f"[APPLY-UPDATE] {filename} written ({len(content)} bytes)"
+        print(log_msg)
+
+        # Optionally restart the affected bot
+        restarted = None
+        if restart:
+            for name, cfg in BOTS.items():
+                if cfg["script"] == filename:
+                    kill_all_screens(cfg["screen"])
+                    time.sleep(1)
+                    subprocess.Popen(
+                        ["screen", "-dmS", cfg["screen"], "python3",
+                         os.path.join(WORK_DIR, cfg["script"])],
+                        cwd=WORK_DIR
+                    )
+                    restarted = name
+                    print(f"[APPLY-UPDATE] Restarted {name}")
+                    break
+
+        return jsonify({
+            "ok":       True,
+            "filename": filename,
+            "bytes":    len(content),
+            "backup":   backup,
+            "restarted": restarted,
+        })
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 if __name__ == "__main__":
     print("Jacob's Money Farm API starting on port 5000...")
-    app.run(host="127.0.0.1", port=5000, debug=False)  # security: localhost only
+    app.run(host="0.0.0.0", port=5000, debug=False)
