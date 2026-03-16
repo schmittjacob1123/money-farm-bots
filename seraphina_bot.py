@@ -90,7 +90,7 @@ CONFIG = {
     # — bear mode (short grid) —
     "bear_mode":            True,       # enable short selling on downtrending coins
     "short_bear_confirm":   0.02,       # price must be ≥2% below MA50 to activate
-    "rsi_short_min":        50,         # only short if RSI > 50 (rally in downtrend)
+    "rsi_short_min":        55,         # only short if RSI > 55 (meaningful rally in downtrend)
     "rsi_short_close":      30,         # close shorts if RSI < 30 (oversold — reversal risk)
 
     # — risk —
@@ -692,10 +692,16 @@ class SeraphinaBot:
 
     # ── helpers ──────────────────────────────────────────────
     def _portfolio_value(self, prices):
-        pos_val = sum(
-            p.size_usd * (prices.get(p.coin, p.entry_price) / p.entry_price)
-            for p in self.positions
-        )
+        pos_val = 0.0
+        for p in self.positions:
+            price = prices.get(p.coin, p.entry_price)
+            if p.side == "long":
+                # current market value of the long position
+                pos_val += p.size_usd * (price / p.entry_price)
+            else:
+                # short: margin reserved + unrealized gain/loss
+                # unrealized_pnl() already handles short math (entry - current)
+                pos_val += p.size_usd + p.unrealized_pnl(price)
         return round(self.wallet.cash + pos_val, 2)
 
     def _open_for_coin(self, coin):
@@ -738,6 +744,10 @@ class SeraphinaBot:
         }
 
     def _collect_funding(self, pos):
+        # Funding income only applies to long (spot-equivalent) positions.
+        # Short positions would owe funding when rates are positive, not collect it.
+        if pos.side != "long":
+            return
         rate_data = self.funding_rates.get(pos.coin)
         if not rate_data:
             return
@@ -987,15 +997,22 @@ class SeraphinaBot:
 
             if not should_exit:
                 if pos.side == "long":
-                    # RSI overbought — close long if profitable
+                    # RSI overbought — close long only if profitable (standard exit)
                     if rsi is not None and rsi > CONFIG["rsi_sell_min"] and pos.unrealized_pnl(price) > 0:
                         should_exit, reason = True, "RSI_OB"
+                    # Bear regime confirmed — cut the long unconditionally.
+                    # Being long in a confirmed downtrend (≥2% below MA50, RSI ≥55)
+                    # is the wrong side of the trade regardless of current P&L.
+                    elif sig.get("bear_confirmed", False):
+                        should_exit, reason = True, "BEAR_FLIP"
                 else:  # short
-                    # RSI oversold — close short (reversal risk)
+                    # RSI oversold — close short, reversal risk
                     if rsi is not None and rsi < CONFIG["rsi_short_close"]:
                         should_exit, reason = True, "RSI_OS"
-                    # Regime flipped back to bull — don't hold shorts in uptrend
-                    elif sig.get("above_ma") and pos.unrealized_pnl(price) > 0:
+                    # Regime no longer bear — close short unconditionally.
+                    # Holding a short against a confirmed uptrend is the wrong
+                    # side of the trade regardless of current P&L.
+                    elif not sig.get("bear_confirmed", False):
                         should_exit, reason = True, "REGIME_FLIP"
 
             if should_exit:
