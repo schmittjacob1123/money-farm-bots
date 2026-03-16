@@ -3,7 +3,7 @@ import subprocess, time, os, requests, hashlib
 
 TOKEN = os.environ.get("GITHUB_TOKEN")
 REPO = "schmittjacob1123/money-farm-bots"
-BRANCH = "main"
+BRANCH = "claude/check-farm-bot-data-zkzuE"
 HEADERS = {"Authorization": f"token {TOKEN}"}
 BASE = f"https://api.github.com/repos/{REPO}/contents"
 
