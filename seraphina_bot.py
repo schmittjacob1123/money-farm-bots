@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║      SERAPHINA v10.1 — GRID + RSI/MA HYBRID                 ║
+║      SERAPHINA v11.0 — GRID + RSI/MA HYBRID + BEAR MODE     ║
 ║  Strategy:                                                   ║
 ║    1. Grid trading: buys every 1% price dip through a level  ║
 ║    2. RSI gate: skip grid buys if RSI > 70 (overbought)      ║
@@ -10,7 +10,19 @@
 ║    5. Exits: TP 2.5%, SL 4%, trailing stop, RSI>65 sell     ║
 ║    6. Funding rate income on open positions                  ║
 ║    7. Maker-tier fees 0.16%                                  ║
+║    8. Bear mode: short grid rallies when price < MA50        ║
 ╚══════════════════════════════════════════════════════════════╝
+
+CHANGES v11.0:
+  - Bear mode: when price is 2%+ below MA50, activates a short
+    grid. Rallies up through grid levels open short positions.
+    Short TP when price falls 2.5%, SL if price rises 4%.
+    Trailing stop arms at +1.5% gain (price trough), fires on
+    1% bounce. RSI < 30 closes all shorts (oversold reversal).
+  - Position class gains a `side` field ("long" / "short") that
+    flips all P&L and exit math automatically.
+  - Wallet gains short_open / short_close accounting methods.
+  - Dashboard exposes regime, side, and short stats.
 
 CHANGES v10.1:
   - Split scan: spot price every 15s (grid + exits), candles
@@ -75,6 +87,12 @@ CONFIG = {
     "funding_threshold":    0.0003,
     "funding_interval_h":   8,
 
+    # — bear mode (short grid) —
+    "bear_mode":            True,       # enable short selling on downtrending coins
+    "short_bear_confirm":   0.02,       # price must be ≥2% below MA50 to activate
+    "rsi_short_min":        50,         # only short if RSI > 50 (rally in downtrend)
+    "rsi_short_close":      30,         # close shorts if RSI < 30 (oversold — reversal risk)
+
     # — risk —
     "daily_loss_cap":       30.0,
     "drawdown_pause_pct":   0.15,
@@ -132,6 +150,18 @@ QUOTES = {
         "Target hit. Booking gains.",
         "RSI overbought — closing profitable positions.",
         "Sold into strength. Resetting grid.",
+    ],
+    "bear_hunting": [
+        "Dead cat bounce detected. Shorting the rally.",
+        "Price is below MA50 and bouncing. Perfect short entry.",
+        "Gravity always wins eventually. Short the rip.",
+        "Bears get paid too. Grid level shorted.",
+    ],
+    "bear_watching": [
+        "Below MA50 and waiting for a rally to short.",
+        "Bear mode active. Watching for price to bounce into my levels.",
+        "Downtrend confirmed. Short grid armed.",
+        "The trend is my friend — and right now it points down.",
     ],
 }
 
@@ -318,40 +348,72 @@ class Grid:
 # MODULE 4 — POSITION
 # ══════════════════════════════════════════════════════════════
 class Position:
-    def __init__(self, coin, entry_price, size_usd, grid_level_idx=None):
+    def __init__(self, coin, entry_price, size_usd, grid_level_idx=None, side="long"):
         self.coin            = coin
         self.entry_price     = entry_price
         self.size_usd        = size_usd
         self.entry_time      = datetime.now(ET).isoformat()
+        self.side            = side          # "long" or "short"
+        # peak_price tracks the most favourable extreme seen:
+        #   long  → highest price hit (for trailing stop)
+        #   short → lowest price hit (trough for trailing stop)
         self.peak_price      = entry_price
-        self.tp_price        = round(entry_price * (1 + CONFIG["take_profit_pct"]), 6)
-        self.sl_price        = round(entry_price * (1 - CONFIG["stop_loss_pct"]),   6)
+        if side == "long":
+            self.tp_price = round(entry_price * (1 + CONFIG["take_profit_pct"]), 6)
+            self.sl_price = round(entry_price * (1 - CONFIG["stop_loss_pct"]),   6)
+        else:  # short
+            self.tp_price = round(entry_price * (1 - CONFIG["take_profit_pct"]), 6)
+            self.sl_price = round(entry_price * (1 + CONFIG["stop_loss_pct"]),   6)
         self.trailing_active = False
         self.trailing_stop   = None
-        self.grid_level_idx  = grid_level_idx  # which grid level opened this
+        self.grid_level_idx  = grid_level_idx
 
     def update(self, price):
-        if price > self.peak_price:
-            self.peak_price = price
-        if (self.peak_price - self.entry_price) / self.entry_price >= CONFIG["trail_activate_pct"]:
-            self.trailing_active = True
-            self.trailing_stop   = round(self.peak_price * (1 - CONFIG["trail_stop_pct"]), 6)
+        if self.side == "long":
+            if price > self.peak_price:
+                self.peak_price = price
+            gain_pct = (self.peak_price - self.entry_price) / self.entry_price
+            if gain_pct >= CONFIG["trail_activate_pct"]:
+                self.trailing_active = True
+                self.trailing_stop   = round(self.peak_price * (1 - CONFIG["trail_stop_pct"]), 6)
+        else:  # short: track trough (lowest price)
+            if price < self.peak_price:
+                self.peak_price = price
+            gain_pct = (self.entry_price - self.peak_price) / self.entry_price
+            if gain_pct >= CONFIG["trail_activate_pct"]:
+                self.trailing_active = True
+                # trailing stop for short: fires if price bounces above trough + trail%
+                self.trailing_stop   = round(self.peak_price * (1 + CONFIG["trail_stop_pct"]), 6)
 
     def check_exit(self, price):
         self.update(price)
-        if price >= self.tp_price:
-            return True, "TP"
-        if price <= self.sl_price:
-            return True, "SL"
-        if self.trailing_active and self.trailing_stop and price <= self.trailing_stop:
-            return True, "TRAIL"
+        if self.side == "long":
+            if price >= self.tp_price:
+                return True, "TP"
+            if price <= self.sl_price:
+                return True, "SL"
+            if self.trailing_active and self.trailing_stop and price <= self.trailing_stop:
+                return True, "TRAIL"
+        else:  # short
+            if price <= self.tp_price:
+                return True, "TP"
+            if price >= self.sl_price:
+                return True, "SL"
+            if self.trailing_active and self.trailing_stop and price >= self.trailing_stop:
+                return True, "TRAIL"
         return False, None
 
     def unrealized_pnl(self, price):
-        return round(self.size_usd * (price - self.entry_price) / self.entry_price, 4)
+        if self.side == "long":
+            return round(self.size_usd * (price - self.entry_price) / self.entry_price, 4)
+        else:
+            return round(self.size_usd * (self.entry_price - price) / self.entry_price, 4)
 
     def unrealized_pct(self, price):
-        return round((price - self.entry_price) / self.entry_price * 100, 2)
+        if self.side == "long":
+            return round((price - self.entry_price) / self.entry_price * 100, 2)
+        else:
+            return round((self.entry_price - price) / self.entry_price * 100, 2)
 
     def to_dict(self):
         return {
@@ -359,6 +421,7 @@ class Position:
             "entry_price":     self.entry_price,
             "size_usd":        self.size_usd,
             "entry_time":      self.entry_time,
+            "side":            self.side,
             "peak_price":      self.peak_price,
             "tp_price":        self.tp_price,
             "sl_price":        self.sl_price,
@@ -374,6 +437,7 @@ class Position:
         p.entry_price     = d["entry_price"]
         p.size_usd        = d["size_usd"]
         p.entry_time      = d["entry_time"]
+        p.side            = d.get("side", "long")
         p.peak_price      = d.get("peak_price", d["entry_price"])
         p.tp_price        = d["tp_price"]
         p.sl_price        = d["sl_price"]
@@ -439,6 +503,38 @@ class Wallet:
         self.trade_log.append({
             "ts": datetime.now(ET).isoformat(), "coin": coin,
             "action": "SELL", "price": price, "size": position.size_usd,
+            "fee": fee, "pnl": net_pnl, "cash": round(self.cash, 2), "reason": reason,
+        })
+        return net_pnl
+
+    def short_open(self, coin, price, size_usd):
+        """Open a short position (paper: reserve size as margin)."""
+        fee = self._fee(size_usd)
+        self.cash       = round(self.cash - size_usd - fee, 4)
+        self.total_fees = round(self.total_fees + fee, 4)
+        self.trade_log.append({
+            "ts": datetime.now(ET).isoformat(), "coin": coin,
+            "action": "SHORT", "price": price, "size": size_usd,
+            "fee": fee, "pnl": 0, "cash": round(self.cash, 2),
+        })
+
+    def short_close(self, coin, price, position, reason=""):
+        """Close a short position. PnL is positive when price fell."""
+        gross_pnl = position.unrealized_pnl(price)   # handles short math
+        fee       = self._fee(position.size_usd)
+        net_pnl   = round(gross_pnl - fee, 4)
+        returned  = round(position.size_usd + net_pnl, 4)
+        self.cash       = round(self.cash + returned, 4)
+        self.total_pnl  = round(self.total_pnl + net_pnl, 4)
+        self.daily_pnl  = round(self.daily_pnl + net_pnl, 4)
+        self.total_fees = round(self.total_fees + fee, 4)
+        if net_pnl > 0:
+            self.wins += 1; self.win_streak += 1; self.loss_streak = 0
+        else:
+            self.losses += 1; self.loss_streak += 1; self.win_streak = 0
+        self.trade_log.append({
+            "ts": datetime.now(ET).isoformat(), "coin": coin,
+            "action": "COVER", "price": price, "size": position.size_usd,
             "fee": fee, "pnl": net_pnl, "cash": round(self.cash, 2), "reason": reason,
         })
         return net_pnl
@@ -615,15 +711,27 @@ class SeraphinaBot:
         rsi    = CandleFetcher.calc_rsi(closes, CONFIG["rsi_period"])
         if ma50 is None or rsi is None:
             return None
-        above_ma = price > ma50
+        above_ma      = price > ma50
+        trend_str     = round((price - ma50) / ma50 * 100, 2)
+        # Bear regime: price is meaningfully below MA50 AND RSI is elevated
+        # enough that we're getting a rally worth shorting.
+        bear_confirmed = (
+            CONFIG.get("bear_mode", False)
+            and not above_ma
+            and trend_str <= -(CONFIG["short_bear_confirm"] * 100)
+            and rsi >= CONFIG["rsi_short_min"]
+        )
+        regime = "bear" if bear_confirmed else ("bull" if above_ma else "neutral")
         return {
             "coin":           coin,
             "price":          price,
             "ma50":           ma50,
             "rsi":            rsi,
             "trend":          "bullish" if above_ma else "bearish",
-            "trend_strength": round((price - ma50) / ma50 * 100, 2),
+            "trend_strength": trend_str,
             "above_ma":       above_ma,
+            "regime":         regime,       # "bull" / "neutral" / "bear"
+            "bear_confirmed": bear_confirmed,
             "high_24h":       max(c["high"]   for c in candles[-24:]),
             "low_24h":        min(c["low"]    for c in candles[-24:]),
             "volume_24h":     sum(c["volume"] for c in candles[-24:]),
@@ -658,6 +766,7 @@ class SeraphinaBot:
                 price = prices.get(pos.coin, pos.entry_price)
                 positions_out.append({
                     "coin":           pos.coin,
+                    "side":           pos.side,
                     "entryPrice":     pos.entry_price,
                     "currentPrice":   price,
                     "sizeUsd":        pos.size_usd,
@@ -674,19 +783,24 @@ class SeraphinaBot:
 
             signals_out = {}
             for coin, sig in all_signals.items():
+                rsi_val = sig.get("rsi")
                 signals_out[coin] = {
-                    "price":         sig["price"],
-                    "ma50":          sig["ma50"],
-                    "rsi":           sig["rsi"],
-                    "trend":         sig["trend"],
-                    "trendStrength": sig["trend_strength"],
-                    "aboveMa":       sig["above_ma"],
-                    "rsiGateOpen":   sig["rsi"] < CONFIG["rsi_buy_max"] if sig.get("rsi") else True,
-                    "rsiBoost":      sig["rsi"] < CONFIG["rsi_boost_threshold"] if sig.get("rsi") else False,
-                    "rsiExitArmed":  sig["rsi"] > CONFIG["rsi_sell_min"] if sig.get("rsi") else False,
-                    "high24h":       sig["high_24h"],
-                    "low24h":        sig["low_24h"],
-                    "volume24h":     sig["volume_24h"],
+                    "price":           sig["price"],
+                    "ma50":            sig["ma50"],
+                    "rsi":             sig["rsi"],
+                    "trend":           sig["trend"],
+                    "trendStrength":   sig["trend_strength"],
+                    "aboveMa":         sig["above_ma"],
+                    "regime":          sig.get("regime", "bull"),
+                    "bearConfirmed":   sig.get("bear_confirmed", False),
+                    "rsiGateOpen":     rsi_val < CONFIG["rsi_buy_max"] if rsi_val else True,
+                    "rsiBoost":        rsi_val < CONFIG["rsi_boost_threshold"] if rsi_val else False,
+                    "rsiExitArmed":    rsi_val > CONFIG["rsi_sell_min"] if rsi_val else False,
+                    "rsiShortArmed":   rsi_val >= CONFIG["rsi_short_min"] if rsi_val else False,
+                    "rsiShortClose":   rsi_val < CONFIG["rsi_short_close"] if rsi_val else False,
+                    "high24h":         sig["high_24h"],
+                    "low24h":          sig["low_24h"],
+                    "volume24h":       sig["volume_24h"],
                 }
 
             grids_out = {}
@@ -710,21 +824,28 @@ class SeraphinaBot:
                     "notable": rate >= CONFIG["funding_threshold"],
                 }
 
-            if trades_this_scan > 0 and any(
-                t["action"] == "SELL" for t in self.wallet.trade_log[-max(trades_this_scan, 1):]
-            ):
+            any_bear_coin = any(s.get("bear_confirmed") for s in all_signals.values())
+            short_positions = [p for p in self.positions if p.side == "short"]
+            long_positions  = [p for p in self.positions if p.side == "long"]
+
+            recent = self.wallet.trade_log[-max(trades_this_scan, 1):]
+            if trades_this_scan > 0 and any(t["action"] in ("SELL", "COVER") for t in recent):
                 mood = "exiting"
+            elif trades_this_scan > 0 and any(t["action"] == "SHORT" for t in recent):
+                mood = "bear_hunting"
             elif trades_this_scan > 0:
                 mood = "hunting"
-            elif self.positions:
+            elif short_positions:
+                mood = "bear_watching"
+            elif long_positions:
                 mood = "watching"
             else:
                 any_bull = any(s["trend"] == "bullish" for s in all_signals.values())
-                mood = "watching" if any_bull else "sleeping"
+                mood = "watching" if any_bull else ("bear_watching" if any_bear_coin else "sleeping")
 
             with open(CONFIG["dashboard_file"], "w") as f:
                 json.dump({
-                    "version":           "v10",
+                    "version":           "v11",
                     "lastScan":          datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
                     "mode":              "PAPER" if CONFIG["dry_run"] else "LIVE",
                     "mood":              mood,
@@ -747,6 +868,10 @@ class SeraphinaBot:
                     "scanCount":         self.scan_count,
                     "tradesThisScan":    trades_this_scan,
                     "openCount":         len(self.positions),
+                    "openLongs":         len(long_positions),
+                    "openShorts":        len(short_positions),
+                    "bearModeEnabled":   CONFIG.get("bear_mode", False),
+                    "bearActiveCoins":   [c for c, s in all_signals.items() if s.get("bear_confirmed")],
                     "startingBudget":    CONFIG["paper_budget"],
                     "circuitBreaker":    self.wallet.circuit_breaker_active,
                     "peakPortfolio":     round(self.wallet.peak_portfolio, 2),
@@ -755,9 +880,11 @@ class SeraphinaBot:
                     ) if self.wallet.peak_portfolio > 0 else 0,
                     "cashFloorPct":      CONFIG["cash_floor_pct"] * 100,
                     "rsiConfig":         {
-                        "buyMax":  CONFIG["rsi_buy_max"],
-                        "sellMin": CONFIG["rsi_sell_min"],
-                        "boost":   CONFIG["rsi_boost_threshold"],
+                        "buyMax":     CONFIG["rsi_buy_max"],
+                        "sellMin":    CONFIG["rsi_sell_min"],
+                        "boost":      CONFIG["rsi_boost_threshold"],
+                        "shortMin":   CONFIG["rsi_short_min"],
+                        "shortClose": CONFIG["rsi_short_close"],
                     },
                     "tpPct":             CONFIG["take_profit_pct"] * 100,
                     "slPct":             CONFIG["stop_loss_pct"] * 100,
@@ -849,27 +976,43 @@ class SeraphinaBot:
 
         trades_this_scan = 0
 
-        # ── 5. Check exits (TP / SL / trail / RSI overbought) ──
+        # ── 5. Check exits (TP / SL / trail / RSI signal) ──────
         for pos in list(self.positions):
             price = prices.get(pos.coin)
             if not price:
                 continue
             should_exit, reason = pos.check_exit(price)
-            # RSI overbought sell — only close if profitable
+            sig = all_signals.get(pos.coin, {})
+            rsi = sig.get("rsi")
+
             if not should_exit:
-                sig = all_signals.get(pos.coin)
-                if sig and sig["rsi"] > CONFIG["rsi_sell_min"] and pos.unrealized_pnl(price) > 0:
-                    should_exit, reason = True, "RSI_OB"
+                if pos.side == "long":
+                    # RSI overbought — close long if profitable
+                    if rsi is not None and rsi > CONFIG["rsi_sell_min"] and pos.unrealized_pnl(price) > 0:
+                        should_exit, reason = True, "RSI_OB"
+                else:  # short
+                    # RSI oversold — close short (reversal risk)
+                    if rsi is not None and rsi < CONFIG["rsi_short_close"]:
+                        should_exit, reason = True, "RSI_OS"
+                    # Regime flipped back to bull — don't hold shorts in uptrend
+                    elif sig.get("above_ma") and pos.unrealized_pnl(price) > 0:
+                        should_exit, reason = True, "REGIME_FLIP"
+
             if should_exit:
-                pnl = self.wallet.sell(pos.coin, price, pos, reason or "")
+                if pos.side == "long":
+                    pnl = self.wallet.sell(pos.coin, price, pos, reason or "")
+                    action_label = "EXIT"
+                else:
+                    pnl = self.wallet.short_close(pos.coin, price, pos, reason or "")
+                    action_label = "COVER"
                 self.positions.remove(pos)
-                # Free the grid level immediately so the same scan can re-enter if
-                # price crosses back down through it (e.g. quick TP then dip).
+                # Free the grid level so the same level can be re-entered
                 if pos.grid_level_idx is not None and pos.coin in self.grids:
                     self.grids[pos.coin].occupied.discard(pos.grid_level_idx)
                 trades_this_scan += 1
-                log.info("  [EXIT/%s] %s | $%.4f | pnl=$%+.4f | cash=$%.2f",
-                         pos.coin, reason, price, pnl, self.wallet.cash)
+                log.info("  [%s/%s] %s | $%.4f | side=%s | pnl=$%+.4f | cash=$%.2f",
+                         action_label, pos.coin, reason, price,
+                         pos.side, pnl, self.wallet.cash)
 
         # ── 6. Collect funding ─────────────────────────────────
         for pos in list(self.positions):
@@ -882,21 +1025,15 @@ class SeraphinaBot:
             g    = self.grids[coin]
             prev = self.prev_prices.get(coin, price)
             sig  = all_signals.get(coin, {})
-            rsi      = sig.get("rsi")
-            above_ma = sig.get("above_ma", True)
+            rsi           = sig.get("rsi")
+            above_ma      = sig.get("above_ma", True)
+            bear_confirmed = sig.get("bear_confirmed", False)
 
             if prev == price:
                 self.prev_prices[coin] = price
                 continue
 
-            # Check RSI gate first — skip all buys if overbought
-            if rsi is not None and rsi > CONFIG["rsi_buy_max"]:
-                log.info("  [GRID/%s] RSI=%.1f > %.0f — skipping buys this scan",
-                         coin, rsi, CONFIG["rsi_buy_max"])
-                self.prev_prices[coin] = price
-                continue
-
-            # Safety checks
+            # Safety checks (apply to both long and short)
             if self.wallet.circuit_breaker_active:
                 self.prev_prices[coin] = price
                 continue
@@ -904,32 +1041,77 @@ class SeraphinaBot:
                 self.prev_prices[coin] = price
                 continue
 
-            buy_idxs = g.find_buy_crossings(prev, price)
-            for idx in buy_idxs:
-                coin_open = self._open_for_coin(coin)
-                if len(coin_open) >= CONFIG["max_open_per_coin"]:
-                    log.info("  [GRID/%s] Max per coin (%d) — skip", coin, CONFIG["max_open_per_coin"])
-                    break
-                if len(self.positions) >= CONFIG["max_open_total"]:
-                    log.info("  [GRID] Max total (%d) — skip", CONFIG["max_open_total"])
-                    break
-                floor = portfolio * CONFIG["cash_floor_pct"]
-                if self.wallet.cash < floor:
-                    log.info("  [GRID/%s] Cash floor $%.2f — skip", coin, floor)
-                    break
-                size = self.wallet.trade_size(portfolio, rsi=rsi, above_ma=above_ma)
-                if size > self.wallet.cash:
-                    break
-                lvl = g.levels[idx]
-                self.wallet.buy(coin, lvl, size)
-                pos = Position(coin, lvl, size, grid_level_idx=idx)
-                self.positions.append(pos)
-                g.occupied.add(idx)
-                trades_this_scan += 1
-                log.info("  [GRID/%s] BUY level $%.4f | RSI=%.1f | %s | size=$%.2f | cash=$%.2f",
-                         coin, lvl, rsi if rsi else 0,
-                         "UPTREND" if above_ma else "downtrend",
-                         size, self.wallet.cash)
+            floor = portfolio * CONFIG["cash_floor_pct"]
+
+            # ── 7a. BEAR MODE: short rallies ────────────────────
+            if bear_confirmed:
+                # Skip shorts if RSI is already too low (oversold — don't short a bottom)
+                if rsi is not None and rsi < CONFIG["rsi_short_close"]:
+                    log.info("  [BEAR/%s] RSI=%.1f < %.0f — too oversold to short",
+                             coin, rsi, CONFIG["rsi_short_close"])
+                    self.prev_prices[coin] = price
+                    continue
+
+                short_idxs = g.find_sell_crossings(prev, price)
+                for idx in short_idxs:
+                    if idx in g.occupied:
+                        continue
+                    coin_open = self._open_for_coin(coin)
+                    if len(coin_open) >= CONFIG["max_open_per_coin"]:
+                        log.info("  [BEAR/%s] Max per coin (%d) — skip", coin, CONFIG["max_open_per_coin"])
+                        break
+                    if len(self.positions) >= CONFIG["max_open_total"]:
+                        log.info("  [BEAR] Max total (%d) — skip", CONFIG["max_open_total"])
+                        break
+                    if self.wallet.cash < floor:
+                        log.info("  [BEAR/%s] Cash floor $%.2f — skip", coin, floor)
+                        break
+                    size = self.wallet.trade_size(portfolio, rsi=rsi, above_ma=False)
+                    if size > self.wallet.cash:
+                        break
+                    lvl = g.levels[idx]
+                    self.wallet.short_open(coin, lvl, size)
+                    pos = Position(coin, lvl, size, grid_level_idx=idx, side="short")
+                    self.positions.append(pos)
+                    g.occupied.add(idx)
+                    trades_this_scan += 1
+                    log.info("  [BEAR/%s] SHORT level $%.4f | RSI=%.1f | size=$%.2f | cash=$%.2f",
+                             coin, lvl, rsi if rsi else 0, size, self.wallet.cash)
+
+            # ── 7b. BULL / NEUTRAL: buy dips ────────────────────
+            else:
+                # Check RSI gate — skip all longs if overbought
+                if rsi is not None and rsi > CONFIG["rsi_buy_max"]:
+                    log.info("  [GRID/%s] RSI=%.1f > %.0f — skipping buys this scan",
+                             coin, rsi, CONFIG["rsi_buy_max"])
+                    self.prev_prices[coin] = price
+                    continue
+
+                buy_idxs = g.find_buy_crossings(prev, price)
+                for idx in buy_idxs:
+                    coin_open = self._open_for_coin(coin)
+                    if len(coin_open) >= CONFIG["max_open_per_coin"]:
+                        log.info("  [GRID/%s] Max per coin (%d) — skip", coin, CONFIG["max_open_per_coin"])
+                        break
+                    if len(self.positions) >= CONFIG["max_open_total"]:
+                        log.info("  [GRID] Max total (%d) — skip", CONFIG["max_open_total"])
+                        break
+                    if self.wallet.cash < floor:
+                        log.info("  [GRID/%s] Cash floor $%.2f — skip", coin, floor)
+                        break
+                    size = self.wallet.trade_size(portfolio, rsi=rsi, above_ma=above_ma)
+                    if size > self.wallet.cash:
+                        break
+                    lvl = g.levels[idx]
+                    self.wallet.buy(coin, lvl, size)
+                    pos = Position(coin, lvl, size, grid_level_idx=idx, side="long")
+                    self.positions.append(pos)
+                    g.occupied.add(idx)
+                    trades_this_scan += 1
+                    log.info("  [GRID/%s] BUY level $%.4f | RSI=%.1f | %s | size=$%.2f | cash=$%.2f",
+                             coin, lvl, rsi if rsi else 0,
+                             "UPTREND" if above_ma else "downtrend",
+                             size, self.wallet.cash)
 
             self.prev_prices[coin] = price
 
@@ -947,13 +1129,17 @@ class SeraphinaBot:
 
     # ── loop ─────────────────────────────────────────────────
     def run_loop(self):
-        log.info("Seraphina v10.1 starting | mode=%s | budget=$%.0f | coins=%s",
+        log.info("Seraphina v11.0 starting | mode=%s | budget=$%.0f | coins=%s",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], ", ".join(CONFIG["coins"]))
         log.info("Grid %.1f%% spacing | RSI buy<%.0f sell>%.0f | %ds price scan | %ds indicator refresh",
                  CONFIG["grid_spacing_pct"] * 100,
                  CONFIG["rsi_buy_max"], CONFIG["rsi_sell_min"],
                  CONFIG["scan_interval_sec"], CONFIG["indicator_refresh_sec"])
+        log.info("Bear mode %s | short if RSI>%.0f + price >=%.0f%% below MA50 | cover if RSI<%.0f",
+                 "ON" if CONFIG.get("bear_mode") else "OFF",
+                 CONFIG["rsi_short_min"], CONFIG["short_bear_confirm"] * 100,
+                 CONFIG["rsi_short_close"])
         while True:
             try:
                 self.run_once()
