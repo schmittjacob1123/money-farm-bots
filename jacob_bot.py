@@ -47,7 +47,7 @@ CONFIG = {
     ],
 
     # Risk
-    "paper_budget":          1000.0,
+    "paper_budget":          500.0,
     "max_position_size_pct": 0.10,   # 10% of cash per trade
     "max_position_size_usd": 80.0,
     "min_position_size_usd": 5.0,
