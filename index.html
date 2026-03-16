@@ -642,6 +642,7 @@
           <div class="bc-stat"><span class="bc-label">Portfolio</span><span class="bc-value y" id="p-loach-wallet">$—</span></div>
           <div class="bc-stat"><span class="bc-label">Daily P&L</span><span class="bc-value y" id="p-loach-pnl">$—</span></div>
           <div class="bc-stat"><span class="bc-label">Mood / Win Rate</span><span class="bc-value y" id="p-loach-mood">—</span></div>
+          <div class="bc-stat"><span class="bc-label">Next Scan</span><span class="bc-value y" id="p-loach-countdown">—</span></div>
         </div>
         <div class="bot-toggle">
           <label class="toggle-switch y" id="toggle-loachy">
@@ -950,6 +951,12 @@ function loadLoach() {
         else sb.textContent = 'DE-VIGGED EDGE';
       }
       // API credit warning banner
+      // Next scan countdown
+      if (d.nextScanAt) {
+        window._loachyNextScan = new Date(d.nextScanAt);
+      }
+
+      // API credit warning banner
       const credits = parseInt(d.apiRemaining);
       if (!isNaN(credits)) {
         const banner = document.getElementById('api-credit-banner');
@@ -970,6 +977,23 @@ function loadLoach() {
 
 loadJacob(); loadSera(); loadLoach();
 setInterval(()=>{ loadJacob(); loadSera(); loadLoach(); }, 30000);
+
+// Live countdown ticker for Loachy next scan
+setInterval(() => {
+  const el = document.getElementById('p-loach-countdown');
+  if (!el) return;
+  const next = window._loachyNextScan;
+  if (!next) { el.textContent = '—'; return; }
+  const secs = Math.round((next - Date.now()) / 1000);
+  if (secs <= 0) {
+    el.textContent = 'scanning...';
+    el.style.color = '#4ade80';
+  } else {
+    const m = Math.floor(secs / 60), s = secs % 60;
+    el.textContent = `${m}m ${s.toString().padStart(2,'0')}s`;
+    el.style.color = secs < 120 ? '#fbbf24' : '';
+  }
+}, 1000);
 
 // ── BOT CONTROLS ──
 const API = '/api';
