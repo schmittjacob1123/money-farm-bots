@@ -51,7 +51,7 @@ BOTS = {
 FRESH_STATE = {
     "positions.json":       {"positions": [], "total_pnl": 0, "daily_pnl": 0},
     "pnl_history.json":     {"history": []},
-    "seraphina_state.json": {"wallet": 50.0, "total_pnl": 0, "daily_pnl": 0, "open_positions": {}, "bet_history": [], "daily_bets": 0, "last_reset_date": ""},
+    "seraphina_state.json": {"wallet": {"cash": 1000.0, "total_pnl": 0.0, "daily_pnl": 0.0, "wins": 0, "losses": 0, "win_streak": 0, "loss_streak": 0, "trade_log": [], "wallet_history": [], "peak_portfolio": 1000.0, "circuit_breaker_active": False, "total_fees": 0.0, "funding_income": 0.0}, "positions": [], "grids": {}, "last_funding": {}},
     "loachy_state.json":    {"wallet": 50.0, "total_pnl": 0, "daily_pnl": 0, "open_bets": {}, "bet_history": [], "daily_bets": 0, "last_reset_date": ""},
     "loachy_pending.json":  {"pending": [], "approved": [], "rejected": []},
 }
@@ -170,7 +170,7 @@ def reset_bot(botname):
 
     if errors:
         return jsonify({"ok": False, "error": "Some files failed: " + ", ".join(errors)})
-    return jsonify({"ok": True, "message": f"{botname} reset to fresh $50 simulation"})
+    return jsonify({"ok": True, "message": f"{botname} reset to fresh state"})
 
 
 @app.route("/sports-config", methods=["GET", "POST"])

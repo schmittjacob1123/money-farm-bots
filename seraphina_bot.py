@@ -681,8 +681,9 @@ class SeraphinaBot:
                     "trend":         sig["trend"],
                     "trendStrength": sig["trend_strength"],
                     "aboveMa":       sig["above_ma"],
-                    "buySignal":     sig["rsi"] < CONFIG["rsi_buy_max"] if sig.get("rsi") else False,
-                    "sellSignal":    sig["rsi"] > CONFIG["rsi_sell_min"] if sig.get("rsi") else False,
+                    "rsiGateOpen":   sig["rsi"] < CONFIG["rsi_buy_max"] if sig.get("rsi") else True,
+                    "rsiBoost":      sig["rsi"] < CONFIG["rsi_boost_threshold"] if sig.get("rsi") else False,
+                    "rsiExitArmed":  sig["rsi"] > CONFIG["rsi_sell_min"] if sig.get("rsi") else False,
                     "high24h":       sig["high_24h"],
                     "low24h":        sig["low_24h"],
                     "volume24h":     sig["volume_24h"],
@@ -862,6 +863,10 @@ class SeraphinaBot:
             if should_exit:
                 pnl = self.wallet.sell(pos.coin, price, pos, reason or "")
                 self.positions.remove(pos)
+                # Free the grid level immediately so the same scan can re-enter if
+                # price crosses back down through it (e.g. quick TP then dip).
+                if pos.grid_level_idx is not None and pos.coin in self.grids:
+                    self.grids[pos.coin].occupied.discard(pos.grid_level_idx)
                 trades_this_scan += 1
                 log.info("  [EXIT/%s] %s | $%.4f | pnl=$%+.4f | cash=$%.2f",
                          pos.coin, reason, price, pnl, self.wallet.cash)

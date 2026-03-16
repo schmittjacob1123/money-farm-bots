@@ -464,9 +464,11 @@ function rsiColor(rsi) {
 function renderSignals(signals, openCoins, rsiCfg) {
   const wrap  = document.getElementById('signals-grid');
   const coins = ['BTC','ETH','SOL','DOGE'];
-  const buyCount = coins.filter(c => signals[c] && signals[c].buySignal).length;
+  const blockedCount = coins.filter(c => signals[c] && !signals[c].rsiGateOpen).length;
+  const boostCount   = coins.filter(c => signals[c] && signals[c].rsiBoost).length;
   document.getElementById('signal-badge').textContent =
-    buyCount > 0 ? `${buyCount} BUY signal${buyCount>1?'s':''}` : 'watching';
+    blockedCount > 0 ? `${blockedCount} coin${blockedCount>1?'s':''} RSI-blocked` :
+    boostCount   > 0 ? `${boostCount} coin${boostCount>1?'s':''} oversold boost` : 'grid active';
 
   wrap.innerHTML = coins.map(coin => {
     const s = signals[coin];
@@ -476,14 +478,16 @@ function renderSignals(signals, openCoins, rsiCfg) {
     const rsiW = Math.round(rsi) + '%';
     const rsiCol = rsiColor(rsi);
     const hasOpen = openCoins.includes(coin);
-    const cardCls = s.buySignal ? 'signal-card has-signal' : bull ? 'signal-card bullish' : 'signal-card bearish';
+    const blocked = s.rsiGateOpen === false;
+    const cardCls = s.rsiBoost ? 'signal-card has-signal' : bull ? 'signal-card bullish' : 'signal-card bearish';
     const distPct = ((s.price - s.ma50) / s.ma50 * 100).toFixed(2);
     const distCol = s.aboveMa ? '#34d399' : '#f87171';
     let badges = '';
-    if (s.buySignal) badges += '<span class="sig-badge badge-buy">● BUY SIGNAL</span>';
-    if (s.sellSignal) badges += '<span class="sig-badge badge-sell">● SELL SIGNAL</span>';
-    if (hasOpen) badges += '<span class="sig-badge badge-open">● IN POSITION</span>';
-    if (!s.buySignal && !s.sellSignal && !hasOpen) badges += '<span class="sig-badge badge-wait">WAITING</span>';
+    if (s.rsiBoost)      badges += '<span class="sig-badge badge-buy">⚡ RSI BOOST</span>';
+    if (blocked)         badges += '<span class="sig-badge badge-sell">⛔ RSI BLOCKED</span>';
+    if (s.rsiExitArmed)  badges += '<span class="sig-badge" style="background:rgba(251,191,36,.12);color:#fbbf24;border-color:rgba(251,191,36,.4)">● EXIT ARMED</span>';
+    if (hasOpen)         badges += '<span class="sig-badge badge-open">● IN POSITION</span>';
+    if (!badges)         badges += '<span class="sig-badge badge-wait">GRID WATCHING</span>';
     return `<div class="${cardCls}">
       <div class="sig-header">
         <div>
