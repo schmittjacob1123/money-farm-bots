@@ -688,17 +688,17 @@ class SeraphinaBot:
                     "volume24h":     sig["volume_24h"],
                 }
 
-            grids_out = []
+            grids_out = {}
             for coin, g in self.grids.items():
-                price = prices.get(coin)
                 coin_positions = self._open_for_coin(coin)
-                grids_out.append({
+                grids_out[coin] = {
                     "coin":       coin,
                     "center":     g.center,
+                    "anchor":     g.center,
                     "levels":     g.levels,
                     "openCount":  len(coin_positions),
                     "spacing":    f"{CONFIG['grid_spacing_pct']*100:.1f}%",
-                })
+                }
 
             funding_out = {}
             for coin, fd in self.funding_rates.items():
@@ -832,9 +832,14 @@ class SeraphinaBot:
             elif self.grids[coin].drifted(price):
                 log.info("  [GRID/%s] Drifted >%.0f%% from center — rebuilding",
                          coin, CONFIG["grid_drift_pct"] * 100)
-                # Keep occupied set in sync with open positions
                 self.grids[coin] = Grid(coin, price)
                 self.prev_prices[coin] = price * 0.9999
+                # Clear stale level indices on open positions — old indices
+                # don't map to new grid levels so we null them out to prevent
+                # the new grid from treating wrong levels as occupied.
+                for p in self.positions:
+                    if p.coin == coin:
+                        p.grid_level_idx = None
             # Sync occupied set from actual open positions
             self.grids[coin].occupied = {
                 p.grid_level_idx for p in self.positions
