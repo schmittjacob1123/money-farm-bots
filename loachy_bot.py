@@ -44,15 +44,12 @@ CONFIG = {
     "odds_api_key": os.getenv("ODDS_API_KEY", ""),
 
     "sports": [
-        "americanfootball_nfl",
-        "americanfootball_ncaaf",
-        "basketball_nba",
-        "basketball_ncaab",
-        "baseball_mlb",
-        "icehockey_nhl",
-        "soccer_epl",
-        "soccer_usa_mls",
-        "mma_mixed_martial_arts",
+        "basketball_ncaab",   # March Madness — peak season, lots of books
+        "basketball_nba",     # In season, deep book coverage
+        "icehockey_nhl",      # In season, good US book coverage
+        "baseball_mlb",       # Season starting, good coverage
+        "soccer_epl",         # In season, decent US book coverage
+        # Removed: NFL/NCAAF (off-season until Aug), MMA (too few books), MLS (thin coverage)
     ],
     "markets": ["h2h", "spreads", "totals"],
 
@@ -76,15 +73,11 @@ CONFIG = {
     # Kelly
     "kelly_fraction": 0.25,
     "sport_kelly": {
-        "basketball_nba":         0.30,
-        "basketball_ncaab":       0.25,
-        "icehockey_nhl":          0.22,
-        "baseball_mlb":           0.25,
-        "americanfootball_nfl":   0.20,
-        "americanfootball_ncaaf": 0.18,
-        "mma_mixed_martial_arts": 0.12,
-        "soccer_epl":             0.20,
-        "soccer_usa_mls":         0.15,
+        "basketball_nba":   0.30,
+        "basketball_ncaab": 0.25,
+        "icehockey_nhl":    0.22,
+        "baseball_mlb":     0.25,
+        "soccer_epl":       0.20,
     },
 
     # Timing
@@ -427,8 +420,7 @@ class OddsFetcher:
 
     PRIORITY = [
         "basketball_ncaab", "basketball_nba", "icehockey_nhl",
-        "baseball_mlb", "americanfootball_nfl", "americanfootball_ncaaf",
-        "mma_mixed_martial_arts", "soccer_epl", "soccer_usa_mls",
+        "baseball_mlb", "soccer_epl",
     ]
 
     def _api_remaining(self):

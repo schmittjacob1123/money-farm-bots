@@ -307,6 +307,17 @@
 </head>
 <body>
 
+<!-- ODDS API CREDIT ALERT -->
+<div id="api-credit-banner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;
+  background:linear-gradient(90deg,#78350f,#92400e);border-bottom:2px solid #fbbf24;
+  padding:10px 16px;display:none;align-items:center;gap:12px;font-family:monospace;font-size:13px;">
+  <span style="font-size:18px;">⚠️</span>
+  <span id="api-credit-msg" style="color:#fef3c7;flex:1;"></span>
+  <button onclick="document.getElementById('api-credit-banner').style.display='none'"
+    style="background:#fbbf24;color:#1c1917;border:none;border-radius:4px;
+    padding:4px 10px;font-family:monospace;font-weight:700;cursor:pointer;">DISMISS</button>
+</div>
+
 <!-- TICKER -->
 <div class="ticker-wrap">
   <div class="ticker-inner">
@@ -862,6 +873,22 @@ function loadLoach() {
         if (pending > 0) sb.textContent = `${pending} PENDING`;
         else if (clv !== null && clv !== undefined) sb.textContent = `CLV ${clv.toFixed(0)}%`;
         else sb.textContent = 'DE-VIGGED EDGE';
+      }
+      // API credit warning banner
+      const credits = parseInt(d.apiRemaining);
+      if (!isNaN(credits)) {
+        const banner = document.getElementById('api-credit-banner');
+        const msg    = document.getElementById('api-credit-msg');
+        if (credits === 0) {
+          msg.textContent = `LOACHY IS OUT OF ODDS API CREDITS (0 remaining) — Loachy is blind. Swap in a new API key at the-odds-api.com and update ODDS_API_KEY.`;
+          banner.style.display = 'flex';
+        } else if (credits <= 50) {
+          msg.textContent = `Odds API credits critically low: ${credits} remaining — Loachy will stop seeing odds soon. Time to swap the key.`;
+          banner.style.display = 'flex';
+        } else if (credits <= 150) {
+          msg.textContent = `Odds API credits low: ${credits} remaining — consider swapping ODDS_API_KEY before it runs out.`;
+          banner.style.display = 'flex';
+        }
       }
     }).catch(()=>{});
 }
