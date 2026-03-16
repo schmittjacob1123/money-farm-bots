@@ -1588,7 +1588,12 @@ class LoachyBot:
             interval = CONFIG["scan_interval_sec"]
             self.next_scan_at = (datetime.now(ET) + timedelta(seconds=interval)).isoformat()
             log.info(f"Sleeping {interval}s...\n")
-            time.sleep(interval)
+            try:
+                time.sleep(interval)
+            except KeyboardInterrupt:
+                log.info("Loachy rests. Goodbye.")
+                self._stop_watcher.set()
+                break
 
 
 if __name__ == "__main__":
