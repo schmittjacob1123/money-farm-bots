@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║      SERAPHINA v10 — GRID + RSI/MA HYBRID                   ║
+║      SERAPHINA v10.1 — GRID + RSI/MA HYBRID                 ║
 ║  Strategy:                                                   ║
 ║    1. Grid trading: buys every 1% price dip through a level  ║
 ║    2. RSI gate: skip grid buys if RSI > 70 (overbought)      ║
@@ -12,18 +12,11 @@
 ║    7. Maker-tier fees 0.16%                                  ║
 ╚══════════════════════════════════════════════════════════════╝
 
-CHANGES v10 vs v9:
-  - Grid trading restored: buys triggered by price crossing grid
-    levels (every 1%), not just RSI<35. This generates consistent
-    daily activity from normal crypto volatility.
-  - RSI now a FILTER not the sole trigger:
-      RSI > 70  → skip grid buy (overbought protection)
-      RSI 40-70 → buy normally on grid cross
-      RSI < 40  → buy with 1.3x size boost (oversold dip)
-  - Multiple positions per coin supported (up to 3)
-  - MA50 downtrend → halve position size (trend awareness)
-  - All v9 safety features kept: circuit breaker, daily loss cap,
-    cash floor, trailing stop, TP, SL, funding income
+CHANGES v10.1:
+  - Split scan: spot price every 15s (grid + exits), candles
+    every 10 min (RSI/MA refresh). Grid is now 4x more responsive
+    without hammering the API — hourly candles only change once
+    per hour so there's no point fetching them every minute.
 """
 import os, json, logging, time, sys, random
 from datetime import datetime
@@ -88,8 +81,9 @@ CONFIG = {
     "drawdown_resume_pct":  0.08,
     "cash_floor_pct":       0.15,
 
-    # — misc —
-    "scan_interval_sec":    60,
+    # — scan timing —
+    "scan_interval_sec":    15,    # fast price scan: grid crossings + exits
+    "indicator_refresh_sec": 600,  # refresh RSI/MA candles every 10 minutes
     "log_file":             "seraphina.log",
     "state_file":           "seraphina_state.json",
     "dashboard_file":       "seraphina_data.json",
@@ -140,6 +134,30 @@ QUOTES = {
         "Sold into strength. Resetting grid.",
     ],
 }
+
+
+# ══════════════════════════════════════════════════════════════
+# MODULE 0 — SPOT PRICE FETCHER (fast, no candles)
+# ══════════════════════════════════════════════════════════════
+class SpotFetcher:
+    KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
+    SYMBOLS = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD", "DOGE": "XDGUSD"}
+
+    def fetch(self, coin):
+        pair = self.SYMBOLS.get(coin)
+        if not pair:
+            return None
+        try:
+            r = requests.get(self.KRAKEN_URL, params={"pair": pair}, timeout=6)
+            r.raise_for_status()
+            res = r.json().get("result", {})
+            if not res:
+                return None
+            t = list(res.values())[0]
+            return (float(t["b"][0]) + float(t["a"][0])) / 2
+        except Exception as e:
+            log.debug("Spot fetch %s: %s", coin, e)
+            return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -509,15 +527,17 @@ class Wallet:
 # ══════════════════════════════════════════════════════════════
 class SeraphinaBot:
     def __init__(self):
+        self.spot           = SpotFetcher()
         self.candles        = CandleFetcher()
         self.funding_api    = FundingFetcher()
         self.wallet         = Wallet()
         self.positions      = []        # List[Position]
         self.grids          = {}        # coin -> Grid
         self.prev_prices    = {}        # coin -> last price
-        self.signals        = {}        # coin -> signal dict
+        self.signals        = {}        # coin -> signal dict (cached from last candle refresh)
         self.funding_rates  = {}
         self._last_funding  = {}
+        self._last_indicator_refresh = 0.0   # epoch seconds of last candle fetch
         self.scan_count     = 0
         self._daily_history = []
         self._load_state()
@@ -764,26 +784,41 @@ class SeraphinaBot:
                  self.wallet.cash, self.wallet.total_pnl, len(self.positions))
         log.info("=" * 64)
 
-        # ── 1. Fetch candles + compute indicators ──────────────
-        all_signals = {}
-        prices      = {}
-        for coin in CONFIG["coins"]:
-            sig = self._analyze(coin)
-            if sig:
-                all_signals[coin] = sig
-                prices[coin]      = sig["price"]
-                log.info("  %s $%.4f | MA50=$%.4f | RSI=%.1f | %s",
-                         coin, sig["price"], sig["ma50"], sig["rsi"],
-                         sig["trend"].upper())
-            else:
-                log.warning("  %s: candle/analysis failed", coin)
-        self.signals = all_signals
+        # ── 1. Refresh indicators if due (every 10 min) ────────
+        now_ts = time.time()
+        due = (now_ts - self._last_indicator_refresh) >= CONFIG["indicator_refresh_sec"]
+        if due:
+            log.info("  [INDICATORS] Refreshing RSI/MA from 1h candles...")
+            fresh = {}
+            for coin in CONFIG["coins"]:
+                sig = self._analyze(coin)
+                if sig:
+                    fresh[coin] = sig
+                    log.info("  %s MA50=$%.4f | RSI=%.1f | %s",
+                             coin, sig["ma50"], sig["rsi"], sig["trend"].upper())
+                else:
+                    log.warning("  %s: candle fetch failed — keeping cached signal", coin)
+            if fresh:
+                self.signals.update(fresh)
+                self._last_indicator_refresh = now_ts
+            # Refresh funding rates alongside candles
+            for coin in CONFIG["coins"]:
+                fd = self.funding_api.fetch(coin)
+                if fd:
+                    self.funding_rates[coin] = fd
 
-        # ── 2. Fetch funding rates ─────────────────────────────
+        # ── 2. Fetch live spot prices (every scan) ─────────────
+        prices = {}
         for coin in CONFIG["coins"]:
-            fd = self.funding_api.fetch(coin)
-            if fd:
-                self.funding_rates[coin] = fd
+            p = self.spot.fetch(coin)
+            if p:
+                prices[coin] = p
+            elif coin in self.signals:
+                prices[coin] = self.signals[coin]["price"]  # fallback to last known
+        if prices:
+            log.info("  Prices: " + " | ".join(f"{c} ${p:,.4f}" for c, p in prices.items()))
+
+        all_signals = self.signals
 
         # ── 3. Portfolio + circuit breaker ─────────────────────
         portfolio = self._portfolio_value(prices)
@@ -902,13 +937,13 @@ class SeraphinaBot:
 
     # ── loop ─────────────────────────────────────────────────
     def run_loop(self):
-        log.info("Seraphina v10 starting | mode=%s | budget=$%.0f | coins=%s",
+        log.info("Seraphina v10.1 starting | mode=%s | budget=$%.0f | coins=%s",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], ", ".join(CONFIG["coins"]))
-        log.info("Grid %.1f%% spacing | RSI buy<%.0f sell>%.0f | boost<%.0f | MA50 trend | maker fees",
+        log.info("Grid %.1f%% spacing | RSI buy<%.0f sell>%.0f | %ds price scan | %ds indicator refresh",
                  CONFIG["grid_spacing_pct"] * 100,
                  CONFIG["rsi_buy_max"], CONFIG["rsi_sell_min"],
-                 CONFIG["rsi_boost_threshold"])
+                 CONFIG["scan_interval_sec"], CONFIG["indicator_refresh_sec"])
         while True:
             try:
                 self.run_once()
