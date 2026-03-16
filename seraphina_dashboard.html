@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Seraphina v10.1 — Grid + RSI</title>
+  <title>Seraphina v11.0 — Grid + RSI + Bear Mode</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -14,6 +14,7 @@
       --gold: #fbbf24; --green: #34d399; --red: #f87171;
       --blue: #818cf8; --text: #e2d9f3; --muted: #6b5f8a;
       --bull: #34d399; --bear: #f87171; --neutral: #fbbf24;
+      --short: #fb923c; --short-dim: rgba(251,146,60,0.08); --short-border: rgba(251,146,60,0.28);
     }
     html, body { background: var(--bg); color: var(--text); font-family: 'Syne', sans-serif; min-height: 100%; }
     ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
@@ -155,6 +156,8 @@
     .act-buy     { background:rgba(248,113,113,.15);color:#f87171; }
     .act-sell    { background:rgba(52,211,153,.15);color:#34d399; }
     .act-funding { background:rgba(251,191,36,.12);color:#fbbf24; }
+    .act-short   { background:rgba(251,146,60,.15);color:#fb923c; }
+    .act-cover   { background:rgba(52,211,153,.15);color:#34d399; }
     .log-desc   { flex:1;color:var(--text);min-width:120px; }
     .log-pnl    { font-weight:700;flex-shrink:0; }
     .log-cash   { font-size:9px;color:var(--muted); }
@@ -180,8 +183,8 @@
  -"-"-</pre>
     </div>
     <div>
-      <div class="brand-title">Seraphina v10.1</div>
-      <div class="brand-sub">Grid + RSI · 15s Scan · MA50 · Funding · Paper Mode</div>
+      <div class="brand-title">Seraphina v11.0</div>
+      <div class="brand-sub">Grid + RSI · Bear Mode · 15s Scan · MA50 · Funding · Paper Mode</div>
     </div>
   </div>
   <div class="header-right">
@@ -235,7 +238,12 @@
     <div class="stat" style="animation-delay:.18s">
       <div class="stat-label">Open Pos.</div>
       <div class="stat-value" id="s-open">0</div>
-      <div class="stat-sub">of 3/coin · 12 max</div>
+      <div class="stat-sub" id="s-open-sub">of 3/coin · 12 max</div>
+    </div>
+    <div class="stat" id="bear-mode-stat" style="animation-delay:.19s;border-color:rgba(251,146,60,.18)">
+      <div class="stat-label">Bear Mode</div>
+      <div class="stat-value" id="s-bear-mode" style="font-size:13px;color:var(--muted)">OFF</div>
+      <div class="stat-sub" id="s-bear-coins">no bear coins</div>
     </div>
     <div class="stat" style="animation-delay:.21s">
       <div class="stat-label">Trades</div>
@@ -332,10 +340,12 @@
 <script>
 // ── sprite ──────────────────────────────────────────────────
 const SPRITES = {
-  hunting:  ['  /\\ /\\  \n (=^.^=)$\n  )   (  \n  -"-"-  ', '  /\\ /\\  \n (=>^.^)$\n  )   (  \n  -"-"-  '],
-  watching: ['  /\\ /\\  \n (=^.^=)  \n  )   (  \n  -"-"-  ', '  /\\ /\\  \n (=^.-=)  \n  )   (  \n  -"-"-  '],
-  sleeping: ['  /\\ /\\  \n (=-.-=)  \n  )   (  \n zz-"-"- ', '  /\\ /\\  \n (=-.~=)  \n  )   (  \nzzz-"-"- '],
-  exiting:  ['  /\\ /\\  \n (=^.^=)$\n  )   (  \n  -"-"-  ', '  /\\ /\\  \n (=^.^=>)\n  )   (  \n  $-"-"- '],
+  hunting:       ['  /\\ /\\  \n (=^.^=)$\n  )   (  \n  -"-"-  ', '  /\\ /\\  \n (=>^.^)$\n  )   (  \n  -"-"-  '],
+  watching:      ['  /\\ /\\  \n (=^.^=)  \n  )   (  \n  -"-"-  ', '  /\\ /\\  \n (=^.-=)  \n  )   (  \n  -"-"-  '],
+  sleeping:      ['  /\\ /\\  \n (=-.-=)  \n  )   (  \n zz-"-"- ', '  /\\ /\\  \n (=-.~=)  \n  )   (  \nzzz-"-"- '],
+  exiting:       ['  /\\ /\\  \n (=^.^=)$\n  )   (  \n  -"-"-  ', '  /\\ /\\  \n (=^.^=>)\n  )   (  \n  $-"-"- '],
+  bear_hunting:  ['  /\\ /\\  \n (=v.v=)↓\n  )   (  \n  -"-"-  ', '  /\\ /\\  \n (=v.v=)$\n  ) )(   \n  -"-"-  '],
+  bear_watching: ['  /\\ /\\  \n (=-.v=)  \n  )   (  \n  -"-"-  ', '  /\\ /\\  \n (=v.-=)  \n  )   (  \n  -"-"-  '],
 };
 let _frame = 0, _mood = 'watching';
 setInterval(() => {
@@ -464,35 +474,67 @@ function rsiColor(rsi) {
 function renderSignals(signals, openCoins, rsiCfg) {
   const wrap  = document.getElementById('signals-grid');
   const coins = ['BTC','ETH','SOL','DOGE'];
-  const blockedCount = coins.filter(c => signals[c] && !signals[c].rsiGateOpen).length;
+  const bearCoins    = coins.filter(c => signals[c]?.bearConfirmed);
+  const blockedCount = coins.filter(c => signals[c] && !signals[c].rsiGateOpen && !signals[c].bearConfirmed).length;
   const boostCount   = coins.filter(c => signals[c] && signals[c].rsiBoost).length;
   document.getElementById('signal-badge').textContent =
-    blockedCount > 0 ? `${blockedCount} coin${blockedCount>1?'s':''} RSI-blocked` :
-    boostCount   > 0 ? `${boostCount} coin${boostCount>1?'s':''} oversold boost` : 'grid active';
+    bearCoins.length  > 0 ? `${bearCoins.join(',')} BEAR MODE` :
+    blockedCount > 0 ? `${blockedCount} RSI-blocked` :
+    boostCount   > 0 ? `${boostCount} oversold boost` : 'grid active';
 
   wrap.innerHTML = coins.map(coin => {
     const s = signals[coin];
     if (!s) return `<div class="signal-card"><div class="empty-msg">${coin}: no data</div></div>`;
-    const bull = s.trend === 'bullish';
-    const rsi  = s.rsi;
-    const rsiW = Math.round(rsi) + '%';
+    const bull  = s.trend === 'bullish';
+    const bear  = s.bearConfirmed;
+    const rsi   = s.rsi;
+    const rsiW  = Math.round(rsi) + '%';
     const rsiCol = rsiColor(rsi);
     const hasOpen = openCoins.includes(coin);
-    const blocked = s.rsiGateOpen === false;
-    const cardCls = s.rsiBoost ? 'signal-card has-signal' : bull ? 'signal-card bullish' : 'signal-card bearish';
+    const blocked = !bear && s.rsiGateOpen === false;
+    const cardCls = bear
+      ? 'signal-card bearish'
+      : s.rsiBoost ? 'signal-card has-signal'
+      : bull ? 'signal-card bullish' : 'signal-card bearish';
+    const cardStyle = bear ? 'border-color:rgba(251,146,60,.45);box-shadow:0 0 16px rgba(251,146,60,.12)' : '';
     const distPct = ((s.price - s.ma50) / s.ma50 * 100).toFixed(2);
     const distCol = s.aboveMa ? '#34d399' : '#f87171';
+
+    // regime badge
+    const regimeBadge = bear
+      ? `<span class="trend-badge" style="background:rgba(251,146,60,.15);color:#fb923c;border:1px solid rgba(251,146,60,.4)">▼ BEAR MODE</span>`
+      : `<span class="trend-badge ${bull?'trend-bull':'trend-bear'}">${bull?'▲':'▼'} ${s.trend.toUpperCase()}</span>`;
+
     let badges = '';
-    if (s.rsiBoost)      badges += '<span class="sig-badge badge-buy">⚡ RSI BOOST</span>';
-    if (blocked)         badges += '<span class="sig-badge badge-sell">⛔ RSI BLOCKED</span>';
-    if (s.rsiExitArmed)  badges += '<span class="sig-badge" style="background:rgba(251,191,36,.12);color:#fbbf24;border-color:rgba(251,191,36,.4)">● EXIT ARMED</span>';
-    if (hasOpen)         badges += '<span class="sig-badge badge-open">● IN POSITION</span>';
-    if (!badges)         badges += '<span class="sig-badge badge-wait">GRID WATCHING</span>';
-    return `<div class="${cardCls}">
+    if (bear) {
+      badges += '<span class="sig-badge" style="background:rgba(251,146,60,.15);color:#fb923c;border-color:rgba(251,146,60,.4)">▼ SHORT GRID ACTIVE</span>';
+      if (s.rsiShortArmed)  badges += '<span class="sig-badge" style="background:rgba(251,146,60,.1);color:#fb923c;border-color:rgba(251,146,60,.3)">RSI ENTRY OK</span>';
+      if (s.rsiShortClose)  badges += '<span class="sig-badge badge-sell">⚠ RSI CLOSE SHORTS</span>';
+    } else {
+      if (s.rsiBoost)      badges += '<span class="sig-badge badge-buy">⚡ RSI BOOST</span>';
+      if (blocked)         badges += '<span class="sig-badge badge-sell">⛔ RSI BLOCKED</span>';
+      if (s.rsiExitArmed)  badges += '<span class="sig-badge" style="background:rgba(251,191,36,.12);color:#fbbf24;border-color:rgba(251,191,36,.4)">● EXIT ARMED</span>';
+    }
+    if (hasOpen) badges += `<span class="sig-badge badge-open">● ${bear?'SHORT':'LONG'} OPEN</span>`;
+    if (!badges) badges += '<span class="sig-badge badge-wait">GRID WATCHING</span>';
+
+    // RSI zone labels change in bear mode
+    const rsiZoneLeft  = bear ? `Short close ${rsiCfg.shortClose||30}` : `Boost ${rsiCfg.boost||40}`;
+    const rsiZoneRight = bear ? `Short entry ${rsiCfg.shortMin||50}` : `Skip ${rsiCfg.buyMax||70}`;
+    const leftCol      = bear ? '#f87171' : '#fbbf24';
+    const rightCol     = bear ? '#fb923c' : '#34d399';
+
+    // extra RSI markers for bear mode
+    const shortMinMarker = bear
+      ? `<div class="rsi-marker" style="left:${rsiCfg.shortMin||50}%;background:rgba(251,146,60,.6)"></div>` : '';
+    const shortCloseMarker = bear
+      ? `<div class="rsi-marker" style="left:${rsiCfg.shortClose||30}%;background:rgba(248,113,113,.6)"></div>` : '';
+
+    return `<div class="${cardCls}" style="${cardStyle}">
       <div class="sig-header">
         <div>
           <div class="sig-coin">${coin}</div>
-          <span class="trend-badge ${bull?'trend-bull':'trend-bear'}">${bull?'▲':'▼'} ${s.trend.toUpperCase()}</span>
+          ${regimeBadge}
         </div>
         <div style="text-align:right">
           <div class="sig-price">${fmtPrice(coin, s.price)}</div>
@@ -509,14 +551,16 @@ function renderSignals(signals, openCoins, rsiCfg) {
       </div>
       <div class="rsi-track">
         <div class="rsi-fill" style="width:${rsiW};background:${rsiCol}"></div>
+        ${shortCloseMarker}
         <div class="rsi-marker" style="left:${rsiCfg.boost||40}%;background:rgba(251,191,36,.5)"></div>
         <div class="rsi-marker" style="left:${rsiCfg.sellMin||65}%"></div>
         <div class="rsi-marker" style="left:${rsiCfg.buyMax||70}%;background:rgba(52,211,153,.5)"></div>
+        ${shortMinMarker}
       </div>
       <div class="rsi-zones">
-        <span style="color:#fbbf24">Boost ${rsiCfg.boost||40}</span>
-        <span style="color:rgba(255,255,255,.3)">grid active</span>
-        <span style="color:#34d399">Skip ${rsiCfg.buyMax||70}</span>
+        <span style="color:${leftCol}">${rsiZoneLeft}</span>
+        <span style="color:rgba(255,255,255,.3)">${bear?'bear zone':'grid active'}</span>
+        <span style="color:${rightCol}">${rsiZoneRight}</span>
       </div>
       <div class="sig-actions">${badges}</div>
     </div>`;
@@ -527,27 +571,51 @@ function renderSignals(signals, openCoins, rsiCfg) {
 function renderPositions(positions, tpPct, slPct) {
   const el    = document.getElementById('positions-list');
   const badge = document.getElementById('pos-badge');
-  badge.textContent = positions.length + ' open';
+  const longs  = positions.filter(p => p.side !== 'short').length;
+  const shorts = positions.filter(p => p.side === 'short').length;
+  badge.textContent = positions.length
+    ? `${longs}L ${shorts}S open`
+    : '0 open';
   badge.style.color = positions.length ? 'var(--green)' : 'var(--muted)';
   badge.style.borderColor = positions.length ? 'rgba(52,211,153,0.3)' : 'var(--border)';
 
   if (!positions.length) { el.innerHTML = '<div class="empty-msg">No open positions</div>'; return; }
 
   el.innerHTML = positions.map(p => {
+    const isShort = p.side === 'short';
     const pnl    = Number(p.unrealizedPnl || 0);
     const pct    = Number(p.unrealizedPct  || 0);
     const pnlCol = pnl >= 0 ? '#34d399' : '#f87171';
-    const range  = p.tpPrice - p.slPrice;
-    const prog   = range > 0 ? Math.max(0, Math.min(100, ((p.currentPrice - p.slPrice) / range) * 100)) : 50;
+
+    // progress bar: for longs, price moves from SL→TP; for shorts, price moves from SL→TP (inverted scale)
+    let prog;
+    if (isShort) {
+      // short: SL is above entry, TP is below. Progress = how far price has fallen toward TP
+      const range = p.slPrice - p.tpPrice;
+      prog = range > 0 ? Math.max(0, Math.min(100, ((p.slPrice - p.currentPrice) / range) * 100)) : 50;
+    } else {
+      const range = p.tpPrice - p.slPrice;
+      prog = range > 0 ? Math.max(0, Math.min(100, ((p.currentPrice - p.slPrice) / range) * 100)) : 50;
+    }
     const progCol = pct >= 0 ? '#34d399' : '#f87171';
+
     const trailHtml = p.trailingActive
       ? `<span class="trail-badge">⚡ TRAIL ${fmtPrice(p.coin, p.trailingStop)}</span>`
       : `<span style="font-size:9px;color:var(--muted);font-family:'JetBrains Mono',monospace">trail arms at +${(tpPct*0.6).toFixed(1)}%</span>`;
-    return `<div class="pos-card">
+
+    const sideBadge = isShort
+      ? `<span style="font-size:9px;font-weight:700;font-family:'JetBrains Mono',monospace;padding:2px 7px;border-radius:4px;background:rgba(251,146,60,.15);color:#fb923c;border:1px solid rgba(251,146,60,.35)">▼ SHORT</span>`
+      : `<span style="font-size:9px;font-weight:700;font-family:'JetBrains Mono',monospace;padding:2px 7px;border-radius:4px;background:rgba(52,211,153,.1);color:#34d399;border:1px solid rgba(52,211,153,.3)">▲ LONG</span>`;
+
+    const cardBorder = isShort ? 'border-color:rgba(251,146,60,.35)' : '';
+    const tpLabel = isShort ? `TP ↓${tpPct.toFixed(1)}%` : `TP ↑${tpPct.toFixed(1)}%`;
+    const slLabel = isShort ? `SL ↑${slPct.toFixed(1)}%` : `SL ↓${slPct.toFixed(1)}%`;
+
+    return `<div class="pos-card" style="${cardBorder}">
       <div class="pos-top">
         <div>
-          <div class="pos-coin">${p.coin}</div>
-          <div class="pos-meta">${fmtUsd(p.sizeUsd)} deployed · ${p.gridLevel!=null?'grid L'+p.gridLevel+' · ':''}${toETFull(p.entryTime)}</div>
+          <div class="pos-coin" style="display:flex;align-items:center;gap:8px">${p.coin} ${sideBadge}</div>
+          <div class="pos-meta">${fmtUsd(p.sizeUsd)} margin · ${p.gridLevel!=null?'grid L'+p.gridLevel+' · ':''}${toETFull(p.entryTime)}</div>
         </div>
         <div class="pos-pnl">
           <div class="pos-pnl-val" style="color:${pnlCol}">${fmtPnl(pnl)}</div>
@@ -556,7 +624,7 @@ function renderPositions(positions, tpPct, slPct) {
       </div>
       <div class="pos-prices">
         <div class="pos-price-item">
-          <div class="pos-price-lbl">Entry</div>
+          <div class="pos-price-lbl">Entry ${isShort?'(sold)':'(bought)'}</div>
           <div class="pos-price-val">${fmtPrice(p.coin, p.entryPrice)}</div>
         </div>
         <div class="pos-price-item">
@@ -564,11 +632,11 @@ function renderPositions(positions, tpPct, slPct) {
           <div class="pos-price-val" style="color:${pnlCol}">${fmtPrice(p.coin, p.currentPrice)}</div>
         </div>
         <div class="pos-price-item">
-          <div class="pos-price-lbl">TP ${tpPct.toFixed(1)}%</div>
+          <div class="pos-price-lbl">${tpLabel}</div>
           <div class="pos-price-val" style="color:#34d399">${fmtPrice(p.coin, p.tpPrice)}</div>
         </div>
         <div class="pos-price-item">
-          <div class="pos-price-lbl">SL ${slPct.toFixed(1)}%</div>
+          <div class="pos-price-lbl">${slLabel}</div>
           <div class="pos-price-val" style="color:#f87171">${fmtPrice(p.coin, p.slPrice)}</div>
         </div>
       </div>
@@ -576,9 +644,9 @@ function renderPositions(positions, tpPct, slPct) {
         <div class="pos-progress-fill" style="width:${prog}%;background:${progCol}"></div>
       </div>
       <div class="pos-progress-labels">
-        <span style="color:#f87171">SL</span>
+        <span style="color:#f87171">${isShort?'SL (↑)':'SL'}</span>
         <span style="color:var(--muted)">${prog.toFixed(0)}% to TP</span>
-        <span style="color:#34d399">TP</span>
+        <span style="color:#34d399">${isShort?'TP (↓)':'TP'}</span>
       </div>
       <div style="margin-top:8px">${trailHtml}</div>
     </div>`;
@@ -665,10 +733,15 @@ function renderLog(trades) {
     el.innerHTML = '<div class="empty-msg">No trades yet — grid will trigger entries on crossings...</div>'; return;
   }
   el.innerHTML = [...trades].reverse().map(t => {
-    const pnl = t.pnl || 0;
-    const isSell = t.action==='SELL', isFund = t.action==='FUNDING';
-    const actCls = isFund?'act-funding':isSell?'act-sell':'act-buy';
-    const pnlStr = (isSell||isFund)
+    const pnl    = t.pnl || 0;
+    const action = t.action || '';
+    const isSell  = action === 'SELL';
+    const isCover = action === 'COVER';
+    const isFund  = action === 'FUNDING';
+    const isShort = action === 'SHORT';
+    const actCls  = isFund ? 'act-funding' : (isSell||isCover) ? 'act-sell' : isShort ? 'act-short' : 'act-buy';
+    const showPnl = isSell || isCover || isFund;
+    const pnlStr  = showPnl
       ? `<span class="log-pnl" style="color:${pnl>=0?'#34d399':'#f87171'}">${fmtPnl(pnl)}</span>`
       : '';
     const reason = t.reason ? `<span style="font-size:9px;color:var(--muted);font-family:'JetBrains Mono',monospace">[${t.reason}]</span>` : '';
@@ -676,7 +749,7 @@ function renderLog(trades) {
     return `<div class="log-row">
       <span class="log-date">${toETDate(ts)}</span>
       <span class="log-time">${toET(ts)}</span>
-      <span class="log-action ${actCls}">${t.action}</span>
+      <span class="log-action ${actCls}">${action}</span>
       <span class="log-desc">${t.coin} @ ${isFund?'–':fmtPrice(t.coin,t.price)} · $${Number(t.size||0).toFixed(2)} ${reason}</span>
       ${pnlStr}
       <span class="log-cash">${fmtUsd(t.cash||0)}</span>
@@ -743,7 +816,37 @@ function loadData() {
         streakSub.textContent = 'no streak';
       }
 
-      document.getElementById('s-open').textContent   = d.openCount ?? 0;
+      // open positions breakdown
+      const longs  = (d.openLongs  ?? 0);
+      const shorts = (d.openShorts ?? 0);
+      document.getElementById('s-open').textContent = d.openCount ?? 0;
+      document.getElementById('s-open-sub').textContent =
+        longs || shorts ? `${longs}L · ${shorts}S · 3/coin max` : 'of 3/coin · 12 max';
+
+      // bear mode stat
+      const bearActive = d.bearActiveCoins?.length > 0;
+      const bearEl     = document.getElementById('s-bear-mode');
+      const bearStat   = document.getElementById('bear-mode-stat');
+      const bearCoinsEl = document.getElementById('s-bear-coins');
+      if (!d.bearModeEnabled) {
+        bearEl.textContent = 'DISABLED';
+        bearEl.style.color = 'var(--muted)';
+        bearStat.style.borderColor = 'var(--border)';
+        bearCoinsEl.textContent = 'feature off';
+      } else if (bearActive) {
+        bearEl.textContent = 'ACTIVE';
+        bearEl.style.color = '#fb923c';
+        bearStat.style.borderColor = 'rgba(251,146,60,.45)';
+        bearStat.style.boxShadow = '0 0 16px rgba(251,146,60,.12)';
+        bearCoinsEl.textContent = d.bearActiveCoins.join(', ');
+      } else {
+        bearEl.textContent = 'ARMED';
+        bearEl.style.color = '#818cf8';
+        bearStat.style.borderColor = 'rgba(129,140,248,.25)';
+        bearStat.style.boxShadow = '';
+        bearCoinsEl.textContent = 'watching for bear coins';
+      }
+
       document.getElementById('s-trades').textContent = d.tradesTotal ?? 0;
       document.getElementById('s-scan').textContent   = d.scanCount ?? 0;
       document.getElementById('s-funding').textContent = fmtUsd(d.fundingIncome??0);
