@@ -1,10 +1,19 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SERAPHINA'S CRYPTO ENGINE v8.1 — GRID TRADER        ║
-║  Strategy: Automated grid trading on BTC, ETH, SOL, DOGE    ║
-║  Places buy/sell orders at fixed price intervals.            ║
-║  Profits from volatility — no direction prediction needed.   ║
+║      SERAPHINA'S CRYPTO ENGINE v10 — GRID + RSI HYBRID      ║
+║  Strategy: Grid trading filtered by RSI momentum signals.    ║
+║  Grid provides consistency; RSI prevents overbought buys     ║
+║  and locks in profits when price is extended.                ║
 ╚══════════════════════════════════════════════════════════════╝
+
+CHANGES v10 vs v9 (RSI-only):
+  - Grid trading restored as the core engine
+  - RSI added as a buy filter: skip grid buys when RSI > rsi_buy_max (70)
+    (prevents buying into overbought conditions)
+  - RSI sell trigger: close profitable positions when RSI > rsi_sell_min (72)
+    (locks in gains before reversals)
+  - All v8 safety features retained: momentum filter, trailing stop,
+    circuit breaker, cash floor, daily loss cap, stale position cleanup
 
 CHANGES v7 vs v6:
   - Momentum filter: skip buying if price dropped >1.5% over last 5 scans
@@ -121,6 +130,11 @@ CONFIG = {
 
     # ── Daily history (v7) ──
     "daily_history_file": "seraphina_daily.json",
+
+    # ── RSI filter (v10) ──
+    "rsi_lookback":   14,    # standard RSI-14 period
+    "rsi_buy_max":    70,    # skip grid buy if RSI above this (overbought)
+    "rsi_sell_min":   72,    # sell profitable open positions if RSI above this
 
     "scan_interval_sec": 15,
 
@@ -570,6 +584,24 @@ class SeraphinaBot:
             return False
         return True
 
+    # ── RSI calculator (v10) ────────────────────────────────────────────────
+
+    def _calc_rsi(self, coin):
+        """Compute RSI-14 from recent price history. Returns None if not enough data."""
+        hist = self.price_hist.get(coin, [])
+        n = CONFIG["rsi_lookback"]
+        if len(hist) < n + 1:
+            return None
+        prices = hist[-(n + 1):]
+        gains  = [max(prices[i] - prices[i-1], 0) for i in range(1, len(prices))]
+        losses = [max(prices[i-1] - prices[i], 0) for i in range(1, len(prices))]
+        avg_gain = sum(gains) / n
+        avg_loss = sum(losses) / n
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return round(100 - (100 / (1 + rs)), 1)
+
     # ────────────────────────────────────────────────────────────────────────
 
     def _load_state(self):
@@ -716,6 +748,8 @@ class SeraphinaBot:
                     "peakPortfolio":   round(self.wallet.peak_portfolio, 2),
                     "drawdownPct":     round((self.wallet.peak_portfolio - portfolio_value) / self.wallet.peak_portfolio * 100, 2) if self.wallet.peak_portfolio > 0 else 0,
                     "prices":          {c: round(p, 4) for c, p in prices.items() if p},
+                    "rsiValues":       {c: self._calc_rsi(c) for c in CONFIG["coins"]},
+                    "rsiConfig":       {"buyMax": CONFIG["rsi_buy_max"], "sellMin": CONFIG["rsi_sell_min"]},
                     "cashFloorPct":    CONFIG["cash_floor_pct"] * 100,
                 }, f, indent=2)
         except Exception as e:
@@ -848,6 +882,24 @@ class SeraphinaBot:
                     log.warning("  [STALE/%s] Closed %dh-old position | entry=$%.4f | gain=%.1f%% | P&L=$%+.4f",
                                _sc, int(_age), _sb["buy_price"], _gain * 100, _pnl)
 
+        # ── Step 3e: RSI overbought sell (v10) — lock in profits when RSI is extended ──
+        for coin, price in list(prices.items()):
+            if coin not in self.grids:
+                continue
+            rsi = self._calc_rsi(coin)
+            if rsi is None or rsi < CONFIG["rsi_sell_min"]:
+                continue
+            g = self.grids[coin]
+            for buy_idx, buy in list(g.open_buys.items()):
+                profit = round(buy["size_usd"] * (price - buy["buy_price"]) / buy["buy_price"], 4)
+                if profit > 0:
+                    self.wallet.sell(coin, price, buy["size_usd"], profit)
+                    g.record_sell(buy_idx)
+                    total_open -= 1
+                    trades_this_scan += 1
+                    log.info("  [RSI/%s] SELL overbought RSI=%.1f | $%.4f | profit=$%+.4f | cash=$%.2f",
+                             coin, rsi, price, profit, self.wallet.cash)
+
         # ── Step 4: Check grid crossings ──
         for coin, price in prices.items():
             if coin not in self.grids:
@@ -898,6 +950,13 @@ class SeraphinaBot:
                     # v7: momentum filter
                     mom_ok, mom_mult = self._momentum_ok_to_buy(coin, price)
                     if not mom_ok:
+                        continue
+
+                    # v10: RSI buy filter — skip if overbought
+                    rsi = self._calc_rsi(coin)
+                    if rsi is not None and rsi > CONFIG["rsi_buy_max"]:
+                        log.info("  [RSI/%s] RSI=%.1f > %.0f — skip overbought buy",
+                                 coin, rsi, CONFIG["rsi_buy_max"])
                         continue
 
                     # v7: cash floor
@@ -955,12 +1014,13 @@ class SeraphinaBot:
         self._write_dashboard(prices, mood, trades_this_scan, vol_regimes, portfolio_value_now)
 
     def run_loop(self):
-        log.info("Seraphina v8 starting | mode=%s | budget=$%.0f | coins=%s",
+        log.info("Seraphina v10 starting | mode=%s | budget=$%.0f | coins=%s",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], ", ".join(CONFIG["coins"]))
-        log.info("Grid: %d levels | %.1f%% spacing | %.0f%% base size | 15s scans | NO API CALLS",
+        log.info("Grid+RSI: %d levels | %.1f%% spacing | %.0f%% base size | RSI buy<%.0f sell>%.0f | 15s scans",
                  CONFIG["grid_levels"], CONFIG["grid_spacing_pct"] * 100,
-                 CONFIG["trade_size_pct"] * 100)
+                 CONFIG["trade_size_pct"] * 100,
+                 CONFIG["rsi_buy_max"], CONFIG["rsi_sell_min"])
         while True:
             try:
                 self.run_once()
