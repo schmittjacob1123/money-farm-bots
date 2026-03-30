@@ -60,8 +60,6 @@ while True:
                 if content:
                     with open(filepath, "w") as f:
                         f.write(content)
-                    subprocess.run(["git", "add", filename], cwd="/home/ubuntu")
-                    subprocess.run(["git", "commit", "-m", f"auto-deploy: {filename}"], cwd="/home/ubuntu")
                     if filename in BOT_SCREENS:
                         restart_screen(BOT_SCREENS[filename], filename)
                     else:
