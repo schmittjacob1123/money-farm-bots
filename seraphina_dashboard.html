@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Seraphina v11.0 — Grid + RSI + Bear Mode</title>
+  <title>Seraphina v12.0 — Grid + RSI + Bear Mode</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -183,8 +183,8 @@
  -"-"-</pre>
     </div>
     <div>
-      <div class="brand-title">Seraphina v11.0</div>
-      <div class="brand-sub">Grid + RSI · Bear Mode · 15s Scan · MA50 · Funding · Paper Mode</div>
+      <div class="brand-title">Seraphina v12.0</div>
+      <div class="brand-sub">Grid + RSI · No Longs Below MA50 · Bear Mode · 15s Scan · Funding · Paper Mode</div>
     </div>
   </div>
   <div class="header-right">
@@ -821,7 +821,7 @@ function loadData() {
       const shorts = (d.openShorts ?? 0);
       document.getElementById('s-open').textContent = d.openCount ?? 0;
       document.getElementById('s-open-sub').textContent =
-        longs || shorts ? `${longs}L · ${shorts}S · 3/coin max` : 'of 3/coin · 12 max';
+        longs || shorts ? `${longs}L · ${shorts}S · 2/coin max` : 'of 2/coin · 12 max';
 
       // bear mode stat
       const bearActive = d.bearActiveCoins?.length > 0;
@@ -870,7 +870,7 @@ function loadData() {
       renderGrids(d.grids||{}, d.signals||{});
 
       // positions
-      renderPositions(d.positions||[], d.tpPct??2.5, d.slPct??4.0);
+      renderPositions(d.positions||[], d.tpPct??3.5, d.slPct??3.0);
 
       // funding
       renderFunding(d.fundingRates||{});
