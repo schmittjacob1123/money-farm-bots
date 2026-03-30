@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Polymarket Bot — Performance</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #0a0a0a; color: #f0f0f0; font-family: 'Syne', sans-serif; }
+    ::-webkit-scrollbar { width: 3px; }
+    ::-webkit-scrollbar-thumb { background: #333; }
+    @keyframes fadeUp { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes drawLine { from { stroke-dashoffset: 1000; } to { stroke-dashoffset: 0; } }
+    .fade-up { animation: fadeUp 0.6s ease both; }
+  </style>
+</head>
+<body>
+<script>
+(async function() {
+  try {
+    const res = await fetch('/api/auth/check', {credentials: 'include'});
+    const data = await res.json();
+    if (!data.ok) window.location.href = '/login.html';
+  } catch(e) { window.location.href = '/login.html'; }
+})();
+</script>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+function parseCSV(text) {
+  const result = Papa.parse(text, { header: true, skipEmptyLines: true });
+  return result.data.map((row, i) => ({
+    id: i,
+    timestamp: new Date(row.timestamp),
+    question: row.market_question || '',
+    side: row.side || 'YES',
+    marketPrice: parseFloat(row.market_price) || 0,
+    aiEstimate: parseFloat(row.ai_estimate) || 0,
+    edge: parseFloat(row.edge) || 0,
+    size: parseFloat(row.size) || 0,
+    entryPrice: parseFloat(row.entry_price) || 0,
+    confidence: row.confidence || 'low',
+    reasoning: row.reasoning || '',
+    dryRun: row.dry_run === 'True',
+  })).filter(r => !isNaN(r.size) && r.size > 0);
+}
+
+function simulatePnl(trades) {
+  // Simulate: if AI estimate is correct, what would profit be?
+  return trades.map(t => {
+    const correctProb = t.aiEstimate;
+    const entryPrice = t.entryPrice;
+    const size = t.size;
+    // Expected value: prob of win * payout - prob of loss * stake
+    const payout = size / entryPrice; // shares * $1
+    const ev = correctProb * (payout - size) - (1 - correctProb) * size;
+    return { ...t, expectedPnl: ev, cumPnl: 0 };
+  }).reduce((acc, t, i) => {
+    const prev = i === 0 ? 0 : acc[i-1].cumPnl;
+    t.cumPnl = prev + t.expectedPnl;
+    acc.push(t);
+    return acc;
+  }, []);
+}
+
+function MiniChart({ trades }) {
+  if (trades.length < 2) return null;
+  const w = 600, h = 160, pad = 20;
+  const values = trades.map(t => t.cumPnl);
+  const min = Math.min(0, ...values);
+  const max = Math.max(0, ...values);
+  const range = max - min || 1;
+  const scaleY = v => pad + (h - pad*2) * (1 - (v - min) / range);
+  const scaleX = i => pad + (w - pad*2) * (i / (trades.length - 1));
+  const points = trades.map((t,i) => `${scaleX(i)},${scaleY(t.cumPnl)}`).join(' ');
+  const zeroY = scaleY(0);
+  const isPositive = trades[trades.length-1].cumPnl >= 0;
+  const color = isPositive ? '#00ff88' : '#ff4455';
+  const areaPoints = `${scaleX(0)},${zeroY} ${points} ${scaleX(trades.length-1)},${zeroY}`;
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} style={{width:'100%',height:'100%'}}>
+      <defs>
+        <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.3"/>
+          <stop offset="100%" stopColor={color} stopOpacity="0.02"/>
+        </linearGradient>
+      </defs>
+      <line x1={pad} y1={zeroY} x2={w-pad} y2={zeroY} stroke="#333" strokeWidth="1" strokeDasharray="4,4"/>
+      <polygon points={areaPoints} fill="url(#areaGrad)"/>
+      <polyline points={points} fill="none" stroke={color} strokeWidth="2.5"
+        strokeDasharray="1000" strokeDashoffset="1000"
+        style={{animation:'drawLine 1.5s ease forwards 0.3s'}}/>
+      {trades.map((t,i) => (
+        <circle key={i} cx={scaleX(i)} cy={scaleY(t.cumPnl)} r="3"
+          fill={t.cumPnl >= 0 ? '#00ff88' : '#ff4455'}
+          opacity="0.8"/>
+      ))}
+    </svg>
+  );
+}
+
+function EdgeBar({ edge }) {
+  const pct = Math.min(Math.abs(edge) * 100, 100);
+  const color = edge > 0.15 ? '#00ff88' : edge > 0.05 ? '#ffcc00' : '#ff4455';
+  return (
+    <div style={{display:'flex',alignItems:'center',gap:8}}>
+      <div style={{flex:1,height:4,background:'#1a1a1a',borderRadius:2}}>
+        <div style={{width:`${pct}%`,height:'100%',background:color,borderRadius:2,transition:'width 1s ease'}}/>
+      </div>
+      <span style={{fontFamily:'Space Mono',fontSize:11,color,width:52,textAlign:'right'}}>
+        {edge > 0 ? '+' : ''}{(edge*100).toFixed(1)}%
+      </span>
+    </div>
+  );
+}
+
+function App() {
+  const [trades, setTrades] = useState(null);
+  const [error, setError] = useState(null);
+  const [sort, setSort] = useState('time');
+
+  useEffect(() => {
+    fetch('trades.csv?t=' + Date.now())
+      .then(r => { if (!r.ok) throw new Error('not found'); return r.text(); })
+      .then(text => {
+        const parsed = parseCSV(text);
+        setTrades(simulatePnl(parsed));
+      })
+      .catch(() => setError(true));
+  }, []);
+
+  if (error) return (
+    <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100vh',gap:16}}>
+      <div style={{fontFamily:'Space Mono',fontSize:32,color:'#333'}}>404</div>
+      <div style={{color:'#555'}}>trades.csv not found — run the bot first</div>
+      <div style={{fontFamily:'Space Mono',fontSize:12,color:'#333',background:'#111',padding:'8px 16px',borderRadius:6}}>python polymarket_bot.py --once</div>
+    </div>
+  );
+
+  if (!trades) return (
+    <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',color:'#333',fontFamily:'Space Mono'}}>
+      Loading trades...
+    </div>
+  );
+
+  const totalInvested = trades.reduce((s,t) => s + t.size, 0);
+  const finalPnl = trades.length ? trades[trades.length-1].cumPnl : 0;
+  const winRate = trades.length ? (trades.filter(t => t.edge > 0).length / trades.length * 100).toFixed(0) : 0;
+  const avgEdge = trades.length ? (trades.reduce((s,t) => s + t.edge, 0) / trades.length * 100).toFixed(1) : 0;
+  const biggestEdge = trades.length ? trades.reduce((best, t) => t.edge > best.edge ? t : best, trades[0]) : null;
+
+  const sorted = [...trades].sort((a,b) => sort === 'edge' ? b.edge - a.edge : b.timestamp - a.timestamp);
+
+  return (
+    <div style={{minHeight:'100vh',background:'#0a0a0a',padding:'0 0 80px'}}>
+
+      {/* Header */}
+      <div style={{borderBottom:'1px solid #1a1a1a',padding:'24px 32px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+        <div>
+          <div style={{fontSize:11,fontFamily:'Space Mono',color:'#444',letterSpacing:'0.15em',textTransform:'uppercase',marginBottom:6}}>Polymarket Bot</div>
+          <div style={{fontSize:28,fontWeight:800,letterSpacing:'-0.03em'}}>Performance Report</div>
+        </div>
+        <div style={{fontFamily:'Space Mono',fontSize:11,color:'#333'}}>{trades.length} trades logged</div>
+      </div>
+
+      <div style={{maxWidth:1100,margin:'0 auto',padding:'32px 32px 0'}}>
+
+        {/* Stats row */}
+        <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:32}}>
+          {[
+            { label:'Expected P&L', value: `${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(2)}`, color: finalPnl >= 0 ? '#00ff88' : '#ff4455', sub:'if AI estimates correct' },
+            { label:'Total Deployed', value: `$${totalInvested.toFixed(2)}`, color:'#f0f0f0', sub:'paper money at risk' },
+            { label:'Positive Edge', value: `${winRate}%`, color:'#ffcc00', sub:'of trades had edge > 0' },
+            { label:'Avg Edge', value: `${avgEdge}%`, color:'#818cf8', sub:'mean edge per trade' },
+          ].map((s,i) => (
+            <div key={i} className="fade-up" style={{background:'#111',border:'1px solid #1a1a1a',borderRadius:12,padding:'20px 22px',animationDelay:`${i*0.08}s`}}>
+              <div style={{fontSize:10,fontFamily:'Space Mono',color:'#444',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:10}}>{s.label}</div>
+              <div style={{fontSize:28,fontWeight:800,color:s.color,fontFamily:'Space Mono',letterSpacing:'-0.02em'}}>{s.value}</div>
+              <div style={{fontSize:11,color:'#333',marginTop:6}}>{s.sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Chart */}
+        <div className="fade-up" style={{background:'#111',border:'1px solid #1a1a1a',borderRadius:12,padding:'24px',marginBottom:32,animationDelay:'0.3s'}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+            <div>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:2}}>Cumulative Expected P&L</div>
+              <div style={{fontSize:11,color:'#444',fontFamily:'Space Mono'}}>simulated based on AI probability estimates</div>
+            </div>
+            <div style={{fontFamily:'Space Mono',fontSize:20,fontWeight:700,color:finalPnl>=0?'#00ff88':'#ff4455'}}>
+              {finalPnl>=0?'+':''}${finalPnl.toFixed(2)}
+            </div>
+          </div>
+          <div style={{height:160}}>
+            <MiniChart trades={trades}/>
+          </div>
+        </div>
+
+        {/* Best signal callout */}
+        {biggestEdge && biggestEdge.edge > 0.1 && (
+          <div className="fade-up" style={{background:'linear-gradient(135deg,rgba(0,255,136,0.06),rgba(0,255,136,0.02))',border:'1px solid rgba(0,255,136,0.2)',borderRadius:12,padding:'20px 24px',marginBottom:32,animationDelay:'0.4s'}}>
+            <div style={{fontSize:10,fontFamily:'Space Mono',color:'#00ff88',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:8}}>Best Signal Found</div>
+            <div style={{fontSize:15,fontWeight:700,marginBottom:6}}>{biggestEdge.question}</div>
+            <div style={{display:'flex',gap:24,flexWrap:'wrap'}}>
+              <span style={{fontFamily:'Space Mono',fontSize:12,color:'#555'}}>Market: <span style={{color:'#f0f0f0'}}>{(biggestEdge.marketPrice*100).toFixed(1)}%</span></span>
+              <span style={{fontFamily:'Space Mono',fontSize:12,color:'#555'}}>AI Est: <span style={{color:'#00ff88'}}>{(biggestEdge.aiEstimate*100).toFixed(1)}%</span></span>
+              <span style={{fontFamily:'Space Mono',fontSize:12,color:'#555'}}>Edge: <span style={{color:'#00ff88'}}>+{(biggestEdge.edge*100).toFixed(1)}%</span></span>
+              <span style={{fontFamily:'Space Mono',fontSize:12,color:'#555'}}>Size: <span style={{color:'#f0f0f0'}}>${biggestEdge.size.toFixed(2)}</span></span>
+            </div>
+          </div>
+        )}
+
+        {/* Trade table */}
+        <div className="fade-up" style={{animationDelay:'0.5s'}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+            <div style={{fontSize:15,fontWeight:700}}>All Trades</div>
+            <div style={{display:'flex',gap:4}}>
+              {['time','edge'].map(s => (
+                <button key={s} onClick={()=>setSort(s)} style={{fontFamily:'Space Mono',fontSize:11,padding:'5px 12px',borderRadius:6,border:'1px solid',cursor:'pointer',background:sort===s?'#f0f0f0':'transparent',color:sort===s?'#0a0a0a':'#444',borderColor:sort===s?'#f0f0f0':'#1a1a1a',transition:'all 0.15s'}}>
+                  {s === 'time' ? 'Recent' : 'By Edge'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{border:'1px solid #1a1a1a',borderRadius:12,overflow:'hidden'}}>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 80px 80px 80px 160px',gap:0,padding:'10px 20px',borderBottom:'1px solid #1a1a1a',background:'#0d0d0d'}}>
+              {['Market','Side','Size','Conf','Edge'].map(h => (
+                <div key={h} style={{fontSize:10,fontFamily:'Space Mono',color:'#333',textTransform:'uppercase',letterSpacing:'0.08em'}}>{h}</div>
+              ))}
+            </div>
+            {sorted.map((t,i) => (
+              <div key={t.id} style={{display:'grid',gridTemplateColumns:'1fr 80px 80px 80px 160px',gap:0,padding:'14px 20px',borderBottom:i<sorted.length-1?'1px solid #111':'none',background:i%2===0?'#0a0a0a':'#0c0c0c',transition:'background 0.15s'}}
+                onMouseEnter={e=>e.currentTarget.style.background='#131313'}
+                onMouseLeave={e=>e.currentTarget.style.background=i%2===0?'#0a0a0a':'#0c0c0c'}>
+                <div style={{paddingRight:16}}>
+                  <div style={{fontSize:13,fontWeight:600,marginBottom:3,lineHeight:1.3}}>{t.question.slice(0,70)}{t.question.length>70?'…':''}</div>
+                  <div style={{fontSize:10,fontFamily:'Space Mono',color:'#333'}}>{t.timestamp.toLocaleDateString()} {t.timestamp.toLocaleTimeString()}</div>
+                </div>
+                <div style={{fontFamily:'Space Mono',fontSize:12,color:t.side==='YES'?'#00ff88':'#ff8844',fontWeight:700,alignSelf:'center'}}>{t.side}</div>
+                <div style={{fontFamily:'Space Mono',fontSize:12,color:'#f0f0f0',alignSelf:'center'}}>${t.size.toFixed(2)}</div>
+                <div style={{fontSize:11,alignSelf:'center',color:t.confidence==='high'?'#00ff88':t.confidence==='medium'?'#ffcc00':'#555'}}>{t.confidence}</div>
+                <div style={{alignSelf:'center'}}><EdgeBar edge={t.edge}/></div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div style={{marginTop:24,fontFamily:'Space Mono',fontSize:11,color:'#222',textAlign:'center',lineHeight:1.8}}>
+          P&L is simulated using AI probability estimates — actual results depend on market outcomes.<br/>
+          Positive edge = AI thinks market is underpriced. Negative edge = AI thinks market is overpriced.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
