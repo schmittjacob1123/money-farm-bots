@@ -1,17 +1,40 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║      SERAPHINA v11.0 — GRID + RSI/MA HYBRID + BEAR MODE     ║
+║      SERAPHINA v12.0 — GRID + RSI/MA HYBRID + BEAR MODE     ║
 ║  Strategy:                                                   ║
 ║    1. Grid trading: buys every 1% price dip through a level  ║
 ║    2. RSI gate: skip grid buys if RSI > 70 (overbought)      ║
 ║    3. RSI boost: larger size when RSI < 40 (oversold dip)    ║
-║    4. MA50 trend: reduce size in downtrend                   ║
-║    5. Exits: TP 2.5%, SL 4%, trailing stop, RSI>65 sell     ║
-║    6. Funding rate income on open positions                  ║
-║    7. Maker-tier fees 0.16%                                  ║
-║    8. Bear mode: short grid rallies when price < MA50        ║
+║    4. MA50 hard gate: NO longs below MA50 (prevents knife    ║
+║       catching in downtrends)                                ║
+║    5. Exits: TP 3.5%, SL 3%, trailing stop, RSI>65 sell     ║
+║       → break-even win rate 46% (was 61.5% in v11)          ║
+║    6. Bear mode activates at 1% below MA50 (was 2%)         ║
+║    7. Shorts stay open until price recrosses MA50 (not just  ║
+║       until bear_confirmed flag resets)                      ║
+║    8. Funding rate income on open positions                  ║
+║    9. Maker-tier fees 0.16%                                  ║
 ╚══════════════════════════════════════════════════════════════╝
+
+CHANGES v12.0:
+  - Hard gate: no long entries when price is below MA50.
+    v11 halved size in downtrend but still bought — this caused
+    repeated stop-outs as the grid caught falling knives. Now
+    the bot simply does nothing on the long side until price
+    recrosses MA50. Bear mode (shorts) is the only activity below MA50.
+  - TP raised 2.5% → 3.5%, SL lowered 4% → 3%.
+    Old ratio required 61.5% win rate to break even. New ratio
+    requires 46.2%. Much more achievable for a grid bot.
+  - Bear confirm threshold lowered 2% → 1% below MA50.
+    Old threshold rarely triggered because the MA50 itself drifts
+    down with price in a slow grind, keeping price within 2%.
+  - RSI short minimum lowered 55 → 50. Slightly easier to enter
+    shorts on rallies in a downtrend.
+  - max_open_per_coin lowered 3 → 2. Reduces concentration risk.
+  - REGIME_FLIP for shorts now closes on above_ma (price back
+    above MA50) instead of on bear_confirmed=False. Prevents
+    shorts from closing prematurely just because RSI dips < 50.
 
 CHANGES v11.0:
   - Bear mode: when price is 2%+ below MA50, activates a short
@@ -65,8 +88,8 @@ CONFIG = {
     "rsi_sell_min":         65,     # close profitable positions if RSI above this
 
     # — trade management —
-    "take_profit_pct":      0.025,  # 2.5% TP per position
-    "stop_loss_pct":        0.040,  # 4% hard stop
+    "take_profit_pct":      0.035,  # 3.5% TP per position (break-even at 46% win rate)
+    "stop_loss_pct":        0.030,  # 3% hard stop (was 4% — tighter to limit knife-catching)
     "trail_activate_pct":   0.015,  # trailing stop arms at +1.5%
     "trail_stop_pct":       0.010,  # trails 1.0% below peak
 
@@ -76,7 +99,7 @@ CONFIG = {
     "trade_size_max":       100.0,
     "downtrend_size_mult":  0.5,    # halve size when below MA50
     "loss_streak_halve":    3,      # halve size after N consecutive losses
-    "max_open_per_coin":    3,      # grid allows stacking positions per coin
+    "max_open_per_coin":    2,      # grid allows stacking positions per coin (was 3)
     "max_open_total":       12,
 
     # — fees (maker tier) —
@@ -89,8 +112,8 @@ CONFIG = {
 
     # — bear mode (short grid) —
     "bear_mode":            True,       # enable short selling on downtrending coins
-    "short_bear_confirm":   0.02,       # price must be ≥2% below MA50 to activate
-    "rsi_short_min":        55,         # only short if RSI > 55 (meaningful rally in downtrend)
+    "short_bear_confirm":   0.01,       # price must be ≥1% below MA50 to activate (was 2%)
+    "rsi_short_min":        50,         # only short if RSI > 50 (meaningful rally in downtrend, was 55)
     "rsi_short_close":      30,         # close shorts if RSI < 30 (oversold — reversal risk)
 
     # — risk —
@@ -855,7 +878,7 @@ class SeraphinaBot:
 
             with open(CONFIG["dashboard_file"], "w") as f:
                 json.dump({
-                    "version":           "v11",
+                    "version":           "v12",
                     "lastScan":          datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
                     "mode":              "PAPER" if CONFIG["dry_run"] else "LIVE",
                     "mood":              mood,
@@ -1009,10 +1032,10 @@ class SeraphinaBot:
                     # RSI oversold — close short, reversal risk
                     if rsi is not None and rsi < CONFIG["rsi_short_close"]:
                         should_exit, reason = True, "RSI_OS"
-                    # Regime no longer bear — close short unconditionally.
-                    # Holding a short against a confirmed uptrend is the wrong
-                    # side of the trade regardless of current P&L.
-                    elif not sig.get("bear_confirmed", False):
+                    # Price recrossed above MA50 — trend flipped bullish, close short.
+                    # We use above_ma (not bear_confirmed) so shorts aren't closed
+                    # prematurely just because RSI dropped below rsi_short_min mid-trade.
+                    elif sig.get("above_ma", False):
                         should_exit, reason = True, "REGIME_FLIP"
 
             if should_exit:
@@ -1097,6 +1120,16 @@ class SeraphinaBot:
 
             # ── 7b. BULL / NEUTRAL: buy dips ────────────────────
             else:
+                # Hard gate: no longs when price is below MA50.
+                # v11 halved size in downtrend but still bought — causing repeated
+                # stop-outs as the grid caught falling knives. Now we simply skip
+                # all long entries until price recrosses MA50. Bear mode (shorts)
+                # handles the downtrend side.
+                if not above_ma:
+                    log.info("  [GRID/%s] Below MA50 — no longs in downtrend", coin)
+                    self.prev_prices[coin] = price
+                    continue
+
                 # Check RSI gate — skip all longs if overbought
                 if rsi is not None and rsi > CONFIG["rsi_buy_max"]:
                     log.info("  [GRID/%s] RSI=%.1f > %.0f — skipping buys this scan",
@@ -1146,7 +1179,7 @@ class SeraphinaBot:
 
     # ── loop ─────────────────────────────────────────────────
     def run_loop(self):
-        log.info("Seraphina v11.0 starting | mode=%s | budget=$%.0f | coins=%s",
+        log.info("Seraphina v12.0 starting | mode=%s | budget=$%.0f | coins=%s",
                  "PAPER" if CONFIG["dry_run"] else "LIVE",
                  CONFIG["paper_budget"], ", ".join(CONFIG["coins"]))
         log.info("Grid %.1f%% spacing | RSI buy<%.0f sell>%.0f | %ds price scan | %ds indicator refresh",
