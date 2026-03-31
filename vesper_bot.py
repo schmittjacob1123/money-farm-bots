@@ -35,12 +35,21 @@ CONFIG = {
 
     # scan timing
     "scan_interval_s":      300,    # 5 min between scans
-    "signal_refresh_s":     600,    # 10 min between full signal refresh
+    "signal_refresh_s":     300,    # 5 min between full signal refresh (match scan)
 
     # market filters
     "min_liquidity":        500.0,
     "min_volume_24h":       50.0,
     "max_markets_scan":     100,
+    "min_end_hours":        24,     # skip markets ending within 24h (same-day props)
+
+    # player prop keywords to skip entirely — these resolve same-day with zero signal value
+    "prop_keywords": [
+        "points o/u", "rebounds o/u", "assists o/u", "steals o/u", "blocks o/u",
+        "threes o/u", "turnovers o/u", "pts o/u", "reb o/u", "ast o/u",
+        "passing yards", "rushing yards", "receiving yards", "touchdowns o/u",
+        "strikeouts o/u", "hits o/u", "home runs o/u",
+    ],
 
     # position sizing
     "position_size_pct":    0.07,
@@ -612,7 +621,22 @@ class VesperBot:
             vol24 = m.get("volume24hr")   or 0
             if liq < CONFIG["min_liquidity"] or vol24 < CONFIG["min_volume_24h"]:
                 continue
+            # Skip markets resolving within min_end_hours (same-day props)
+            end_date = m.get("endDate") or m.get("endDateIso", "")
+            if end_date:
+                try:
+                    from datetime import timezone
+                    end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                    if hours_left < CONFIG["min_end_hours"]:
+                        continue
+                except Exception:
+                    pass
             q = m.get("question", "")
+            # Skip player prop markets entirely — no signal value
+            q_lower = q.lower()
+            if any(kw in q_lower for kw in CONFIG["prop_keywords"]):
+                continue
             sig = self.weather.get_signal(q, yes_price)
             if sig is None:
                 sig = self.price_signal.get_signal(m, yes_price)
@@ -660,7 +684,12 @@ class VesperBot:
     # ── ENTRIES ───────────────────────────────────────────────
     def _try_enter(self, portfolio):
         entered = 0
-        ranked  = sorted(self._signal_cache.values(), key=lambda s: s["edge"], reverse=True)
+        # Weather signals rank first (highest quality), then momentum, reversion, volume
+        TYPE_PRIORITY = {"weather": 0, "momentum": 1, "reversion": 2, "volume": 3}
+        ranked = sorted(
+            self._signal_cache.values(),
+            key=lambda s: (TYPE_PRIORITY.get(s["signal_type"], 9), -s["edge"])
+        )
         for sig in ranked:
             if len(self.positions) >= CONFIG["max_open_positions"]:
                 break
