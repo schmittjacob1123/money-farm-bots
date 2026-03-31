@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║      VESPER v1.0 — POLYMARKET PREDICTION SIGNAL BOT         ║
+║      VESPER v1.2 — POLYMARKET PREDICTION SIGNAL BOT         ║
 ║  Strategy:                                                   ║
-║    1. Fetches active Polymarket markets via Gamma API        ║
-║    2. Runs 3 signal types:                                   ║
+║    1. Fetches top-100 markets + dedicated weather fetch      ║
+║    2. Runs 2 signal types (reversion removed):              ║
 ║       a) Weather  — NOAA forecast vs market price           ║
-║       b) Momentum — follow 24h price moves > 12%            ║
-║       c) Volume   — follow direction on 3x volume spikes    ║
-║    3. Enters when calculated edge > 7%                      ║
-║    4. Exits: TP +35%, SL -25%, max 96h hold                 ║
-║    5. Paper trading · $500 starting budget                  ║
+║       b) Momentum — 24h price moves, scaled by mid-distance ║
+║       c) Volume   — spike with early-entry timing filter    ║
+║    3. Enters when edge > 4%, sized by signal quality        ║
+║    4. Exits: TP +35%, tiered SL 20-30%, max 96h hold        ║
+║    5. Tag diversification: max 2 positions per category     ║
+║    6. Secondary fill: $1k-$2k liq markets at 40% size       ║
+║    7. Paper trading · $500 starting budget                  ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 import os, json, logging, time, sys, random
@@ -57,13 +59,19 @@ CONFIG = {
     "position_size_max":    70.0,
     "max_open_positions":   8,
     "cash_floor_pct":       0.25,
+    "max_positions_per_tag": 2,     # max concurrent positions sharing the same category tag
+    "secondary_liq_min":    1000.0, # secondary fill tier: $1k-$2k liquidity, smaller size
+    "secondary_size_mult":  0.40,   # secondary fill positions get 40% of base size
 
     # signal thresholds
     "min_edge":             0.04,   # 4% min edge (prediction markets move slowly)
     "momentum_threshold":   0.03,   # 3% 1d move triggers momentum signal
     "volume_spike_mult":    1.8,    # 1.8x daily average = meaningful spike
+    "volume_max_price_chg": 0.05,   # volume signal: price must have moved < 5% (catch early, not late)
     "weather_min_edge":     0.08,
     "weather_min_prob":     0.50,   # NOAA must be >= 50% to enter YES
+    # weather fetch: dedicated keyword scan separate from top-100 volume fetch
+    "weather_fetch_limit":  200,    # how many weather-tag markets to fetch separately
 
     # exits — SL widens on thin markets to survive noise
     "take_profit_pct":      0.35,
@@ -386,6 +394,40 @@ class GammaFetcher:
             log.warning("[GAMMA] Fetch failed: %s", e)
             return []
 
+    def fetch_weather_markets(self, limit=200):
+        """Dedicated fetch for weather/natural-disaster tagged markets.
+        Weather markets rarely appear in the top-100 by volume so we scan separately."""
+        weather_tags = ["weather", "natural-disaster", "climate", "hurricane",
+                        "tornado", "flooding", "wildfire", "winter-weather"]
+        seen_ids = set()
+        markets  = []
+        for tag in weather_tags:
+            try:
+                r = self.session.get(
+                    f"{self.BASE}/events",
+                    params={
+                        "active": "true", "closed": "false",
+                        "tag_slug": tag,
+                        "order": "volume24hr", "ascending": "false",
+                        "limit": limit,
+                    },
+                    timeout=25,
+                )
+                if r.status_code != 200:
+                    continue
+                for event in r.json():
+                    tags = [t.get("slug", "") for t in event.get("tags", [])]
+                    for m in event.get("markets", []):
+                        if m.get("id") not in seen_ids:
+                            m["_event_title"] = event.get("title", "")
+                            m["_tags"]        = tags
+                            markets.append(m)
+                            seen_ids.add(m.get("id"))
+            except Exception as e:
+                log.debug("[GAMMA/WEATHER] Tag %s fetch failed: %s", tag, e)
+        log.info("[GAMMA/WEATHER] Fetched %d dedicated weather markets", len(markets))
+        return markets
+
     @staticmethod
     def parse_yes_no_prices(market):
         """Returns (yes_price, no_price) or None.
@@ -526,21 +568,27 @@ class PriceSignal:
         chg_1d = market.get("oneDayPriceChange") or 0
 
         # ── MOMENTUM ──
+        # Edge is scaled by distance from 0.50: a 3% move on a market at 0.50
+        # is much more informative than the same move on a market already at 0.92.
+        # nearness_to_mid ranges 0→1 where 1 = market at exactly 0.50 (maximum uncertainty).
         if abs(chg_1d) >= CONFIG["momentum_threshold"]:
-            edge = abs(chg_1d) * 0.45
+            nearness_to_mid = 1.0 - abs(yes_price - 0.5) * 2  # 1.0 at 0.50, 0.0 at 0.02/0.98
+            nearness_to_mid = max(nearness_to_mid, 0.1)        # floor at 0.1 so edge never zeroes out
+            edge = abs(chg_1d) * 0.45 * nearness_to_mid
             if edge >= CONFIG["min_edge"]:
                 signals.append({
                     "signal_type":  "momentum",
                     "direction":    "YES" if chg_1d > 0 else "NO",
                     "edge":         round(edge, 4),
                     "price_chg_1d": chg_1d,
-                    "confidence":   min(abs(chg_1d) * 3.5, 1.0),
+                    "confidence":   min(abs(chg_1d) * 3.5 * nearness_to_mid, 1.0),
                 })
 
         # ── VOLUME SURGE ──
-        # Direction is only valid when volume spike is corroborated by a
-        # meaningful same-day price move. If price is flat, we don't know
-        # which way the information is pushing — skip rather than guess.
+        # The real edge in volume signals is catching activity BEFORE price fully
+        # adjusts. We require a small confirming price move (>=1%) to know direction,
+        # but cap at <5% — if price already moved >5%, we're entering late and the
+        # informed money has already been made.
         vol_24h = market.get("volume24hr") or 0
         vol_1wk = market.get("volume1wk")  or 0
         if vol_1wk > 0 and vol_24h > 0:
@@ -548,9 +596,11 @@ class PriceSignal:
             if avg_daily > 10:
                 ratio = vol_24h / avg_daily
                 if ratio >= CONFIG["volume_spike_mult"]:
-                    # Require at least a 1% price move to confirm direction
-                    if abs(chg_1d) < 0.01:
-                        pass  # flat price + volume spike = ambiguous, skip
+                    price_chg_abs = abs(chg_1d)
+                    if price_chg_abs < 0.01:
+                        pass  # flat — no direction confirmation, skip
+                    elif price_chg_abs > CONFIG["volume_max_price_chg"]:
+                        pass  # price already moved >5% — entering late, skip
                     else:
                         edge = min((ratio - 1) * 0.035, 0.14)
                         if edge >= CONFIG["min_edge"]:
@@ -562,18 +612,10 @@ class PriceSignal:
                                 "confidence":   min(ratio / 12, 1.0),
                             })
 
-        # ── MEAN REVERSION ──
-        chg_1w = market.get("oneWeekPriceChange") or 0
-        if abs(chg_1w) > 0.28:
-            edge = abs(chg_1w) * 0.28
-            if edge >= CONFIG["min_edge"]:
-                signals.append({
-                    "signal_type":  "reversion",
-                    "direction":    "NO" if chg_1w > 0 else "YES",
-                    "edge":         round(edge, 4),
-                    "price_chg_1w": chg_1w,
-                    "confidence":   min(abs(chg_1w) * 1.5, 0.65),
-                })
+        # Mean reversion intentionally removed: prediction markets move toward
+        # 0 or 1 as information arrives — they don't revert to 0.50. A market
+        # that dropped 28% in a week likely did so on real information, and
+        # betting it "bounces back" means betting against informed participants.
 
         return max(signals, key=lambda s: s["edge"]) if signals else None
 
@@ -591,6 +633,7 @@ class VesperBot:
         self.scan_count   = 0
         self._last_signal_refresh = 0.0
         self._signal_cache        = {}
+        self._secondary_cache     = {}  # thin-liquidity fill signals ($1k-$2k)
         self._market_cache        = {}
         self._tp_cooldown         = {}  # market_id → timestamp of TP exit
         self._daily_history       = []
@@ -658,7 +701,8 @@ class VesperBot:
     # ── SIGNAL ENGINE ─────────────────────────────────────────
     def _refresh_signals(self, markets):
         self._market_cache = {m["id"]: m for m in markets if m.get("id")}
-        new_signals = {}
+        new_signals     = {}  # primary: liq >= min_liquidity ($2k)
+        secondary_sigs  = {}  # secondary fill: liq $1k-$2k, smaller position size
         for m in markets:
             mid = m.get("id")
             if not mid:
@@ -669,7 +713,11 @@ class VesperBot:
             yes_price = prices[0]
             liq   = m.get("liquidityNum") or 0
             vol24 = m.get("volume24hr")   or 0
-            if liq < CONFIG["min_liquidity"] or vol24 < CONFIG["min_volume_24h"]:
+            if vol24 < CONFIG["min_volume_24h"]:
+                continue
+            is_primary   = liq >= CONFIG["min_liquidity"]
+            is_secondary = (not is_primary and liq >= CONFIG["secondary_liq_min"])
+            if not is_primary and not is_secondary:
                 continue
             # Skip markets resolving within min_end_hours (same-day props)
             end_date = m.get("endDate") or m.get("endDateIso", "")
@@ -698,10 +746,17 @@ class VesperBot:
                     "no_price":   round(1 - yes_price, 4),
                     "liquidity":  liq,
                     "volume_24h": vol24,
+                    "tags":       m.get("_tags", []),
+                    "secondary":  not is_primary,
                 })
-                new_signals[mid] = sig
-        self._signal_cache = new_signals
-        log.info("[SIGNALS] %d signals from %d markets", len(new_signals), len(markets))
+                if is_primary:
+                    new_signals[mid] = sig
+                else:
+                    secondary_sigs[mid] = sig
+        self._signal_cache     = new_signals
+        self._secondary_cache  = secondary_sigs
+        log.info("[SIGNALS] %d primary + %d secondary signals from %d markets",
+                 len(new_signals), len(secondary_sigs), len(markets))
 
     # ── EXITS ─────────────────────────────────────────────────
     def _sl_for_market(self, market_id):
@@ -746,43 +801,68 @@ class VesperBot:
         return len(closed)
 
     # ── ENTRIES ───────────────────────────────────────────────
+    def _tag_counts(self):
+        """Count open positions per tag slug."""
+        counts = {}
+        for pos in self.positions:
+            m = self._market_cache.get(pos.market_id, {})
+            for tag in m.get("_tags", []):
+                counts[tag] = counts.get(tag, 0) + 1
+        return counts
+
     def _try_enter(self, portfolio):
         entered = 0
-        # Weather signals rank first (highest quality), then momentum, reversion, volume
-        TYPE_PRIORITY = {"weather": 0, "momentum": 1, "reversion": 2, "volume": 3}
-        ranked = sorted(
+        TYPE_PRIORITY = {"weather": 0, "momentum": 1, "volume": 2}
+
+        # Build combined ranked list: primary signals first, then secondary fill
+        primary_ranked   = sorted(
             self._signal_cache.values(),
             key=lambda s: (TYPE_PRIORITY.get(s["signal_type"], 9), -s["edge"])
         )
-        for sig in ranked:
+        secondary_ranked = sorted(
+            self._secondary_cache.values(),
+            key=lambda s: (TYPE_PRIORITY.get(s["signal_type"], 9), -s["edge"])
+        )
+        all_signals = primary_ranked + secondary_ranked
+
+        for sig in all_signals:
             if len(self.positions) >= CONFIG["max_open_positions"]:
                 break
             if self.wallet.cash < portfolio * CONFIG["cash_floor_pct"]:
                 break
             if self.wallet.daily_loss_hit():
                 break
+
             mid = sig["market_id"]
             if any(p.market_id == mid for p in self.positions):
                 continue
-            # Skip markets on TP cooldown — avoid giving profits back immediately
+
+            # TP cooldown check
             if mid in self._tp_cooldown:
                 elapsed_h = (time.time() - self._tp_cooldown[mid]) / 3600
                 if elapsed_h < CONFIG["tp_cooldown_h"]:
                     continue
                 else:
                     del self._tp_cooldown[mid]
+
+            # Tag diversification: max 2 positions per category tag
+            tag_counts = self._tag_counts()
+            sig_tags   = sig.get("tags", [])
+            if sig_tags and any(tag_counts.get(t, 0) >= CONFIG["max_positions_per_tag"]
+                                for t in sig_tags):
+                continue
+
             direction   = sig["direction"]
             entry_price = sig["yes_price"] if direction == "YES" else sig["no_price"]
             if not (0.03 <= entry_price <= 0.97):
                 continue
-            # Scale position size by signal quality:
-            # weather (real edge) → full size
-            # momentum/reversion (statistical) → 80%
-            # volume (direction confirmed by price move, but weakest) → 55%
+
+            # Position sizing: scaled by signal type, further reduced for secondary fills
             base_size = min(self.wallet.position_size(portfolio), self.wallet.cash * 0.85)
-            sig_type  = sig["signal_type"]
-            type_mult = {"weather": 1.0, "momentum": 0.80, "reversion": 0.80, "volume": 0.55}
-            size = round(base_size * type_mult.get(sig_type, 0.70), 2)
+            type_mult = {"weather": 1.0, "momentum": 0.80, "volume": 0.55}
+            size = round(base_size * type_mult.get(sig["signal_type"], 0.70), 2)
+            if sig.get("secondary"):
+                size = round(size * CONFIG["secondary_size_mult"], 2)
             if size < CONFIG["position_size_min"]:
                 continue
 
@@ -798,11 +878,12 @@ class VesperBot:
                 "edge":      sig["edge"],
                 "price":     entry_price,
                 "size":      size,
+                "secondary": sig.get("secondary", False),
             })
             self._signal_log = self._signal_log[-50:]
+            tier = "FILL" if sig.get("secondary") else sig["signal_type"].upper()
             log.info("  [BUY/%s] %s | %s @ %.3f | edge=%.1f%% | $%.2f",
-                     sig["signal_type"].upper(), mid[:12],
-                     direction, entry_price, sig["edge"] * 100, size)
+                     tier, mid[:12], direction, entry_price, sig["edge"] * 100, size)
             entered += 1
         return entered
 
@@ -905,6 +986,16 @@ class VesperBot:
             log.warning("[SCAN] No markets fetched — skipping")
             return 0
         log.info("  [SCAN] Fetched %d markets", len(markets))
+
+        # Merge dedicated weather market fetch (runs every signal refresh cycle)
+        now_t = time.time()
+        if now_t - self._last_signal_refresh >= CONFIG["signal_refresh_s"]:
+            weather_markets = self.gamma.fetch_weather_markets(limit=CONFIG["weather_fetch_limit"])
+            if weather_markets:
+                existing_ids = {m.get("id") for m in markets}
+                new_weather  = [m for m in weather_markets if m.get("id") not in existing_ids]
+                markets      = markets + new_weather
+                log.info("  [SCAN] +%d weather markets (total %d)", len(new_weather), len(markets))
 
         # Build position price map
         pos_prices = {}
