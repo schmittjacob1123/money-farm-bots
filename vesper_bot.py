@@ -38,7 +38,7 @@ CONFIG = {
     "signal_refresh_s":     300,    # 5 min between full signal refresh (match scan)
 
     # market filters
-    "min_liquidity":        500.0,
+    "min_liquidity":        2000.0, # raised from 500 — thin markets hit SL on noise
     "min_volume_24h":       50.0,
     "max_markets_scan":     100,
     "min_end_hours":        24,     # skip markets ending within 24h (same-day props)
@@ -65,9 +65,12 @@ CONFIG = {
     "weather_min_edge":     0.08,
     "weather_min_prob":     0.50,   # NOAA must be >= 50% to enter YES
 
-    # exits
+    # exits — SL widens on thin markets to survive noise
     "take_profit_pct":      0.35,
-    "stop_loss_pct":        0.25,
+    "stop_loss_pct":        0.20,   # default SL for liquid markets (liq >= 10k)
+    "stop_loss_mid_pct":    0.25,   # SL for mid-liquidity markets (2k–10k)
+    "stop_loss_thin_pct":   0.30,   # SL for thin markets (just above min_liquidity)
+    "liq_mid_threshold":    10000,  # above this = liquid, use default SL
     "max_hold_hours":       96,
     "tp_cooldown_h":        2,      # after a TP exit, don't re-enter same market for 2h
 
@@ -132,6 +135,7 @@ QUOTES = {
 
 # US cities for weather signal (name → lat, lon)
 US_CITIES = {
+    # Primary city names
     "new york": (40.7128, -74.0060), "los angeles": (34.0522, -118.2437),
     "chicago": (41.8781, -87.6298), "houston": (29.7604, -95.3698),
     "phoenix": (33.4484, -112.0740), "philadelphia": (39.9526, -75.1652),
@@ -156,6 +160,35 @@ US_CITIES = {
     "washington": (38.9072, -77.0369), "dc": (38.9072, -77.0369),
     "oklahoma city": (35.4676, -97.5164), "el paso": (31.7619, -106.4850),
     "indianapolis": (39.7684, -86.1581), "charlotte nc": (35.2271, -80.8431),
+    # Aliases — common shorthand Polymarket uses in market titles
+    "nyc": (40.7128, -74.0060), "new york city": (40.7128, -74.0060),
+    "manhattan": (40.7580, -73.9855), "brooklyn": (40.6782, -73.9442),
+    "la": (34.0522, -118.2437), "l.a.": (34.0522, -118.2437),
+    "sf": (37.7749, -122.4194), "bay area": (37.7749, -122.4194),
+    "d.c.": (38.9072, -77.0369), "washington d.c.": (38.9072, -77.0369),
+    "washington dc": (38.9072, -77.0369),
+    "socal": (34.0522, -118.2437), "south florida": (25.7617, -80.1918),
+    "new england": (42.3601, -71.0589), "midwest": (41.8781, -87.6298),
+    # Additional cities commonly seen in weather event markets
+    "anchorage": (61.2181, -149.9003), "honolulu": (21.3069, -157.8583),
+    "buffalo": (42.8864, -78.8784), "salt lake city": (40.7608, -111.8910),
+    "boise": (43.6150, -116.2023), "spokane": (47.6588, -117.4260),
+    "bismarck": (46.8083, -100.7837), "fargo": (46.8772, -96.7898),
+    "billings": (45.7833, -108.5007), "cheyenne": (41.1400, -104.8202),
+    "hartford": (41.7658, -72.6851), "providence": (41.8240, -71.4128),
+    "richmond": (37.5407, -77.4360), "norfolk": (36.8508, -76.2859),
+    "charleston": (32.7765, -79.9311), "savannah": (32.0809, -81.0912),
+    "little rock": (34.7465, -92.2896), "jackson": (32.2988, -90.1848),
+    "birmingham": (33.5186, -86.8104), "montgomery": (32.3668, -86.2999),
+    "mobile": (30.6954, -88.0399), "baton rouge": (30.4515, -91.1871),
+    "shreveport": (32.5252, -93.7502), "lubbock": (33.5779, -101.8552),
+    "corpus christi": (27.8006, -97.3964), "wichita": (37.6872, -97.3301),
+    "sioux falls": (43.5446, -96.7311), "des moines": (41.5868, -93.6250),
+    "madison": (43.0731, -89.4012), "green bay": (44.5133, -88.0133),
+    "grand rapids": (42.9634, -85.6681), "flint": (43.0125, -83.6875),
+    "toledo": (41.6639, -83.5552), "akron": (41.0814, -81.5190),
+    "cincinnati": (39.1031, -84.5120), "lexington": (38.0406, -84.5037),
+    "knoxville": (35.9606, -83.9207), "chattanooga": (35.0456, -85.3097),
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -386,8 +419,16 @@ class GammaFetcher:
 # ══════════════════════════════════════════════════════════════
 class WeatherSignal:
     PRECIP_KEYWORDS = [
-        "rain", "rainfall", "precipitation", "snow", "snowfall",
-        "blizzard", "storm", "hurricane", "flood", "tornado",
+        # direct weather terms
+        "rain", "rainfall", "precipitation", "snow", "snowfall", "snowing",
+        "blizzard", "storm", "hurricane", "flood", "tornado", "thunderstorm",
+        "hail", "sleet", "freezing rain", "ice storm", "nor'easter", "derecho",
+        # seasonal / event phrasings common on Polymarket
+        "inches of snow", "inches of rain", "snowfall total", "rainfall total",
+        "named storm", "named storms", "tropical storm", "category", "landfall",
+        "evacuate", "evacuation", "emergency declaration", "state of emergency",
+        "weather event", "weather disaster", "drought", "wildfire", "heat wave",
+        "record high", "record low", "record temperature", "polar vortex",
     ]
 
     def __init__(self):
@@ -497,6 +538,9 @@ class PriceSignal:
                 })
 
         # ── VOLUME SURGE ──
+        # Direction is only valid when volume spike is corroborated by a
+        # meaningful same-day price move. If price is flat, we don't know
+        # which way the information is pushing — skip rather than guess.
         vol_24h = market.get("volume24hr") or 0
         vol_1wk = market.get("volume1wk")  or 0
         if vol_1wk > 0 and vol_24h > 0:
@@ -504,15 +548,19 @@ class PriceSignal:
             if avg_daily > 10:
                 ratio = vol_24h / avg_daily
                 if ratio >= CONFIG["volume_spike_mult"]:
-                    edge = min((ratio - 1) * 0.035, 0.14)
-                    if edge >= CONFIG["min_edge"]:
-                        signals.append({
-                            "signal_type":  "volume",
-                            "direction":    "YES" if chg_1d >= 0 else "NO",
-                            "edge":         round(edge, 4),
-                            "volume_ratio": round(ratio, 2),
-                            "confidence":   min(ratio / 12, 1.0),
-                        })
+                    # Require at least a 1% price move to confirm direction
+                    if abs(chg_1d) < 0.01:
+                        pass  # flat price + volume spike = ambiguous, skip
+                    else:
+                        edge = min((ratio - 1) * 0.035, 0.14)
+                        if edge >= CONFIG["min_edge"]:
+                            signals.append({
+                                "signal_type":  "volume",
+                                "direction":    "YES" if chg_1d > 0 else "NO",
+                                "edge":         round(edge, 4),
+                                "volume_ratio": round(ratio, 2),
+                                "confidence":   min(ratio / 12, 1.0),
+                            })
 
         # ── MEAN REVERSION ──
         chg_1w = market.get("oneWeekPriceChange") or 0
@@ -656,16 +704,28 @@ class VesperBot:
         log.info("[SIGNALS] %d signals from %d markets", len(new_signals), len(markets))
 
     # ── EXITS ─────────────────────────────────────────────────
+    def _sl_for_market(self, market_id):
+        """Return the appropriate SL % based on market liquidity."""
+        m = self._market_cache.get(market_id)
+        liq = (m.get("liquidityNum") or 0) if m else 0
+        if liq >= CONFIG["liq_mid_threshold"]:
+            return CONFIG["stop_loss_pct"]
+        elif liq >= CONFIG["min_liquidity"]:
+            return CONFIG["stop_loss_mid_pct"]
+        else:
+            return CONFIG["stop_loss_thin_pct"]
+
     def _check_exits(self, pos_prices):
         closed = []
         for pos in self.positions:
             price  = pos_prices.get(pos.market_id, pos.entry_price)
             pct    = pos.unrealized_pct(price)
             hours  = pos.hours_held()
+            sl_pct = self._sl_for_market(pos.market_id)
             reason = None
             if pct >= CONFIG["take_profit_pct"] * 100:
                 reason = "TP"
-            elif pct <= -CONFIG["stop_loss_pct"] * 100:
+            elif pct <= -(sl_pct * 100):
                 reason = "SL"
             elif hours >= CONFIG["max_hold_hours"]:
                 reason = "TIME"
@@ -715,7 +775,14 @@ class VesperBot:
             entry_price = sig["yes_price"] if direction == "YES" else sig["no_price"]
             if not (0.03 <= entry_price <= 0.97):
                 continue
-            size = min(self.wallet.position_size(portfolio), self.wallet.cash * 0.85)
+            # Scale position size by signal quality:
+            # weather (real edge) → full size
+            # momentum/reversion (statistical) → 80%
+            # volume (direction confirmed by price move, but weakest) → 55%
+            base_size = min(self.wallet.position_size(portfolio), self.wallet.cash * 0.85)
+            sig_type  = sig["signal_type"]
+            type_mult = {"weather": 1.0, "momentum": 0.80, "reversion": 0.80, "volume": 0.55}
+            size = round(base_size * type_mult.get(sig_type, 0.70), 2)
             if size < CONFIG["position_size_min"]:
                 continue
 
