@@ -69,6 +69,7 @@ CONFIG = {
     "take_profit_pct":      0.35,
     "stop_loss_pct":        0.25,
     "max_hold_hours":       96,
+    "tp_cooldown_h":        2,      # after a TP exit, don't re-enter same market for 2h
 
     # fees (Polymarket ~0.5% maker)
     "fee_rate":             0.005,
@@ -543,6 +544,7 @@ class VesperBot:
         self._last_signal_refresh = 0.0
         self._signal_cache        = {}
         self._market_cache        = {}
+        self._tp_cooldown         = {}  # market_id → timestamp of TP exit
         self._daily_history       = []
         self._signal_log          = []
         self._load_state()
@@ -676,6 +678,8 @@ class VesperBot:
                 log.info("  [EXIT/%s] %s | %s @ %.3f→%.3f | pct=%.1f%% | pnl=$%+.2f",
                          reason, pos.market_id[:12], pos.outcome,
                          pos.entry_price, price, pct, pnl)
+                if reason == "TP":
+                    self._tp_cooldown[pos.market_id] = time.time()
                 closed.append(pos)
         for pos in closed:
             self.positions.remove(pos)
@@ -700,6 +704,13 @@ class VesperBot:
             mid = sig["market_id"]
             if any(p.market_id == mid for p in self.positions):
                 continue
+            # Skip markets on TP cooldown — avoid giving profits back immediately
+            if mid in self._tp_cooldown:
+                elapsed_h = (time.time() - self._tp_cooldown[mid]) / 3600
+                if elapsed_h < CONFIG["tp_cooldown_h"]:
+                    continue
+                else:
+                    del self._tp_cooldown[mid]
             direction   = sig["direction"]
             entry_price = sig["yes_price"] if direction == "YES" else sig["no_price"]
             if not (0.03 <= entry_price <= 0.97):
