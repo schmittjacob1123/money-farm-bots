@@ -43,9 +43,10 @@ def valid_session(req):
 WORK_DIR = "/home/ubuntu"
 
 BOTS = {
-    "jacob":     {"script": "jacob_bot.py",  "screen": "jacob", "state": ["jacob_state.json", "jacob_trades.csv", "jacob_data.json"]},
-    "seraphina": {"script": "seraphina_bot.py",   "screen": "seraphina",  "state": ["seraphina_state.json", "seraphina_trades.csv", "seraphina_data.json"]},
-    "loachy":    {"script": "loachy_bot.py",      "screen": "loachy",     "state": ["loachy_state.json", "loachy_trades.csv", "loachy_data.json", "loachy_pending.json"]},
+    "jacob":     {"script": "jacob_bot.py",    "screen": "jacob",     "state": ["jacob_state.json", "jacob_trades.csv", "jacob_data.json"]},
+    "seraphina": {"script": "seraphina_bot.py", "screen": "seraphina", "state": ["seraphina_state.json", "seraphina_trades.csv", "seraphina_data.json"]},
+    "loachy":    {"script": "loachy_bot.py",   "screen": "loachy",    "state": ["loachy_state.json", "loachy_trades.csv", "loachy_data.json", "loachy_pending.json"]},
+    "vesper":    {"script": "vesper_bot.py",   "screen": "vesper",    "state": ["vesper_state.json", "vesper_data.json"]},
 }
 
 FRESH_STATE = {
@@ -54,6 +55,7 @@ FRESH_STATE = {
     "seraphina_state.json": {"wallet": {"cash": 1000.0, "total_pnl": 0.0, "daily_pnl": 0.0, "wins": 0, "losses": 0, "win_streak": 0, "loss_streak": 0, "trade_log": [], "wallet_history": [], "peak_portfolio": 1000.0, "circuit_breaker_active": False, "total_fees": 0.0, "funding_income": 0.0}, "positions": [], "grids": {}, "last_funding": {}},
     "loachy_state.json":    {"wallet": 50.0, "total_pnl": 0, "daily_pnl": 0, "open_bets": {}, "bet_history": [], "daily_bets": 0, "last_reset_date": ""},
     "loachy_pending.json":  {"pending": [], "approved": [], "rejected": []},
+    "vesper_state.json":    {"wallet": {"cash": 500.0, "total_pnl": 0.0, "daily_pnl": 0.0, "wins": 0, "losses": 0, "win_streak": 0, "loss_streak": 0, "total_fees": 0.0, "trade_log": [], "wallet_history": [], "peak_portfolio": 500.0, "last_date": ""}, "positions": []},
 }
 
 CSV_HEADERS = {
@@ -386,11 +388,13 @@ UPDATABLE_FILES = {
     "seraphina_bot.py",
     "jacob_bot.py",
     "loachy_bot.py",
+    "vesper_bot.py",
     "farm_api.py",
     "farm_alerts.py",
     "seraphina_dashboard.html",
     "jacob_dashboard.html",
     "loachy_dashboard.html",
+    "vesper_dashboard.html",
     "index.html",
     "login.html",
 }
