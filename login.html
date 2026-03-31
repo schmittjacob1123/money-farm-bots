@@ -211,19 +211,9 @@ async function tryLogin(password) {
   }
 }
 
-// Auto-submit after typing stops for 400ms OR on Enter
-let debounce;
-pw.addEventListener('input', () => {
-  clearTimeout(debounce);
-  if (!pw.value) return;
-  debounce = setTimeout(() => tryLogin(pw.value), 400);
-});
-
+// Submit only on Enter
 pw.addEventListener('keydown', e => {
-  if (e.key === 'Enter') {
-    clearTimeout(debounce);
-    if (pw.value) tryLogin(pw.value);
-  }
+  if (e.key === 'Enter' && pw.value) tryLogin(pw.value);
 });
 
 pw.focus();
