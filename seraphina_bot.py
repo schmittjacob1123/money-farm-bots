@@ -85,7 +85,8 @@ CONFIG = {
     "rsi_buy_max":          70,     # skip grid buy if RSI above this
     "rsi_boost_threshold":  40,     # boost size if RSI below this (oversold)
     "rsi_boost_mult":       1.3,    # size multiplier on oversold dip
-    "rsi_sell_min":         65,     # close profitable positions if RSI above this
+    "rsi_sell_min":         73,     # close profitable positions if RSI above this (must be > rsi_buy_max to avoid churn)
+    "rsi_ob_min_hold_m":    20,     # RSI_OB exit only fires after holding this many minutes (prevents instant buy→exit loops)
 
     # — trade management —
     "take_profit_pct":      0.035,  # 3.5% TP per position (break-even at 46% win rate)
@@ -1020,8 +1021,15 @@ class SeraphinaBot:
 
             if not should_exit:
                 if pos.side == "long":
-                    # RSI overbought — close long only if profitable (standard exit)
-                    if rsi is not None and rsi > CONFIG["rsi_sell_min"] and pos.unrealized_pnl(price) > 0:
+                    # RSI overbought — close long only if profitable AND held long enough.
+                    # The min-hold guard prevents instant buy→exit churn when RSI is in
+                    # the 70-73 zone: bot buys (RSI ≤ 70), RSI ticks to 71, price barely
+                    # moves, exit fires — losing only fees. Requiring 20 min hold ensures
+                    # the position has had a real chance to develop before RSI forces exit.
+                    _mins_held = (datetime.now(ET) - datetime.fromisoformat(pos.entry_time)).total_seconds() / 60
+                    if (rsi is not None and rsi > CONFIG["rsi_sell_min"]
+                            and pos.unrealized_pnl(price) > 0
+                            and _mins_held >= CONFIG["rsi_ob_min_hold_m"]):
                         should_exit, reason = True, "RSI_OB"
                     # Bear regime confirmed — cut the long unconditionally.
                     # Being long in a confirmed downtrend (≥2% below MA50, RSI ≥55)
