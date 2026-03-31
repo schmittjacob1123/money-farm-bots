@@ -1,159 +1,225 @@
-# Jacob's Money Farm — Handoff Doc
-*Last updated: 2026-03-15*
+# Money Farm — Handoff Document
+**Last updated: 2026-03-31**
 
 ---
 
-## What This Is
+## Farm Overview
 
-Three paper-trading bots running 24/7 on an AWS Ubuntu server, managed through a homepage dashboard at `https://jacobsmoneyfarm.duckdns.org`.
+Two live bots trading paper money. One on crypto futures (Seraphina), one on Polymarket prediction markets (Vesper). All infrastructure runs on a single AWS EC2 instance.
 
-| Bot | Strategy | Budget | Version |
-|-----|----------|--------|---------|
-| **Jacob** 🦎 | US stocks, long-only, MA50 + daily RSI14, AI confirmed | $500 | v5 |
-| **Seraphina** 🐱 | Crypto (BTC/ETH/SOL/DOGE), MA50 + RSI + funding rate | $1,000 | v9 |
-| **Loachy** 🐟 | Sports betting, de-vigged edge detection, AI veto | $50 | v4 |
-
-All bots are in **DRY_RUN=true** (paper mode). No real money is being traded.
+- **Live URL:** https://jacobsmoneyfarm.duckdns.org
+- **EC2 IP:** 98.80.2.233 (Ubuntu)
+- **GitHub:** https://github.com/schmittjacob1123/money-farm-bots
+- **SSH:** `ssh -i polymarket-bot.pem ubuntu@98.80.2.233`
 
 ---
 
-## Infrastructure
+## Server Architecture
 
-| Thing | Detail |
-|-------|--------|
-| Server | AWS EC2, Ubuntu, `/home/ubuntu/` |
-| Homepage | `https://jacobsmoneyfarm.duckdns.org` |
-| Control API | `farm_api.py` on port 5000, screen session `farmapi` |
-| Git repo | `https://github.com/schmittjacob1123/money-farm-bots` |
-| Screen sessions | `loachy`, `seraphina`, `jacob`, `farmapi` |
-| Deploy flow | Edit locally → `git push` → SSH `git pull` on server → restart affected bot |
+```
+/home/ubuntu/               ← nginx web root (what the browser loads)
+  index.html
+  seraphina_bot.py
+  seraphina_dashboard.html
+  seraphina_state.json
+  seraphina_data.json
+  seraphina_daily.json
+  seraphina.log
+  vesper_bot.py
+  vesper_dashboard.html
+  vesper_state.json
+  vesper_data.json
+  vesper_daily.json
+  farm_api.py
+  login.html
 
-**Key files on server (not in repo):**
-- `/home/ubuntu/.env` — all API keys (never commit this)
-- `*_state.json` — wallet state per bot
-- `*_data.json` — dashboard data per bot
+/home/ubuntu/money-farm-bots/   ← Git repo (version control only)
+  vesper.log
+  archive/jacob/
+  archive/loachy/
+  seraphina_dashboard.html      (git-tracked copy)
+  vesper_dashboard.html         (git-tracked copy)
+  vesper_bot.py                 (git-tracked copy)
+  seraphina_bot.py              (git-tracked copy)
+  ...
+```
 
----
-
-## Bot Details
-
-### Jacob v5 (`jacob_bot.py`)
-- **Watchlist:** 20 tickers across tech, finance, energy, healthcare sectors
-- **Entry:** RSI < 40 AND price above MA50 AND score ≥ 68 AND not BEAR regime AND AI confirmed ≥ 75% confidence
-- **Exit:** TP +2.5%, RSI > 65, stop-loss -6%, trailing stop (arms at +2.5%, fires at -1.5% from peak), quick-cut -5% in 24h, max hold 5 days
-- **Sizing:** 10% of cash per trade, max $80, min $5
-- **Regime:** SPY + QQQ 5-day momentum → BEAR/NEUTRAL/BULL (no new longs in BEAR)
-- **Data:** Yahoo Finance daily candles (3mo range, 1d interval), 4.5min cache
-- **Scan interval:** Every 15min during market hours (9:30am–4pm ET, weekdays)
-- **Note:** farm_api was previously pointing to old `polymarket_bot.py` — now fixed to `jacob_bot.py` on screen `jacob`
-
-### Seraphina v9 (`seraphina_bot.py`)
-- **Coins:** BTC, ETH, SOL, DOGE (via Kraken public OHLC API)
-- **Entry:** RSI < 35 AND price above MA50 (50-period on 1h candles)
-- **Exit:** TP +2.5%, RSI > 65, stop-loss -4%, trailing stop (arms at +1.5%, fires at -1% from peak)
-- **Sizing:** 20% of cash per trade, max 4 open positions simultaneously
-- **Funding rate:** Collects income every 8h when Binance funding rate > 0.03%/8h
-- **Circuit breaker:** Pauses if portfolio drops 15% from peak
-- **Scan interval:** Every hour, 24/7
-- **Status as of handoff:** 81 scans, 0 trades — crypto RSI elevated (60-72), waiting for dip
-
-### Loachy v4 (`loachy_bot.py`)
-- **Sports:** NCAAB, NBA, NHL, MLB, EPL (trimmed from 9 — NFL/NCAAF off-season, MMA/MLS thin coverage)
-- **Edge detection:** Additive de-vig — averages implied probs per outcome across books, normalizes to true probability, edge = true_prob − to_prob(best_price)
-- **Gates:** ≥2% real edge AND ≥3 books confirming price AND odds between -280 and +200
-- **AI role:** Veto mechanism (not confidence generator) — vetoes on injuries, weather, back-to-backs
-- **Kelly sizing:** Fractional Kelly using live wallet balance (not fixed budget), sport-specific fractions
-- **Pending system:** Borderline picks go to pending (55%+ confidence), auto-bet at 72%+, longshots always pending
-- **Parlay builder:** Suggests 2-leg parlays from high-confidence confirmed picks
-- **CLV tracking:** Tracks closing line value to measure long-term edge quality
-- **Scan interval:** Every hour, 24/7
-- **Odds API:** `the-odds-api.com` — ~4 credits/scan, ~96/day. Free tier = 500 credits (~5 days). Swap key from homepage banner.
-- **Status as of handoff:** Running, valid API key (464 credits), finding 47 games/scan, 0 qualifying edges yet (normal — Sunday night, games in progress)
+> **CRITICAL:** nginx serves from `/home/ubuntu/` — NOT from the git repo.
+> Always SCP files to `/home/ubuntu/<file>` when deploying. The git repo is for version control only and does NOT auto-sync with the web root.
 
 ---
 
-## Homepage (`index.html`)
+## Screen Sessions
 
-- Live stats cards for all 3 bots, updates every 30 seconds
-- Start/stop/reset toggles for each bot (requires farm password)
-- **Easter eggs:** Konami code (↑↑↓↓←→←→BA) → DEGEN MODE, click characters for animations, secret words: `farm`, `money`, `loach`, `jacob`, `purr`, `yolo`
-- **Odds API credit banner:** Appears at 150 / 50 / 0 credits with SWAP KEY button
-- **Key swap modal:** Paste new Odds API key → writes to `.env` → restarts Loachy automatically
-- **Loachy next-scan countdown:** Live ticker counting down to next scan, turns yellow in last 2 min
+| Session | Purpose |
+|---|---|
+| `seraphina` | Seraphina bot process |
+| `vesper` | Vesper bot process |
+| `farmapi` | Flask API on port 5000 |
+| `deploy` | Auto-deploy watcher |
 
----
+**Check sessions:** `screen -ls`
+**Attach:** `screen -r seraphina`
+**Detach:** `Ctrl+A, D`
 
-## Known Issues / Watch List
-
-| Issue | Severity | Notes |
-|-------|----------|-------|
-| Odds API credits burn fast | Medium | ~5 days per free account. Swap via homepage modal. |
-| MLB/EPL not fetching for Loachy | Low | Old `loachy_sports_config.json` on server may not include new sports. Delete it and let it regenerate. |
-| `datetime.utcnow()` deprecation warnings | Low | Python 3.12 warning, no functional impact. Fix eventually by switching to `datetime.now(UTC)`. |
-| Jacob never started yet | — | Pull latest on server (`git pull`), then start from homepage toggle. |
-| `nextScanAt` null on Loachy scan 1 | Low | Cosmetic — shows correctly from scan 2 onward. |
-
----
-
-## Roadmap / Future Ideas
-
-### High Priority
-- [ ] **Turn on Jacob** — pull latest on server, start from homepage, verify $500 budget loads correctly
-- [ ] **Fix MLB/EPL for Loachy** — delete `loachy_sports_config.json` on server so it regenerates with new 5-sport list
-- [ ] **Add force-scan button** to homepage (currently need SSH `--once` to trigger manually)
-
-### Medium Priority
-- [ ] **Loachy: add NCAAF/NFL back** when season starts (August). Update sports list and PRIORITY.
-- [ ] **Jacob: live trading** — when paper results look good, flip `DRY_RUN=false` and add brokerage API (Alpaca recommended)
-- [ ] **Seraphina: live trading** — flip to live when paper results are solid, use Kraken API keys
-- [ ] **Fix `datetime.utcnow()` deprecation** across all bots — replace with `datetime.now(timezone.utc)`
-- [ ] **Jacob trigger file** — already implemented (`jacob_trigger.json`). Add homepage button to trigger early scan.
-- [ ] **Loachy trigger file** — not implemented yet. Add same mechanism as Jacob for manual force-scan.
-
-### Low Priority / Nice to Have
-- [ ] **Email/SMS alerts** — `farm_alerts.py` exists but unclear if configured. Wire up for big wins, losses, or errors.
-- [ ] **Parlay approval UI** — Loachy suggests parlays but there's no UI to approve them on the homepage
-- [ ] **Pending bet approval UI** — Loachy pending bets need homepage UI to approve/reject (endpoint exists at `/api/pending-approve`)
-- [ ] **Jacob sector breakdown** — show open positions by sector on homepage
-- [ ] **Seraphina funding rate history** — graph cumulative funding income over time
-- [ ] **Rotate Odds API keys automatically** — build key pool in `.env`, auto-rotate when credits hit 0
-
----
-
-## Useful Commands (SSH)
-
+**Restart Seraphina:**
 ```bash
-# Check what's running
-screen -ls
+screen -S seraphina -X stuff $'\003'
+sleep 1
+cd /home/ubuntu && screen -dmS seraphina bash -c 'python3 seraphina_bot.py 2>&1 | tee seraphina.log'
+```
 
-# Attach to a bot's output
-screen -r loachy
-screen -r seraphina
-screen -r jacob
+**Restart Vesper:**
+```bash
+screen -S vesper -X stuff $'\003'
+sleep 1
+cd /home/ubuntu && screen -dmS vesper bash -c 'python3 vesper_bot.py 2>&1 | tee money-farm-bots/vesper.log'
+```
 
-# Restart a bot
-screen -X -S loachy quit && screen -dmS loachy python3 /home/ubuntu/loachy_bot.py
-
-# Force a one-off scan (doesn't affect running instance)
-python3 /home/ubuntu/loachy_bot.py --once
-
-# Pull latest code
-cd /home/ubuntu && git pull
-
-# Restart control API
-screen -X -S farmapi quit && screen -dmS farmapi python3 /home/ubuntu/farm_api.py
-
-# Edit API keys
-nano /home/ubuntu/.env
+**Wipe Vesper state and restart fresh:**
+```bash
+rm -f /home/ubuntu/vesper_state.json /home/ubuntu/vesper_data.json /home/ubuntu/vesper_daily.json
+# then restart as above
 ```
 
 ---
 
-## API Keys Needed (in `/home/ubuntu/.env`)
+## Deploying a Change
 
+1. Edit locally
+2. SCP to web root: `scp -i polymarket-bot.pem <file> ubuntu@98.80.2.233:/home/ubuntu/<file>`
+3. SCP to git repo: `scp -i polymarket-bot.pem <file> ubuntu@98.80.2.233:/home/ubuntu/money-farm-bots/<file>`
+4. Restart the screen session for any bot file changes
+5. Commit and push locally: `git add <file> && git commit && git push origin main`
+
+---
+
+## Bot 1: Seraphina
+
+**Strategy:** Crypto grid trading with RSI momentum filter and bear mode.
+
+**Paper budget:** $1,000 | **Status:** Running
+
+**Current state (2026-03-31):**
+- Portfolio: ~$885 (peaked at $1,001 — briefly profitable)
+- Total PnL: -$76 | Win rate: 31%
+- Total trades: ~378 | Total fees paid: $73
+- 7 open longs (BTC, ETH, SOL, DOGE mix) — all coins in uptrend
+
+**How it works:**
+- Builds a price grid per coin (1% spacing, 8 levels above/below center)
+- Buys when price crosses a grid level downward
+- Exits via: 3.5% TP, 3% SL, trailing stop (arms at +1.5%), or RSI overbought
+- Bear mode: when price is ≥1% below MA50 and RSI > 50, flips to shorting rallies
+- Hard gate: no long entries when price is below MA50 (v12 fix)
+
+**Key CONFIG:**
+```python
+"rsi_buy_max":        70    # no buys above RSI 70
+"rsi_sell_min":       73    # RSI exit threshold — MUST stay above rsi_buy_max
+"rsi_ob_min_hold_m":  20    # RSI exit requires 20-min hold (prevents instant churn loops)
+"take_profit_pct":    0.035
+"stop_loss_pct":      0.030
+"grid_spacing_pct":   0.010
+"max_open_per_coin":  2
+"max_open_total":     12
 ```
-ANTHROPIC_API_KEY=...     # Claude AI — used by Jacob + Loachy for confirmations
-ODDS_API_KEY=...          # the-odds-api.com — Loachy sports odds
-DRY_RUN=true              # set to false to go live (don't until paper results are good!)
-FARM_PASSWORD=...         # homepage login password
+
+**Important — why rsi_sell_min must be > rsi_buy_max:**
+If `rsi_sell_min` (65) < `rsi_buy_max` (70), there's an overlap zone where the bot buys AND immediately wants to exit. Price barely ticks up → unrealized PnL > 0 → instant exit. Net result: ~-$0.07 fee per round trip, repeated dozens of times per hour. This cost $73 in fees before being fixed. Keep `rsi_sell_min` at 73 or higher.
+
+---
+
+## Bot 2: Vesper
+
+**Strategy:** Polymarket prediction market oracle. Finds price inefficiencies using NOAA weather data, price momentum, volume spikes, and mean reversion.
+
+**Paper budget:** $500 | **Status:** Running (clean restart 2026-03-31)
+
+**Current positions (2026-03-31):**
+- Will Bitcoin dip to $45,000 by Dec 31, 2026? (momentum)
+- San Diego Padres win 2026 NLCS? (reversion)
+- Milwaukee Brewers win 2026 NLCS? (reversion)
+- San Antonio Spurs win 2026 NBA Finals? (volume)
+- Ronaldo Caiado win 2026 Brazilian election? (volume)
+- Will Israel strike 4 countries in 2026? (volume)
+- Will Bitcoin dip to $66,000 March 30-April 5? (volume)
+- Will Bitcoin dip to $64,000 March 30-April 5? (volume)
+
+**Signal types (in priority order):**
+1. **Weather** — NOAA precip probability vs market price (two-step API: `/points/{lat},{lon}` → forecast URL → parse)
+2. **Momentum** — 1-day price change >3% = directional signal
+3. **Reversion** — 1-week price change >10% = mean reversion candidate
+4. **Volume** — 24h volume >1.8x 7-day average = market interest spike
+
+**Key CONFIG:**
+```python
+"max_open_positions": 8
+"position_size_usd":  35.0
+"min_edge":           0.04    # 4% edge minimum
+"take_profit_pct":    0.25    # 25% TP
+"stop_loss_pct":      0.15    # 15% SL
+"max_hold_hours":     72
+"min_end_hours":      24      # skip markets resolving within 24h
+"momentum_threshold": 0.03
+"volume_spike_mult":  1.8
+"signal_refresh_s":   300     # refresh signals every 5 min (matches scan interval)
 ```
+
+**Prop keyword filter:** Skips any market whose question contains:
+`points o/u, rebounds o/u, assists o/u, steals o/u, blocks o/u, threes o/u, turnovers o/u, pts o/u, reb o/u, ast o/u, passing yards, rushing yards, receiving yards, touchdowns o/u, strikeouts o/u, hits o/u, home runs o/u`
+
+**Gamma API quirk:** `outcomePrices` and `outcomes` are returned as JSON-encoded strings, not lists. Must call `json.loads()` on them if they're of type `str`. This was a silent bug that caused 0 signals on first run.
+
+**APIs used (both free, no key needed):**
+- Polymarket Gamma: `https://gamma-api.polymarket.com/markets`
+- NOAA Weather: `https://api.weather.gov/` (requires `User-Agent` header)
+
+---
+
+## Archived Bots
+
+Stopped, hidden from homepage. Code in `/home/ubuntu/money-farm-bots/archive/`.
+
+- `archive/jacob/` — Jacob bot (original Polymarket bot)
+- `archive/loachy/` — Loachy bot
+
+To reactivate: copy files to `/home/ubuntu/`, re-add to `BOTS` dict in `farm_api.py`, start a screen session, and unhide the building/card in `index.html`.
+
+---
+
+## Homepage (index.html)
+
+- 2-bot grid: Seraphina and Vesper
+- Jacob and Loachy hidden via `display:none` on their buildings, stat chips, and cards
+- Footer: "TWO BOTS · ONE MISSION · ONE FARM"
+
+**Dashboard navigation (all active pages link to each other, no links to archived bots):**
+- Seraphina dashboard: Farm | Vesper
+- Vesper dashboard: Farm | Seraphina
+
+---
+
+## Farm API (farm_api.py)
+
+Flask on port 5000, proxied via nginx. Active bots in BOTS dict: seraphina, vesper. Jacob and Loachy commented out.
+
+---
+
+## GitHub PAT
+
+The token previously hardcoded in `farm_deploy.html` was exposed and is compromised. Go to GitHub → Settings → Developer Settings → Personal Access Tokens → revoke old token, create new one with `repo` scope. Paste into the deploy tool at the farm URL when needed.
+
+---
+
+## What to Watch Next
+
+**Seraphina:**
+- Win rate should climb toward 40%+ now that RSI churn is fixed
+- Fee drain should drop sharply — watch `totalFees` in the dashboard
+- If BTC/ETH/SOL drop below MA50, bear mode activates and she'll start shorting
+
+**Vesper:**
+- Watch for weather signals appearing — they're highest quality but rare
+- Positions are held up to 72h, so give it a few days before judging P&L
+- If it keeps filling slots with volume signals and no weather signals appear, may need to loosen weather signal detection or check NOAA data parsing
