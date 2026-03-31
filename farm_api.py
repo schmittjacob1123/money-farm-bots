@@ -43,10 +43,14 @@ def valid_session(req):
 WORK_DIR = "/home/ubuntu"
 
 BOTS = {
-    "jacob":     {"script": "jacob_bot.py",    "screen": "jacob",     "state": ["jacob_state.json", "jacob_trades.csv", "jacob_data.json"]},
+    # ── ACTIVE BOTS ──────────────────────────────────────────────────────
     "seraphina": {"script": "seraphina_bot.py", "screen": "seraphina", "state": ["seraphina_state.json", "seraphina_trades.csv", "seraphina_data.json"]},
-    "loachy":    {"script": "loachy_bot.py",   "screen": "loachy",    "state": ["loachy_state.json", "loachy_trades.csv", "loachy_data.json", "loachy_pending.json"]},
-    "vesper":    {"script": "vesper_bot.py",   "screen": "vesper",    "state": ["vesper_state.json", "vesper_data.json"]},
+    "vesper":    {"script": "vesper_bot.py",    "screen": "vesper",    "state": ["vesper_state.json", "vesper_data.json"]},
+
+    # ── ARCHIVED BOTS (files in /home/ubuntu/archive/) ───────────────────
+    # Uncomment and move files back to /home/ubuntu/ to reactivate.
+    # "jacob":  {"script": "jacob_bot.py",  "screen": "jacob",  "state": ["jacob_state.json", "jacob_trades.csv", "jacob_data.json"]},
+    # "loachy": {"script": "loachy_bot.py", "screen": "loachy", "state": ["loachy_state.json", "loachy_trades.csv", "loachy_data.json", "loachy_pending.json"]},
 }
 
 FRESH_STATE = {
@@ -386,14 +390,10 @@ def debug():
 # ── ALLOWED FILES FOR apply-update (whitelist for safety) ──
 UPDATABLE_FILES = {
     "seraphina_bot.py",
-    "jacob_bot.py",
-    "loachy_bot.py",
     "vesper_bot.py",
     "farm_api.py",
     "farm_alerts.py",
     "seraphina_dashboard.html",
-    "jacob_dashboard.html",
-    "loachy_dashboard.html",
     "vesper_dashboard.html",
     "index.html",
     "login.html",
