@@ -189,7 +189,7 @@
     .bottom-panel { position:relative; z-index:10; background:rgba(2,4,8,0.97); border-top:1px solid rgba(74,222,128,0.12); padding:40px 24px 60px; }
     .panel-inner  { max-width:900px; margin:0 auto; }
     .panel-title  { font-family:'Bebas Neue', sans-serif; font-size:28px; letter-spacing:0.12em; color:rgba(200,196,176,0.7); margin-bottom:28px; text-align:center; }
-    .bot-cards { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+    .bot-cards { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; }
     .bot-card  { border-radius:14px; padding:22px; text-decoration:none; transition:transform 0.2s, box-shadow 0.2s; display:block; animation:fadeUp 0.6s ease both; }
     .bot-card:hover { transform:translateY(-6px); }
     .bot-card.g { background:linear-gradient(135deg,rgba(74,222,128,0.07),rgba(74,222,128,0.03)); border:1px solid rgba(74,222,128,0.22); }
@@ -298,11 +298,32 @@
 
     /* Responsive */
     @media(max-width:640px) {
-      .bot-cards { grid-template-columns:1fr; }
+      .bot-cards { grid-template-columns:1fr 1fr; }
       .buildings, .characters { padding:0 10px; }
       .tower-jacob { margin-right:20px; } .tower-loach { margin-left:20px; }
       .jacob-char  { margin-right:20px; } .loach-char  { margin-left:20px; }
     }
+
+    /* === VESPER OBSERVATORY === */
+    .tower-vesper { position:relative; display:flex; flex-direction:column; align-items:center; animation:fadeUp 1s ease 0.8s both; }
+    .tower-vesper .building { width:110px; background:linear-gradient(to bottom, #050c14, #030810); border:1px solid rgba(34,211,238,0.2); border-bottom:none; position:relative; box-shadow:0 0 40px rgba(34,211,238,0.08), inset 0 0 30px rgba(34,211,238,0.03); }
+    .tower-vesper .dome-top { width:60px; height:30px; border-radius:50% 50% 0 0; background:rgba(34,211,238,0.1); border:1px solid rgba(34,211,238,0.3); margin:0 auto -1px; box-shadow:0 0 20px rgba(34,211,238,0.3); }
+    .tower-vesper .scope { width:3px; height:24px; background:linear-gradient(to top,rgba(34,211,238,0.8),rgba(34,211,238,0.1)); margin:0 auto -1px; transform:rotate(25deg); transform-origin:bottom center; }
+    @keyframes windowGlowC { 0%,100%{background:rgba(34,211,238,0.2)} 50%{background:rgba(34,211,238,0.5)} }
+    .win.c { animation:windowGlowC 3s ease-in-out infinite; animation-delay:var(--d,0s); }
+    .sign.c { color:#22d3ee; text-shadow:0 0 20px rgba(34,211,238,0.8); border:1px solid rgba(34,211,238,0.3); background:rgba(34,211,238,0.05); animation:lightFlicker 9s ease-in-out infinite 3s; }
+    .bubble.c { color:#22d3ee; border:1px solid rgba(34,211,238,0.3); background:rgba(0,0,0,0.85); }
+    .stat-chip.c { color:#22d3ee; border-color:rgba(34,211,238,0.2); background:rgba(5,12,20,0.9); }
+    .vesper-char { position:relative; margin-left:60px; display:flex; flex-direction:column; align-items:center; animation:owlBob 4s ease-in-out infinite; cursor:pointer; }
+    .vesper-ascii { font-size:11px; color:#22d3ee; white-space:pre; line-height:1.3; text-shadow:0 0 12px rgba(34,211,238,0.7); }
+    @keyframes owlBob { 0%,100%{transform:translateY(0) rotate(0deg)} 25%{transform:translateY(-4px) rotate(-2deg)} 75%{transform:translateY(-2px) rotate(2deg)} }
+    .bot-card.c { background:linear-gradient(135deg,rgba(34,211,238,0.07),rgba(34,211,238,0.03)); border:1px solid rgba(34,211,238,0.22); }
+    .bot-card.c:hover { box-shadow:0 12px 40px rgba(34,211,238,0.15); }
+    .bc-name.c { color:#22d3ee; }
+    .bc-version.c { color:#22d3ee; border-color:rgba(34,211,238,0.3); background:rgba(34,211,238,0.1); }
+    .bc-value.c { color:#22d3ee; }
+    .toggle-switch.c .toggle-slider { background:rgba(34,211,238,0.2); border-color:rgba(34,211,238,0.3); }
+    .toggle-switch.c input:checked + .toggle-slider { background:rgba(34,211,238,0.4); border-color:#22d3ee; }
   </style>
 </head>
 <body>
@@ -414,7 +435,7 @@
   <div class="buildings" id="buildings">
 
     <!-- JACOB'S PREDICTION TOWER -->
-    <div class="bcard" onclick="location.href='jacob_dashboard.html'" id="jacob-bcard">
+    <div class="bcard" onclick="location.href='jacob_dashboard.html'" id="jacob-bcard" style="display:none">
       <div class="bubble g" id="jacob-bubble">Scanning tickers...</div>
       <div class="sign g">Stock Exchange</div>
       <div class="tower-jacob">
@@ -471,7 +492,7 @@
     </div>
 
     <!-- LOACHY'S STADIUM -->
-    <div class="bcard" onclick="location.href='loachy_dashboard.html'" id="loach-bcard">
+    <div class="bcard" onclick="location.href='loachy_dashboard.html'" id="loach-bcard" style="display:none">
       <div class="bubble y" id="loach-bubble">De-vigged edge detected.</div>
       <div class="sign y">Sportsbook Stadium</div>
       <div class="tower-loach">
@@ -492,13 +513,43 @@
       <div class="win-label" id="loach-status" style="color:#fbbf24">● LIVE</div>
     </div>
 
+
+    <!-- VESPER'S OBSERVATORY -->
+    <div class="bcard" onclick="location.href='vesper_dashboard.html'" id="vesper-bcard">
+      <div class="bubble c" id="vesper-bubble">Scanning prediction markets...</div>
+      <div class="sign c">Oracle Observatory</div>
+      <div class="tower-vesper">
+        <div class="scope"></div>
+        <div class="dome-top"></div>
+        <div class="building" style="height:180px">
+          <div style="padding:6px 8px;text-align:center;font-size:8px;color:rgba(34,211,238,0.6);border-bottom:1px solid rgba(34,211,238,0.1);letter-spacing:0.1em;animation:shimmer 2s ease-in-out infinite" id="vesper-ticker-top">POLYMARKET · SIGNALS</div>
+          <div class="windows">
+            <div class="win c" style="--d:0.2s"></div><div class="win off"></div><div class="win c" style="--d:0.5s"></div><div class="win c" style="--d:0.8s"></div>
+            <div class="win c" style="--d:1.1s"></div><div class="win off"></div><div class="win off"></div><div class="win c" style="--d:1.4s"></div>
+          </div>
+          <div class="floor-line"></div>
+          <div style="padding:5px 8px;text-align:center;font-size:8px;color:rgba(34,211,238,0.4);letter-spacing:0.08em;border-bottom:1px solid rgba(34,211,238,0.06)" id="vesper-ticker-mid">WEATHER · MOMENTUM · VOLUME</div>
+          <div class="windows">
+            <div class="win off"></div><div class="win c" style="--d:1.7s"></div><div class="win c" style="--d:2s"></div><div class="win off"></div>
+            <div class="win c" style="--d:2.3s"></div><div class="win c" style="--d:2.6s"></div><div class="win off"></div><div class="win c" style="--d:2.9s"></div>
+          </div>
+          <div class="floor-line"></div>
+          <div class="windows">
+            <div class="win c" style="--d:3.2s"></div><div class="win off"></div><div class="win c" style="--d:3.5s"></div><div class="win c" style="--d:3.8s"></div>
+            <div class="win off"></div><div class="win c" style="--d:4.1s"></div><div class="win off"></div><div class="win c" style="--d:4.4s"></div>
+          </div>
+        </div>
+      </div>
+      <div class="win-label" id="vesper-status" style="color:#22d3ee">&#9679; LIVE</div>
+    </div>
+
   </div><!-- /buildings -->
 
   <!-- CHARACTERS -->
   <div class="characters">
 
     <!-- Jacob -->
-    <div class="jacob-char" onclick="jacobClick()" title="Click Jacob">
+    <div class="jacob-char" onclick="jacobClick()" title="Click Jacob" style="display:none">
       <div class="jacob-ascii" id="jacob-ascii">  .__.
  /  e\__,
 |  ~~~~~ `~~>
@@ -515,10 +566,19 @@
     </div>
 
     <!-- Loachy -->
-    <div class="loach-char" onclick="loachClick()" title="Click Loachy">
+    <div class="loach-char" onclick="loachClick()" title="Click Loachy" style="display:none">
       <div class="loach-ascii" id="loach-ascii">  ><(((º>
   ~ ~ ~ ~
  ><(((º></div>
+    </div>
+
+
+    <!-- Vesper -->
+    <div class="vesper-char" onclick="vesperClick()" title="Click Vesper">
+      <div class="vesper-ascii" id="vesper-ascii"> ,_,
+(0 0)
+ ") ("
+ /   \</div>
     </div>
 
   </div><!-- /characters -->
@@ -539,7 +599,7 @@
   <!-- GROUND TITLE -->
   <div class="ground-title-strip" style="position:absolute;bottom:24%;left:0;right:0;z-index:7;text-align:center;padding:14px 0 10px;pointer-events:none;">
     <div style="font-family:'Bebas Neue',sans-serif;font-size:clamp(28px,4vw,52px);letter-spacing:0.12em;line-height:1;background:linear-gradient(180deg,#e8e4d0 0%,#4ade80 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;filter:drop-shadow(0 0 16px rgba(74,222,128,0.4));" id="farm-title">Jacob's Money Farm</div>
-    <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(74,222,128,0.4);letter-spacing:0.2em;margin-top:4px;">THREE ANIMALS · THREE BOTS · ONE FARM</div>
+    <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(74,222,128,0.4);letter-spacing:0.2em;margin-top:4px;">TWO BOTS · ONE MISSION · ONE FARM</div>
   </div>
 
   <!-- GROUND -->
@@ -563,9 +623,10 @@
 
   <!-- STAT STRIP -->
   <div class="stat-strip" id="stat-strip">
-    <div class="stat-chip g" id="s-jacob">🦎 Jacob · $— · — open</div>
+    <div class="stat-chip g" id="s-jacob" style="display:none">🦎 Jacob · $— · — open</div>
     <div class="stat-chip p" id="s-sera" >🐱 Seraphina · $— · —% win</div>
-    <div class="stat-chip y" id="s-loach">🐟 Loachy · $— · watching</div>
+    <div class="stat-chip y" id="s-loach" style="display:none">🐟 Loachy · $— · watching</div>
+    <div class="stat-chip c" id="s-vesper">🦉 Vesper · $— · scanning</div>
   </div>
 
 </div><!-- /scene -->
@@ -577,7 +638,7 @@
     <div class="bot-cards">
 
       <!-- Jacob -->
-      <a href="jacob_dashboard.html" class="bot-card g" style="animation-delay:0.1s">
+      <a href="jacob_dashboard.html" class="bot-card g" style="animation-delay:0.1s;display:none">
         <div class="bc-header">
           <div class="bc-icon">🦎</div>
           <div class="bc-name g">Jacob</div>
@@ -631,7 +692,7 @@
       </a>
 
       <!-- Loachy -->
-      <a href="loachy_dashboard.html" class="bot-card y" style="animation-delay:0.3s">
+      <a href="loachy_dashboard.html" class="bot-card y" style="animation-delay:0.3s;display:none">
         <div class="bc-header">
           <div class="bc-icon">🐟</div>
           <div class="bc-name y">Loachy Boy</div>
@@ -660,6 +721,35 @@
           onclick="openKeyModal()">🔑 SWAP ODDS API KEY</button>
       </a>
 
+
+      <!-- Vesper -->
+      <a href="vesper_dashboard.html" class="bot-card c" style="animation-delay:0.4s">
+        <div class="bc-header">
+          <div class="bc-icon">&#129993;</div>
+          <div class="bc-name c">Vesper</div>
+          <div class="bc-version c">v1</div>
+        </div>
+        <div class="bc-tagline">Polymarket Oracle &middot; Weather + Momentum + Volume Signals &middot; Edge Detection &middot; Paper $500</div>
+        <div class="bc-stats">
+          <div class="bc-stat"><span class="bc-label">Portfolio</span><span class="bc-value c" id="p-vesper-wallet">$&mdash;</span></div>
+          <div class="bc-stat"><span class="bc-label">Daily P&amp;L</span><span class="bc-value c" id="p-vesper-pnl">$&mdash;</span></div>
+          <div class="bc-stat"><span class="bc-label">Win Rate</span><span class="bc-value c" id="p-vesper-wr">&mdash;</span></div>
+          <div class="bc-stat"><span class="bc-label">Signals / Open</span><span class="bc-value c" id="p-vesper-signals">&mdash;</span></div>
+        </div>
+        <div class="bot-toggle">
+          <label class="toggle-switch c" id="toggle-vesper">
+            <input type="checkbox" id="chk-vesper" onchange="toggleBot('vesper', this)">
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="toggle-label off" id="tgl-label-vesper">STOPPED</span>
+          <div class="toggle-spinner" id="spin-vesper"></div>
+          <span style="flex:1"></span>
+          <span class="status-dot" id="dot-vesper" style="background:#4a4a38"></span>
+          <span class="status-text" id="st-vesper" style="font-family:'JetBrains Mono',monospace;font-size:9px;color:#4a4a38">STOPPED</span>
+        </div>
+        <button class="reset-btn" onclick="resetBot('vesper', event)">&#8635; RESET DRY RUN</button>
+      </a>
+
     </div>
   </div>
 </div>
@@ -669,9 +759,9 @@
   <pre class="footer-art">
         ____________________________________________________
        |                                                    |
-       |  🦎 JACOB    🐱 SERAPHINA    🐟 LOACHY BOY       |
+       |  🦎 JACOB  🐱 SERAPHINA  🐟 LOACHY  🦉 VESPER  |
        |                                                    |
-       |      THREE ANIMALS · THREE BOTS · ONE FARM        |
+       |    FOUR ANIMALS · FOUR BOTS · ONE FARM           |
        |   "The farm runs while you sleep. Usually."        |
        |____________________________________________________|
   </pre>
@@ -975,8 +1065,124 @@ function loadLoach() {
     }).catch(()=>{});
 }
 
-loadJacob(); loadSera(); loadLoach();
-setInterval(()=>{ loadJacob(); loadSera(); loadLoach(); }, 30000);
+
+function loadVesper() {
+  fetch('vesper_data.json?t='+Date.now())
+    .then(r=>r.json()).then(d=>{
+      const portfolio = d.portfolioValue ?? 500;
+      const pnl       = d.dailyPnl ?? 0;
+      const wr        = d.winRate ?? 0;
+      const signals   = d.signalsFound ?? 0;
+      const openCount = d.openCount ?? 0;
+      document.getElementById('p-vesper-wallet').textContent  = '$'+portfolio.toFixed(2);
+      document.getElementById('p-vesper-pnl').textContent     = (pnl>=0?'+':'-')+'$'+Math.abs(pnl).toFixed(2);
+      document.getElementById('p-vesper-pnl').style.color     = pnl>=0 ? '#22d3ee' : '#f87171';
+      document.getElementById('p-vesper-wr').textContent      = wr.toFixed(0)+'% win rate';
+      document.getElementById('p-vesper-signals').textContent = signals+' sig / '+openCount+' open';
+      document.getElementById('st-vesper').textContent        = 'PAPER · '+(d.mood||'SCANNING').toUpperCase();
+      document.getElementById('s-vesper').textContent         = '🦉 Vesper · $'+portfolio.toFixed(2)+' · '+signals+' sig';
+      const top = document.getElementById('vesper-ticker-top');
+      const mid = document.getElementById('vesper-ticker-mid');
+      if(top && d.topSignals && d.topSignals.length>0){
+        top.textContent = d.topSignals.slice(0,2).map(s=>s.signal_type.toUpperCase()).join(' · ')+' SIGNAL';
+        top.style.color = 'rgba(34,211,238,0.9)';
+      }
+      if(mid && openCount>0){
+        mid.textContent = openCount+' POSITION'+(openCount>1?'S':'')+' OPEN';
+        mid.style.color = 'rgba(34,211,238,0.8)';
+      }
+      const bub = document.getElementById('vesper-bubble');
+      if(bub) bub.textContent = signals>0
+        ? signals+' signal'+(signals>1?'s':'')+' found · '+openCount+' open'
+        : 'Scanning '+( d.marketsScanned||0)+' prediction markets...';
+    }).catch(()=>{});
+}
+
+const vesperLines = [
+  "NOAA says 74%. Market says 41%. Entering YES.",
+  "Volume spike 4.2x average. Signal confirmed.",
+  "Momentum +18% in 24h. Following the move.",
+  "Seven signals found. Ranking by edge now.",
+  "Weather: rain probability 81%. Market: 38%. Gap.",
+  "The oracle never guesses. It calculates.",
+  "*rotates telescope* Found a mispriced market.",
+  "Edge confirmed. Sizing in. Trust the signal.",
+  "Mean reversion: price down 31% this week. Watching.",
+  "The crowd is emotional. The data is not.",
+];
+let vesperClickIdx = 0;
+function vesperClick() {
+  const el = document.querySelector('.vesper-char');
+  const bubble = document.getElementById('vesper-bubble');
+  el.style.animation = 'none';
+  setTimeout(() => { el.style.animation = ''; }, 50);
+  bubble.textContent = vesperLines[vesperClickIdx % vesperLines.length];
+  bubble.classList.add('show');
+  setTimeout(() => bubble.classList.remove('show'), 3500);
+  vesperClickIdx++;
+  if(vesperClickIdx % 5 === 0) showToast('🦉 The oracle has spoken', 'c');
+}
+
+loadJacob(); loadSera(); loadLoach(); loadVesper();
+setInterval(()=>{ 
+function loadVesper() {
+  fetch('vesper_data.json?t='+Date.now())
+    .then(r=>r.json()).then(d=>{
+      const portfolio = d.portfolioValue ?? 500;
+      const pnl       = d.dailyPnl ?? 0;
+      const wr        = d.winRate ?? 0;
+      const signals   = d.signalsFound ?? 0;
+      const openCount = d.openCount ?? 0;
+      document.getElementById('p-vesper-wallet').textContent  = '$'+portfolio.toFixed(2);
+      document.getElementById('p-vesper-pnl').textContent     = (pnl>=0?'+':'-')+'$'+Math.abs(pnl).toFixed(2);
+      document.getElementById('p-vesper-pnl').style.color     = pnl>=0 ? '#22d3ee' : '#f87171';
+      document.getElementById('p-vesper-wr').textContent      = wr.toFixed(0)+'% win rate';
+      document.getElementById('p-vesper-signals').textContent = signals+' sig / '+openCount+' open';
+      document.getElementById('st-vesper').textContent        = 'PAPER · '+(d.mood||'SCANNING').toUpperCase();
+      document.getElementById('s-vesper').textContent         = '🦉 Vesper · $'+portfolio.toFixed(2)+' · '+signals+' sig';
+      const top = document.getElementById('vesper-ticker-top');
+      const mid = document.getElementById('vesper-ticker-mid');
+      if(top && d.topSignals && d.topSignals.length>0){
+        top.textContent = d.topSignals.slice(0,2).map(s=>s.signal_type.toUpperCase()).join(' · ')+' SIGNAL';
+        top.style.color = 'rgba(34,211,238,0.9)';
+      }
+      if(mid && openCount>0){
+        mid.textContent = openCount+' POSITION'+(openCount>1?'S':'')+' OPEN';
+        mid.style.color = 'rgba(34,211,238,0.8)';
+      }
+      const bub = document.getElementById('vesper-bubble');
+      if(bub) bub.textContent = signals>0
+        ? signals+' signal'+(signals>1?'s':'')+' found · '+openCount+' open'
+        : 'Scanning '+( d.marketsScanned||0)+' prediction markets...';
+    }).catch(()=>{});
+}
+
+const vesperLines = [
+  "NOAA says 74%. Market says 41%. Entering YES.",
+  "Volume spike 4.2x average. Signal confirmed.",
+  "Momentum +18% in 24h. Following the move.",
+  "Seven signals found. Ranking by edge now.",
+  "Weather: rain probability 81%. Market: 38%. Gap.",
+  "The oracle never guesses. It calculates.",
+  "*rotates telescope* Found a mispriced market.",
+  "Edge confirmed. Sizing in. Trust the signal.",
+  "Mean reversion: price down 31% this week. Watching.",
+  "The crowd is emotional. The data is not.",
+];
+let vesperClickIdx = 0;
+function vesperClick() {
+  const el = document.querySelector('.vesper-char');
+  const bubble = document.getElementById('vesper-bubble');
+  el.style.animation = 'none';
+  setTimeout(() => { el.style.animation = ''; }, 50);
+  bubble.textContent = vesperLines[vesperClickIdx % vesperLines.length];
+  bubble.classList.add('show');
+  setTimeout(() => bubble.classList.remove('show'), 3500);
+  vesperClickIdx++;
+  if(vesperClickIdx % 5 === 0) showToast('🦉 The oracle has spoken', 'c');
+}
+
+loadJacob(); loadSera(); loadLoach(); loadVesper(); }, 30000);
 
 // Live countdown ticker for Loachy next scan
 setInterval(() => {
@@ -997,7 +1203,7 @@ setInterval(() => {
 
 // ── BOT CONTROLS ──
 const API = '/api';
-const BOT_COLORS = { jacob: '#4ade80', seraphina: '#c084fc', loachy: '#fbbf24' };
+const BOT_COLORS = { jacob: '#4ade80', seraphina: '#c084fc', loachy: '#fbbf24', vesper: '#22d3ee' };
 
 function setToggleState(name, running) {
   const chk   = document.getElementById('chk-' + name);
