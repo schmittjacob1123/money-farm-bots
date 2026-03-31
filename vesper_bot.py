@@ -50,11 +50,11 @@ CONFIG = {
     "cash_floor_pct":       0.25,
 
     # signal thresholds
-    "min_edge":             0.07,
-    "momentum_threshold":   0.12,   # 12% 1d move triggers momentum signal
-    "volume_spike_mult":    3.0,    # 3x daily average = spike
-    "weather_min_edge":     0.10,
-    "weather_min_prob":     0.55,   # NOAA must be >= 55% to enter YES
+    "min_edge":             0.04,   # 4% min edge (prediction markets move slowly)
+    "momentum_threshold":   0.03,   # 3% 1d move triggers momentum signal
+    "volume_spike_mult":    1.8,    # 1.8x daily average = meaningful spike
+    "weather_min_edge":     0.08,
+    "weather_min_prob":     0.50,   # NOAA must be >= 50% to enter YES
 
     # exits
     "take_profit_pct":      0.35,
@@ -345,10 +345,17 @@ class GammaFetcher:
 
     @staticmethod
     def parse_yes_no_prices(market):
-        """Returns (yes_price, no_price) or None."""
+        """Returns (yes_price, no_price) or None.
+        Gamma API returns outcomes/outcomePrices as JSON-encoded strings OR lists."""
         try:
+            import json as _json
             outcomes = market.get("outcomes", [])
             prices   = market.get("outcomePrices", [])
+            # Gamma API returns these as JSON strings — decode if needed
+            if isinstance(outcomes, str):
+                outcomes = _json.loads(outcomes)
+            if isinstance(prices, str):
+                prices = _json.loads(prices)
             if not outcomes or not prices or len(outcomes) != len(prices):
                 return None
             yes_idx = next((i for i, o in enumerate(outcomes) if str(o).upper() == "YES"), None)
@@ -469,7 +476,7 @@ class PriceSignal:
 
         # ── MOMENTUM ──
         if abs(chg_1d) >= CONFIG["momentum_threshold"]:
-            edge = abs(chg_1d) * 0.55
+            edge = abs(chg_1d) * 0.45
             if edge >= CONFIG["min_edge"]:
                 signals.append({
                     "signal_type":  "momentum",
